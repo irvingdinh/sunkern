@@ -1,11 +1,9 @@
 package main
 
 import (
-	"fmt"
-
-	"sunkern.local/framework"
+	"sunkern.local/framework/app"
 )
 
 func main() {
-	fmt.Printf("Hello, %s!\n", framework.Name())
+	app.New()
 }
