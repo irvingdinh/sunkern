@@ -7,24 +7,31 @@ import (
 	"net"
 	httpstd "net/http"
 
-	"go.uber.org/fx"
+	"sunkern.local/framework/config"
+	"sunkern.local/framework/container"
 )
 
+// Server is the framework's HTTP server abstraction.
 type Server interface{}
 
-func NewServer(lc fx.Lifecycle) Server {
+// NewServer creates an HTTP server, registers lifecycle hooks, and returns
+// a Server. It reads the listen address from config (key "http.addr",
+// default ":19110"). Intended to be registered via container.Provide.
+func NewServer() (Server, error) {
+	addr := config.GetOr[string]("http.addr", ":19110")
+
 	mux := httpstd.NewServeMux()
 	mux.HandleFunc("/", func(w httpstd.ResponseWriter, r *httpstd.Request) {
 		w.WriteHeader(httpstd.StatusOK)
 	})
 
 	srv := &httpstd.Server{
-		Addr:    ":8080",
+		Addr:    addr,
 		Handler: mux,
 	}
 
-	lc.Append(fx.Hook{
-		OnStart: func(ctx context.Context) error {
+	container.AppendHook(container.Hook{
+		OnStart: func(_ context.Context) error {
 			ln, err := net.Listen("tcp", srv.Addr)
 			if err != nil {
 				return err
@@ -41,7 +48,7 @@ func NewServer(lc fx.Lifecycle) Server {
 		},
 	})
 
-	return &serverImpl{}
+	return &serverImpl{}, nil
 }
 
 type serverImpl struct{}

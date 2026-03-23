@@ -1,9 +1,7 @@
 package main
 
-import (
-	"sunkern.local/framework/app"
-)
+import "sunkern.local/framework/app"
 
 func main() {
-	app.New()
+	app.New().Run()
 }

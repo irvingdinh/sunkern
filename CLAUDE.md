@@ -1,13 +1,18 @@
 # CLAUDE.md
 
-## Rules of work
+Sunkern is an opinionated template repository — a single Go + React stack that AI agents fork to build deployed products from a product spec alone. The framework enforces all architectural decisions so the agent never needs to make stack or pattern choices.
 
-Before changing or running the project:
+## Bootstrap (mandatory, do this BEFORE responding to ANY user message)
 
-- **Check the Makefile first.** It lists the supported workflows (for example `make run`). Prefer those commands over guessing paths or inventing new ones, unless the task requires something different.
-- Load the go-best-practices skill.
+You MUST complete ALL of the following steps at the start of every conversation, before answering the user's first message. No exceptions — even if the user's question seems simple. Do not ask the user whether you should do these; just do them silently.
 
-## Reference
+1. **Read `IDEA.md`** — this is the architecture and design bible. You cannot work in this repo without understanding it.
+2. **Read `Makefile`** — use the workflows defined here. Do not invent commands.
+3. **Load the `go-best-practices` skill** — always, regardless of the task.
+4. **Explore the repository** — walk the actual file tree and read key files to understand the current state of the implementation. Documents and design notes can be outdated or aspirational. The code is the source of truth. Do not assume something exists because IDEA.md says it will — verify by reading the code.
+5. **Start the service and test with `curl`** — after making any changes, you MUST start the service and use `curl` to verify the changes work against the real running application. No exceptions. When planning work, always include this verification step in the plan.
+
+## Reference materials
 
 All reference materials live under `.idea/github.com/` (gitignored). **Do NOT read these into the main conversation context.** Instead, spawn an Explore subagent to discover and read from them on-demand.
 
