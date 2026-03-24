@@ -74,6 +74,12 @@ func Inspect() []ServiceInfo {
 	return global.Inspect()
 }
 
+// DependencyGraph returns the service dependency graph from the global
+// container as an adjacency list. See Container.DependencyGraph for details.
+func DependencyGraph() map[string][]string {
+	return global.DependencyGraph()
+}
+
 // AppendHook adds a lifecycle hook to the global container.
 func AppendHook(h Hook) {
 	global.AppendHook(h)
@@ -83,6 +89,20 @@ func AppendHook(h Hook) {
 // tests and the application boot sequence.
 func Reset() {
 	global = New()
+}
+
+// Reset clears all services, hooks, and resolution tracking from the
+// container, returning it to its initial empty state. Intended for tests
+// using non-global containers.
+func (c *Container) Reset() {
+	c.mu.Lock()
+	c.services = make(map[string]*service)
+	c.hooks = nil
+	c.mu.Unlock()
+
+	c.resolveMu.Lock()
+	c.resolving = make(map[int64]*resolveState)
+	c.resolveMu.Unlock()
 }
 
 // Global returns the package-level container instance. Exported for the

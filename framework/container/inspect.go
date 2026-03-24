@@ -48,6 +48,10 @@ type ServiceInfo struct {
 	Status ServiceStatus `json:"status"`
 	// Caller is the file:line where the service was registered.
 	Caller string `json:"caller,omitempty"`
+	// Deps lists the type names of services this service directly depends on
+	// (resolved during provider execution). Sorted alphabetically. Nil for
+	// supplied services and unbuilt providers.
+	Deps []string `json:"deps,omitempty"`
 	// Error is the cached provider error, if any. Nil unless Status is
 	// ServiceFailed. Excluded from JSON — use ErrorText for serialization.
 	Error error `json:"-"`
@@ -91,6 +95,10 @@ func (c *Container) Inspect() []ServiceInfo {
 			Kind:   svc.kind,
 			Caller: svc.caller,
 		}
+		if len(svc.deps) > 0 {
+			info.Deps = make([]string, len(svc.deps))
+			copy(info.Deps, svc.deps)
+		}
 		switch {
 		case !svc.built:
 			info.Status = ServicePending
@@ -110,4 +118,24 @@ func (c *Container) Inspect() []ServiceInfo {
 		return infos[i].Name < infos[j].Name
 	})
 	return infos
+}
+
+// DependencyGraph returns the service dependency graph as an adjacency list.
+// Each key is a service type name, and the value is a sorted list of type
+// names it directly depends on. Only includes built services with at least
+// one dependency. Intended for admin dashboards and debugging.
+func (c *Container) DependencyGraph() map[string][]string {
+	c.mu.RLock()
+	graph := make(map[string][]string)
+	for name, svc := range c.services {
+		svc.mu.Lock()
+		if svc.built && len(svc.deps) > 0 {
+			deps := make([]string, len(svc.deps))
+			copy(deps, svc.deps)
+			graph[name] = deps
+		}
+		svc.mu.Unlock()
+	}
+	c.mu.RUnlock()
+	return graph
 }

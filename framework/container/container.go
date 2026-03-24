@@ -6,6 +6,14 @@ import (
 	"sync"
 )
 
+// resolveState tracks the resolution chain for a single goroutine during
+// service initialization. Used for circular dependency detection and
+// dependency graph building.
+type resolveState struct {
+	stack []string                       // service names being built, in order
+	deps  map[string]map[string]struct{} // parent name → set of direct dep names
+}
+
 // Registration kind constants.
 const (
 	kindProvided = "provided" // lazy singleton with factory function
@@ -19,10 +27,11 @@ const (
 type service struct {
 	provider func() (any, error) // nil for Supply'd values
 	instance any
-	err      error // cached provider error (nil on success)
+	err      error    // cached provider error (nil on success)
 	built    bool
-	kind     string // kindProvided or kindSupplied
-	caller   string // "file.go:42" — registration call site
+	kind     string   // kindProvided or kindSupplied
+	caller   string   // "file.go:42" — registration call site
+	deps     []string // direct dependencies resolved during build (sorted, unique)
 	mu       sync.Mutex // protects lazy init (per-service, not global)
 }
 
@@ -46,12 +55,19 @@ type Container struct {
 	mu       sync.RWMutex
 	services map[string]*service
 	hooks    []Hook
+
+	// Resolution tracking: per-goroutine resolution chain for circular
+	// dependency detection and dependency graph building. Only active
+	// during provider execution (boot phase); empty at runtime.
+	resolveMu sync.Mutex
+	resolving map[int64]*resolveState
 }
 
 // New returns an empty container.
 func New() *Container {
 	return &Container{
-		services: make(map[string]*service),
+		services:  make(map[string]*service),
+		resolving: make(map[int64]*resolveState),
 	}
 }
 

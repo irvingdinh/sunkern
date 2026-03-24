@@ -8,7 +8,7 @@
 
 ## Current State
 
-**Last session**: 2026-03-25 — Session 36 (framework/db revisited — RunTxVal, FindByID, DeleteByID, optimized Exists)
+**Last session**: 2026-03-25 — Session 37 (framework/container revisited — circular dep detection, dependency graph, Container.Reset)
 **Working tree**: clean
 **Branch**: with-experiment
 
@@ -17,7 +17,7 @@
 | Package | Maturity | Last Touched | Notes |
 |---------|----------|--------------|-------|
 | `framework/app` | **Maturing** | Session 30 | Revisited: PostBooter optional interface (PostBoot() after ALL modules Boot — data seeding, cache warm-up, cross-module workers), PreShutdowner optional interface (PreShutdown(ctx) before individual Shutdown — drain work, flush buffers), phase timing in startup log (boot_time_ms broken into register_ms/framework_ms/module_boot_ms/post_boot_ms/hooks_ms), ModuleGroup delegates PostBoot/PreShutdown to children, 8 new tests (21 total). Previous (Session 25): health check system, ReadyCh, Env/Version. Previous (Session 13): *App supplied to container, boot/shutdown timing. Previous: ModuleGroup boot rollback fix |
-| `framework/container` | **Maturing** | Session 26 | Revisited: ServiceInfo enriched with JSON tags, Kind (supplied/provided), Caller (file:line), ErrorText; ServiceStatus.MarshalJSON; HookReport with per-hook timing from StartHooks/StopHooks; caller tracking in Provide/Supply/Override (runtime.Caller); duplicate-registration panics show both original+duplicate call sites; app.go logs hook start/stop at Debug level. Previous (Session 13): introspection APIs (Keys, Inspect, Len), ServiceInfo/ServiceStatus types, Hooks() accessor. Previous: Override/OverrideSupply, named hooks, all framework hooks named |
+| `framework/container` | **Maturing** | Session 37 | Revisited: circular dependency detection (prevents deadlocks — panics with clear "A → B → A" chain message), automatic dependency tracking during provider resolution (recorded as sorted unique []string per service), DependencyGraph() adjacency-list method for admin dashboards, Deps field on ServiceInfo with JSON serialization, Container.Reset() instance method for non-global container test isolation, goID()-based per-goroutine resolution tracking (zero overhead on cached hits — fast path skips goID entirely), 11 new tests (48 total). Previous (Session 26): ServiceInfo enriched with Kind/Caller/ErrorText; HookReport with per-hook timing; caller tracking in Provide/Supply/Override. Previous (Session 13): introspection APIs (Keys, Inspect, Len), ServiceInfo/ServiceStatus types. Previous: Override/OverrideSupply, named hooks |
 | `framework/config` | **Maturing** | Session 29 | Revisited: Source tracking (resolveWithSource returns env/file/default per key), MarkSensitive/IsSensitive for masking secrets in Export, Export() returns []Entry with key/value/source/env_name sorted by key, Freeze/IsFrozen (auto-freeze after Validate, SetDefault/SetDefaults/AddRule/MarkSensitive panic if frozen), Load() resets frozen+sensitive for test reuse. Previous (Session 16): config validation (AddRule, Validate, 10 built-in rules). Previous (Session 7): Has, All, Keys, Sub, DataDir, EnvName, SetDefaults; Load creates data dir; improved panic messages |
 | `framework/log` | **Maturing** | Session 31 | Revisited: samplingHandler for per-level log volume control (atomic counters, DEBUG/INFO configurable via log.sample.debug/log.sample.info — 1.3M msg/s throughput), mergedHandler.Enabled optimization (skips Record allocation when both sinks filter level), Query now takes context.Context for cancellation (checks every 1024 lines), QueryResult struct replaces tuple return (adds Skipped count for malformed lines), date validation in Query (rejects invalid YYYY_MM_DD format), config defaults registered in Load() for discoverability (log.level, log.console.level, log.sample.debug, log.sample.info visible in config.Keys()), 8 new tests (47 total). Previous (Session 17): buffered file writer (64KB bufio.Writer + 200ms flush). Previous (Session 8): Separate console/file levels, log file management, JSONL entry parsing + querying |
 | `framework/http` | **Maturing** | Session 35 | Revisited: Chain(mw ...Middleware) combines multiple middleware into one (first-added outermost, composable — Chain of Chains works), SkipIf(mw, skip func(r) bool) conditionally bypasses middleware, SkipPaths(mw, paths...) exact-path shorthand with O(1) map lookup, 11 new tests (11 total in http package). Previous (Session 28): PaginationParams, embedded BindQuery, Created(), configurable timeouts. Previous (Session 14): SSE support. Previous (Session 10): Bind/BindForm MaxBytesError → 413 |
@@ -412,6 +412,17 @@ Session 36 (db revisit, banking app with RunTxVal + FindByID + DeleteByID + opti
 - [memory] 27 MB RSS after 200+ writes and 30K+ load test requests
 - [race] No data races detected with -race flag on concurrent transfers + reads + deletes + exists checks
 
+Session 37 (container revisit, service registry app with 4 modules — 50 services, 100 events, 100 metrics, 9 container services):
+- [container/GET Inspect] 65,105 req/s, p99 2.7ms — Inspect() with 9 services + Deps field (no regression from Session 26: 67K with 8 services)
+- [container/GET DependencyGraph] 63,486 req/s, p99 2.4ms — DependencyGraph() adjacency list with 3 entries, 6 edges
+- [container/GET deps/tree] 64,195 req/s, p99 2.6ms — Inspect() + DependencyGraph() combined per request
+- [container/GET stats] 67,884 req/s, p99 2.5ms — Make + Inspect + DependencyGraph + atomic counters combined
+- [container/GET keys] 70,690 req/s, p99 2.4ms — Keys() sorted, 9 services
+- [container/GET health] 69,637 req/s, p99 2.5ms — CheckHealth with sqlite health check
+- [crud/GET services] 10,484 req/s — paginated list on 50 rows (IO-bound baseline)
+- [memory] 27 MB RSS after 250+ writes and 60K+ load test requests
+- [race] No data races detected with -race flag on concurrent introspection + CRUD + events writes
+
 ## Design Decisions
 
 <!-- Key decisions and rationale so future sessions don't reverse them. Format:
@@ -674,21 +685,28 @@ Session 36 (db revisit, banking app with RunTxVal + FindByID + DeleteByID + opti
 - [db] FindByID[T] uses newSyntheticColumn for the "id" column to avoid requiring callers to pass a typed column reference. Every Sunkern model has BaseModel with an "id" text column — this is a framework-level assumption that justifies the hardcoded column name. The variadic scopes parameter enables composition (e.g., NotDeleted) without overloading or separate functions. (Session 36)
 - [db] DeleteByID is the hard-delete counterpart to SoftDeleteByID. Both use newSyntheticColumn("id") for the WHERE clause. The naming parallel (DeleteByID vs SoftDeleteByID) makes the intent explicit — callers choose between permanent and soft deletion. (Session 36)
 
+- [container] Circular dependency detection checks the per-goroutine resolution stack BEFORE acquiring svc.mu — this prevents the deadlock that would occur if A's provider resolves B, whose provider resolves A (A's mutex is already held). The check uses goID() (runtime.Stack parse) which only runs when len(c.resolving) > 0 — zero overhead on cached hits after boot. (Session 37)
+- [container] goID() extracts goroutine ID from runtime.Stack output — a fixed 64-byte stack buffer, parse "goroutine N [...]". Only called during service initialization (not cached hits), so allocation is negligible. The approach is well-established in Go ecosystem (used by golang.org/x/net/trace, testing frameworks). (Session 37)
+- [container] Dependency tracking uses a per-goroutine resolveState with stack + deps map. When makeFromContainer is called: (1) recordDep adds the resolved service as a dep of the current top-of-stack (the parent provider), (2) pushResolve adds the name to the stack, (3) provider runs, (4) popResolve pops and returns collected deps as sorted unique []string. deps are stored on the service struct and exposed via Inspect() and DependencyGraph(). (Session 37)
+- [container] recordDepIfResolving is the fast-path wrapper: checks len(c.resolving) == 0 under resolveMu and returns immediately if no goroutine is building. This means cached-hit resolution after boot has no goID overhead and only a brief uncontended lock check. (Session 37)
+- [container] Lock ordering: c.mu (RLock, released before anything else) → svc.mu (held during provider) → c.resolveMu (briefly acquired/released inside recordDep/pushResolve/popResolve). resolveMu is never held while acquiring svc.mu, preventing deadlocks between tracking and resolution locks. (Session 37)
+- [container] DependencyGraph() returns map[string][]string — only includes built services with at least one dep. Each dep list is a copy (mutation-safe). Admin endpoints serialize this directly. The graph represents direct dependencies only (not transitive). (Session 37)
+- [container] Container.Reset() is an instance method that clears services, hooks, and resolving map in place. The global Reset() still replaces the pointer (global = New()) for backward compatibility — existing code holding a Global() pointer sees a stale-but-valid container. Instance Reset is for non-global containers in tests. (Session 37)
+
 ## Next Priorities
 
 <!-- What the last session thinks should come next, in order -->
 
-1. **Revisit `framework/container`** — last touched Session 26 (10 sessions ago, oldest). Future: typed resolution helpers (MustMakeAll for batch resolution), container reset for test isolation, service dependency graph visualization
-2. **Revisit `framework/http`** — last touched Session 35. SSE broker/hub pattern (manages multiple connections, fan-out from event source, stats), response inspection helpers (exported ResponseRecorder or status getter)
-3. **Revisit `framework/http/middleware`** — last touched Session 35. Future: CSRF protection (double-submit cookie), conditional middleware by method (SkipMethods), request body caching for retry/inspection
-4. **Revisit `framework/db`** — last touched Session 36. Future: batch update helpers (CASE-based multi-row updates), query logging/tracing hook (can now leverage driver trace), prepared statement caching, consider UpdateByID convenience
-5. **Revisit `framework/app`** — last touched Session 30. Future: module dependency declaration (explicit DependsOn for boot ordering), module tags/labels for admin introspection, conditional modules (enabled/disabled via config)
-6. **Revisit `framework/config`** — last touched Session 29. Future: config value change detection (compare Export snapshots), config documentation generator
-7. **Revisit `framework/log`** — last touched Session 31. Future: mmap-based query for very large files (deferred — current linear scan acceptable for admin viewer with daily rotation), log rotation callback (notify when file rotates), per-request sampling (sample by request_id hash for consistent traces)
-8. **Revisit `framework/sqlite/driver`** — last touched Session 34. Future: blob I/O (sqlite3_blob_open/read/write/close for incremental large object access), sqlite3_update_hook (row-level change notifications), WAL hook integration with maintenance goroutine (proactive checkpoint triggering instead of polling)
-9. **Revisit `framework/sqlite/migrate`** — last touched Session 33. Future: dry-run mode (validate SQL syntax without applying), migration locking (prevent concurrent Up() calls), migration hooks (pre/post callbacks)
+1. **Revisit `framework/app`** — last touched Session 30 (7 sessions ago, oldest). Future: module dependency declaration (explicit DependsOn for boot ordering — now can leverage container dep graph), module tags/labels for admin introspection, conditional modules (enabled/disabled via config)
+2. **Revisit `framework/config`** — last touched Session 29. Future: config value change detection (compare Export snapshots), config documentation generator
+3. **Revisit `framework/http`** — last touched Session 35. SSE broker/hub pattern (manages multiple connections, fan-out from event source, stats), response inspection helpers (exported ResponseRecorder or status getter)
+4. **Revisit `framework/http/middleware`** — last touched Session 35. Future: CSRF protection (double-submit cookie), conditional middleware by method (SkipMethods), request body caching for retry/inspection
+5. **Revisit `framework/log`** — last touched Session 31. Future: mmap-based query for very large files (deferred — current linear scan acceptable for admin viewer with daily rotation), log rotation callback (notify when file rotates), per-request sampling (sample by request_id hash for consistent traces)
+6. **Revisit `framework/db`** — last touched Session 36. Future: batch update helpers (CASE-based multi-row updates), query logging/tracing hook (can now leverage driver trace), prepared statement caching, consider UpdateByID convenience
+7. **Revisit `framework/sqlite/driver`** — last touched Session 34. Future: blob I/O (sqlite3_blob_open/read/write/close for incremental large object access), sqlite3_update_hook (row-level change notifications), WAL hook integration with maintenance goroutine (proactive checkpoint triggering instead of polling)
+8. **Revisit `framework/sqlite/migrate`** — last touched Session 33. Future: dry-run mode (validate SQL syntax without applying), migration locking (prevent concurrent Up() calls), migration hooks (pre/post callbacks)
+9. **Revisit `framework/container`** — last touched Session 37. Future: exported container-level generic functions (ProvideToContainer, MustMakeFromContainer) for isolated container testing, provider timeout (context-based deadline for lazy init), service health integration (register health checks from providers automatically)
 10. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
-9. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
 
 ## In-Progress Work
 

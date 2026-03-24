@@ -1028,3 +1028,276 @@ func TestStopHookReportsIncludeErrors(t *testing.T) {
 		t.Errorf("ok-hook should have no error, got %q", reports[1].Err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Circular dependency detection
+// ---------------------------------------------------------------------------
+
+func TestCircularDepSelf(t *testing.T) {
+	resetContainer(t)
+
+	type SelfRef struct{}
+	Provide(func() (*SelfRef, error) {
+		_ = MustMake[*SelfRef]() // self-dependency
+		return &SelfRef{}, nil
+	})
+
+	mustPanic(t, "circular dependency", func() {
+		MustMake[*SelfRef]()
+	})
+}
+
+func TestCircularDepTwoServices(t *testing.T) {
+	resetContainer(t)
+
+	type A struct{}
+	type B struct{}
+
+	Provide(func() (*A, error) {
+		_ = MustMake[*B]()
+		return &A{}, nil
+	})
+	Provide(func() (*B, error) {
+		_ = MustMake[*A]()
+		return &B{}, nil
+	})
+
+	mustPanic(t, "circular dependency", func() {
+		MustMake[*A]()
+	})
+}
+
+func TestCircularDepThreeServices(t *testing.T) {
+	resetContainer(t)
+
+	type X struct{}
+	type Y struct{}
+	type Z struct{}
+
+	Provide(func() (*X, error) {
+		_ = MustMake[*Y]()
+		return &X{}, nil
+	})
+	Provide(func() (*Y, error) {
+		_ = MustMake[*Z]()
+		return &Y{}, nil
+	})
+	Provide(func() (*Z, error) {
+		_ = MustMake[*X]()
+		return &Z{}, nil
+	})
+
+	mustPanic(t, "circular dependency", func() {
+		MustMake[*X]()
+	})
+}
+
+func TestCircularDepChainInMessage(t *testing.T) {
+	resetContainer(t)
+
+	type Alpha struct{}
+	type Beta struct{}
+
+	Provide(func() (*Alpha, error) {
+		_ = MustMake[*Beta]()
+		return &Alpha{}, nil
+	})
+	Provide(func() (*Beta, error) {
+		_ = MustMake[*Alpha]()
+		return &Beta{}, nil
+	})
+
+	// Verify the panic message contains the cycle chain with arrows.
+	mustPanic(t, "→", func() {
+		MustMake[*Alpha]()
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Dependency tracking & graph
+// ---------------------------------------------------------------------------
+
+func TestDependencyTracking(t *testing.T) {
+	resetContainer(t)
+
+	type Config struct{ DSN string }
+	type DB struct{ DSN string }
+	type Repo struct{ DB *DB }
+
+	Supply(&Config{DSN: "file:test.db"})
+
+	Provide(func() (*DB, error) {
+		cfg := MustMake[*Config]()
+		return &DB{DSN: cfg.DSN}, nil
+	})
+
+	Provide(func() (*Repo, error) {
+		db := MustMake[*DB]()
+		return &Repo{DB: db}, nil
+	})
+
+	_ = MustMake[*Repo]()
+
+	infos := Inspect()
+	// Find each service's deps.
+	depsByName := make(map[string][]string)
+	for _, info := range infos {
+		depsByName[info.Name] = info.Deps
+	}
+
+	// Config: supplied, no deps.
+	if deps := depsByName["*container.Config"]; len(deps) != 0 {
+		t.Errorf("Config deps = %v, want empty", deps)
+	}
+
+	// DB: depends on Config.
+	dbDeps := depsByName["*container.DB"]
+	if len(dbDeps) != 1 || dbDeps[0] != "*container.Config" {
+		t.Errorf("DB deps = %v, want [*container.Config]", dbDeps)
+	}
+
+	// Repo: depends on DB (not transitively on Config).
+	repoDeps := depsByName["*container.Repo"]
+	if len(repoDeps) != 1 || repoDeps[0] != "*container.DB" {
+		t.Errorf("Repo deps = %v, want [*container.DB]", repoDeps)
+	}
+}
+
+func TestDependencyGraph(t *testing.T) {
+	resetContainer(t)
+
+	type A struct{}
+	type B struct{}
+	type C struct{}
+
+	Supply(&A{})
+	Provide(func() (*B, error) {
+		_ = MustMake[*A]()
+		return &B{}, nil
+	})
+	Provide(func() (*C, error) {
+		_ = MustMake[*A]()
+		_ = MustMake[*B]()
+		return &C{}, nil
+	})
+
+	_ = MustMake[*C]()
+
+	graph := DependencyGraph()
+
+	// A: supplied, no deps → not in graph.
+	if _, ok := graph["*container.A"]; ok {
+		t.Error("A should not be in DependencyGraph (no deps)")
+	}
+
+	// B: depends on A.
+	bDeps := graph["*container.B"]
+	if len(bDeps) != 1 || bDeps[0] != "*container.A" {
+		t.Errorf("B graph = %v, want [*container.A]", bDeps)
+	}
+
+	// C: depends on A and B.
+	cDeps := graph["*container.C"]
+	if len(cDeps) != 2 || cDeps[0] != "*container.A" || cDeps[1] != "*container.B" {
+		t.Errorf("C graph = %v, want [*container.A, *container.B]", cDeps)
+	}
+}
+
+func TestDependencyGraphEmpty(t *testing.T) {
+	resetContainer(t)
+
+	graph := DependencyGraph()
+	if len(graph) != 0 {
+		t.Errorf("DependencyGraph = %v, want empty", graph)
+	}
+}
+
+func TestDependencyDeduplication(t *testing.T) {
+	resetContainer(t)
+
+	type Dep struct{}
+	type Svc struct{}
+
+	Supply(&Dep{})
+	Provide(func() (*Svc, error) {
+		// Resolve same dep twice.
+		_ = MustMake[*Dep]()
+		_ = MustMake[*Dep]()
+		return &Svc{}, nil
+	})
+
+	_ = MustMake[*Svc]()
+
+	infos := Inspect()
+	for _, info := range infos {
+		if info.Name == "*container.Svc" {
+			if len(info.Deps) != 1 {
+				t.Errorf("Svc deps = %v, want exactly 1 (deduplicated)", info.Deps)
+			}
+			return
+		}
+	}
+	t.Fatal("Svc not found in Inspect()")
+}
+
+// ---------------------------------------------------------------------------
+// Container.Reset (instance method)
+// ---------------------------------------------------------------------------
+
+func TestContainerReset(t *testing.T) {
+	c := New()
+
+	type Svc struct{}
+	provideToContainer[*Svc](c, func() (*Svc, error) { return &Svc{}, nil }, "test")
+	c.AppendHook(Hook{Name: "test-hook"})
+
+	if c.Len() != 1 {
+		t.Fatalf("Len = %d, want 1", c.Len())
+	}
+	if len(c.Hooks()) != 1 {
+		t.Fatalf("Hooks count = %d, want 1", len(c.Hooks()))
+	}
+
+	c.Reset()
+
+	if c.Len() != 0 {
+		t.Errorf("Len after Reset = %d, want 0", c.Len())
+	}
+	if len(c.Hooks()) != 0 {
+		t.Errorf("Hooks after Reset count = %d, want 0", len(c.Hooks()))
+	}
+}
+
+func TestDependencyTrackingJSON(t *testing.T) {
+	resetContainer(t)
+
+	type Dep struct{}
+	type Svc struct{}
+
+	Supply(&Dep{})
+	Provide(func() (*Svc, error) {
+		_ = MustMake[*Dep]()
+		return &Svc{}, nil
+	})
+	_ = MustMake[*Svc]()
+
+	infos := Inspect()
+	for _, info := range infos {
+		if info.Name == "*container.Svc" {
+			data, err := json.Marshal(info)
+			if err != nil {
+				t.Fatalf("Marshal error: %v", err)
+			}
+			var m map[string]any
+			if err := json.Unmarshal(data, &m); err != nil {
+				t.Fatalf("Unmarshal error: %v", err)
+			}
+			deps, ok := m["deps"].([]any)
+			if !ok || len(deps) != 1 {
+				t.Errorf("JSON deps = %v, want 1-element array", m["deps"])
+			}
+			return
+		}
+	}
+	t.Fatal("Svc not found in Inspect()")
+}
