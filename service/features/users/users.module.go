@@ -28,7 +28,9 @@ func (m *Module) Boot() error {
 		readDB:  sqliteDB.ReadDB(),
 		writeDB: sqliteDB.WriteDB(),
 	}
-	server.Mux().HandleFunc("GET /api/users", uc.list)
+
+	g := server.Group("/api/users")
+	g.HandleFunc("GET /", uc.list)
 
 	return nil
 }

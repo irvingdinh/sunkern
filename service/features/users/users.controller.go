@@ -2,11 +2,11 @@ package users
 
 import (
 	"database/sql"
-	"encoding/json"
 	"log/slog"
 	"net/http"
 
 	"sunkern.local/framework/db"
+	sunkernhttp "sunkern.local/framework/http"
 )
 
 // usersController groups HTTP handlers for the /api/users resource.
@@ -23,12 +23,9 @@ func (c *usersController) list(w http.ResponseWriter, r *http.Request) {
 	items, err := db.QueryAll[User](r.Context(), c.readDB, q)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "users: list", "error", err)
-		http.Error(w, `{"error":"internal server error"}`, http.StatusInternalServerError)
+		sunkernhttp.Error(w, err)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"data": items,
-	})
+	sunkernhttp.JSON(w, http.StatusOK, items)
 }
