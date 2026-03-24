@@ -145,3 +145,62 @@ func (g *ModuleGroup) shutdownBooted(ctx context.Context) error {
 	}
 	return errors.Join(errs...)
 }
+
+// ---------------------------------------------------------------------------
+// Optional module interfaces
+// ---------------------------------------------------------------------------
+
+// Tagger is optionally implemented by modules to provide categorization
+// tags for admin introspection. Tags are free-form strings — common
+// values include "builtin", "admin", "feature", "experimental".
+type Tagger interface {
+	Tags() []string
+}
+
+// DependencyDeclarer is optionally implemented by modules that depend on
+// other modules being registered. The app validates all declared
+// dependencies between the register and boot phases — if any named
+// dependency is not registered (or is disabled), boot fails with a
+// clear error.
+//
+// This is a validation-only mechanism — it does NOT reorder modules.
+// Registration order still determines boot order.
+type DependencyDeclarer interface {
+	DependsOn() []string
+}
+
+// ---------------------------------------------------------------------------
+// Conditional modules
+// ---------------------------------------------------------------------------
+
+// When conditionally includes a module. If condition is true, the module
+// participates in all lifecycle phases normally. If false, the module is
+// disabled — all lifecycle methods become no-ops, but it still appears
+// in App.ModuleInfo() with status "disabled" and preserves the inner
+// module's name, tags, and dependencies for introspection.
+//
+//	a.Use(app.When(os.Getenv("ENABLE_EMAIL") == "true", emailModule))
+func When(condition bool, m Module) Module {
+	if condition {
+		return m
+	}
+	return &disabledModule{inner: m}
+}
+
+// disabledModule wraps a module excluded by When(false, ...). All
+// lifecycle methods are no-ops. The inner module's metadata is preserved
+// for introspection via App.ModuleInfo().
+type disabledModule struct {
+	inner Module
+}
+
+func (d *disabledModule) Name() string                     { return d.inner.Name() }
+func (d *disabledModule) Register() error                  { return nil }
+func (d *disabledModule) Boot() error                      { return nil }
+func (d *disabledModule) Shutdown(_ context.Context) error { return nil }
+
+// isDisabled reports whether m is a disabled wrapper from When(false, ...).
+func isDisabled(m Module) bool {
+	_, ok := m.(*disabledModule)
+	return ok
+}

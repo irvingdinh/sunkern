@@ -925,6 +925,312 @@ func contains(calls []string, target string) bool {
 	return false
 }
 
+// ---------------------------------------------------------------------------
+// Tagger / DependencyDeclarer / When
+// ---------------------------------------------------------------------------
+
+type testModuleWithTags struct {
+	testModule
+	tags []string
+}
+
+func (m *testModuleWithTags) Tags() []string { return m.tags }
+
+type testModuleWithDeps struct {
+	testModule
+	deps []string
+}
+
+func (m *testModuleWithDeps) DependsOn() []string { return m.deps }
+
+type testModuleWithTagsAndDeps struct {
+	testModule
+	tags []string
+	deps []string
+}
+
+func (m *testModuleWithTagsAndDeps) Tags() []string      { return m.tags }
+func (m *testModuleWithTagsAndDeps) DependsOn() []string  { return m.deps }
+
+func TestDuplicateModuleNames(t *testing.T) {
+	a := newTestApp(t)
+	a.Use(&testModule{BaseModule: BaseModule{ModuleName: "dup"}})
+	a.Use(&testModule{BaseModule: BaseModule{ModuleName: "dup"}})
+
+	err := a.run()
+	if err == nil || !strings.Contains(err.Error(), "duplicate module name") {
+		t.Fatalf("expected duplicate name error, got: %v", err)
+	}
+}
+
+func TestDependencyValidationPasses(t *testing.T) {
+	a := newTestApp(t)
+	a.Use(&testModule{BaseModule: BaseModule{ModuleName: "auth"}})
+	a.Use(&testModuleWithDeps{
+		testModule: testModule{BaseModule: BaseModule{ModuleName: "users"}},
+		deps:       []string{"auth"},
+	})
+
+	if err := a.run(); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+}
+
+func TestDependencyValidationMissingDep(t *testing.T) {
+	a := newTestApp(t)
+	a.Use(&testModuleWithDeps{
+		testModule: testModule{BaseModule: BaseModule{ModuleName: "users"}},
+		deps:       []string{"auth"},
+	})
+
+	err := a.run()
+	if err == nil || !strings.Contains(err.Error(), `depends on "auth"`) {
+		t.Fatalf("expected dependency error, got: %v", err)
+	}
+}
+
+func TestDependencyValidationDisabledDep(t *testing.T) {
+	a := newTestApp(t)
+	a.Use(When(false, &testModule{BaseModule: BaseModule{ModuleName: "auth"}}))
+	a.Use(&testModuleWithDeps{
+		testModule: testModule{BaseModule: BaseModule{ModuleName: "users"}},
+		deps:       []string{"auth"},
+	})
+
+	err := a.run()
+	if err == nil || !strings.Contains(err.Error(), `depends on "auth"`) {
+		t.Fatalf("expected dependency error for disabled dep, got: %v", err)
+	}
+}
+
+func TestDependencyValidationMultipleDeps(t *testing.T) {
+	a := newTestApp(t)
+	a.Use(&testModule{BaseModule: BaseModule{ModuleName: "auth"}})
+	a.Use(&testModule{BaseModule: BaseModule{ModuleName: "notifications"}})
+	a.Use(&testModuleWithDeps{
+		testModule: testModule{BaseModule: BaseModule{ModuleName: "users"}},
+		deps:       []string{"auth", "notifications"},
+	})
+
+	if err := a.run(); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+}
+
+func TestWhenTrue(t *testing.T) {
+	a := newTestApp(t)
+	m := &testModule{BaseModule: BaseModule{ModuleName: "feature"}}
+	a.Use(When(true, m))
+
+	if err := a.run(); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	if !contains(m.calls, "register") || !contains(m.calls, "boot") {
+		t.Errorf("When(true) should run lifecycle, calls = %v", m.calls)
+	}
+}
+
+func TestWhenFalse(t *testing.T) {
+	a := newTestApp(t)
+	m := &testModule{BaseModule: BaseModule{ModuleName: "feature"}}
+	a.Use(When(false, m))
+
+	if err := a.run(); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	if contains(m.calls, "register") || contains(m.calls, "boot") || contains(m.calls, "shutdown") {
+		t.Errorf("When(false) should skip all lifecycle, calls = %v", m.calls)
+	}
+}
+
+func TestWhenFalseSkipsPostBoot(t *testing.T) {
+	a := newTestApp(t)
+	m := &testModuleWithPostBoot{
+		testModule: testModule{BaseModule: BaseModule{ModuleName: "feature"}},
+	}
+	a.Use(When(false, m))
+
+	if err := a.run(); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	if contains(m.calls, "post-boot") {
+		t.Error("disabled module should not run PostBoot")
+	}
+}
+
+func TestWhenFalsePreservesName(t *testing.T) {
+	m := When(false, &testModule{BaseModule: BaseModule{ModuleName: "email"}})
+	if m.Name() != "email" {
+		t.Errorf("Name() = %q, want %q", m.Name(), "email")
+	}
+}
+
+func TestWhenMixedModules(t *testing.T) {
+	a := newTestApp(t)
+
+	active := &testModule{BaseModule: BaseModule{ModuleName: "active"}}
+	disabled := &testModule{BaseModule: BaseModule{ModuleName: "disabled"}}
+
+	a.Use(active)
+	a.Use(When(false, disabled))
+
+	if err := a.run(); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	// Active module ran full lifecycle.
+	if !contains(active.calls, "register") || !contains(active.calls, "boot") {
+		t.Errorf("active module should run lifecycle, calls = %v", active.calls)
+	}
+	// Disabled module skipped entirely.
+	if contains(disabled.calls, "register") || contains(disabled.calls, "boot") {
+		t.Errorf("disabled module should skip lifecycle, calls = %v", disabled.calls)
+	}
+}
+
+func TestModuleInfoBasic(t *testing.T) {
+	a := newTestApp(t)
+	a.Use(&testModule{BaseModule: BaseModule{ModuleName: "auth"}})
+	a.Use(&testModule{BaseModule: BaseModule{ModuleName: "users"}})
+
+	if err := a.run(); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	infos := a.ModuleInfo()
+	if len(infos) != 2 {
+		t.Fatalf("ModuleInfo() returned %d entries, want 2", len(infos))
+	}
+
+	// After run() returns, ready=false and booted is populated → status=shutdown.
+	if infos[0].Name != "auth" || infos[0].Status != ModuleStatusShutdown {
+		t.Errorf("infos[0] = {%q, %q}, want {auth, shutdown}", infos[0].Name, infos[0].Status)
+	}
+	if infos[1].Name != "users" || infos[1].Status != ModuleStatusShutdown {
+		t.Errorf("infos[1] = {%q, %q}, want {users, shutdown}", infos[1].Name, infos[1].Status)
+	}
+}
+
+func TestModuleInfoWithTags(t *testing.T) {
+	a := newTestApp(t)
+	a.Use(&testModuleWithTags{
+		testModule: testModule{BaseModule: BaseModule{ModuleName: "auth"}},
+		tags:       []string{"builtin", "security"},
+	})
+
+	if err := a.run(); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	infos := a.ModuleInfo()
+	if len(infos[0].Tags) != 2 || infos[0].Tags[0] != "builtin" || infos[0].Tags[1] != "security" {
+		t.Errorf("infos[0].Tags = %v, want [builtin security]", infos[0].Tags)
+	}
+}
+
+func TestModuleInfoWithDeps(t *testing.T) {
+	a := newTestApp(t)
+	a.Use(&testModule{BaseModule: BaseModule{ModuleName: "auth"}})
+	a.Use(&testModuleWithDeps{
+		testModule: testModule{BaseModule: BaseModule{ModuleName: "users"}},
+		deps:       []string{"auth"},
+	})
+
+	if err := a.run(); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	infos := a.ModuleInfo()
+	if len(infos[1].Dependencies) != 1 || infos[1].Dependencies[0] != "auth" {
+		t.Errorf("infos[1].Dependencies = %v, want [auth]", infos[1].Dependencies)
+	}
+}
+
+func TestModuleInfoDisabledPreservesMetadata(t *testing.T) {
+	a := newTestApp(t)
+	a.Use(When(false, &testModuleWithTagsAndDeps{
+		testModule: testModule{BaseModule: BaseModule{ModuleName: "email"}},
+		tags:       []string{"optional"},
+		deps:       []string{"auth"},
+	}))
+
+	if err := a.run(); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	infos := a.ModuleInfo()
+	if len(infos) != 1 {
+		t.Fatalf("ModuleInfo() returned %d entries, want 1", len(infos))
+	}
+	if infos[0].Status != ModuleStatusDisabled {
+		t.Errorf("Status = %q, want %q", infos[0].Status, ModuleStatusDisabled)
+	}
+	if len(infos[0].Tags) != 1 || infos[0].Tags[0] != "optional" {
+		t.Errorf("Tags = %v, want [optional]", infos[0].Tags)
+	}
+	if len(infos[0].Dependencies) != 1 || infos[0].Dependencies[0] != "auth" {
+		t.Errorf("Dependencies = %v, want [auth]", infos[0].Dependencies)
+	}
+}
+
+func TestModuleInfoStatusDuringBoot(t *testing.T) {
+	a := newTestApp(t)
+
+	var capturedInfo []ModuleInfo
+	a.Use(&testModule{
+		BaseModule: BaseModule{ModuleName: "probe"},
+		bootFn: func() error {
+			capturedInfo = a.ModuleInfo()
+			return nil
+		},
+	})
+
+	if err := a.run(); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	// During boot, ready=false, module is not yet in booted set → registered.
+	if len(capturedInfo) != 1 {
+		t.Fatalf("captured %d entries, want 1", len(capturedInfo))
+	}
+	if capturedInfo[0].Status != ModuleStatusRegistered {
+		t.Errorf("status during boot = %q, want %q", capturedInfo[0].Status, ModuleStatusRegistered)
+	}
+}
+
+func TestModuleNamesShowsDisabled(t *testing.T) {
+	a := newTestApp(t)
+	a.Use(&testModule{BaseModule: BaseModule{ModuleName: "auth"}})
+	a.Use(When(false, &testModule{BaseModule: BaseModule{ModuleName: "email"}}))
+
+	names := a.moduleNames()
+	if len(names) != 2 {
+		t.Fatalf("moduleNames() returned %d, want 2", len(names))
+	}
+	if names[0] != "auth" {
+		t.Errorf("names[0] = %q, want %q", names[0], "auth")
+	}
+	if names[1] != "email (disabled)" {
+		t.Errorf("names[1] = %q, want %q", names[1], "email (disabled)")
+	}
+}
+
+func TestDisabledModulesNotInDependencyValidation(t *testing.T) {
+	// A disabled module with DependsOn should NOT be validated.
+	a := newTestApp(t)
+	a.Use(When(false, &testModuleWithDeps{
+		testModule: testModule{BaseModule: BaseModule{ModuleName: "email"}},
+		deps:       []string{"nonexistent"},
+	}))
+
+	if err := a.run(); err != nil {
+		t.Fatalf("disabled module's deps should not be validated, got: %v", err)
+	}
+}
+
 // Ensure DATA_DIR is always set for tests that call config.Load via Run.
 func TestMain(m *testing.M) {
 	if os.Getenv("DATA_DIR") == "" {

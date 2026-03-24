@@ -85,6 +85,25 @@ func WithVersion(v string) Option {
 	return func(a *App) { a.version = v }
 }
 
+// ModuleStatus represents a module's position in the application lifecycle.
+type ModuleStatus string
+
+const (
+	ModuleStatusRegistered ModuleStatus = "registered"
+	ModuleStatusBooted     ModuleStatus = "booted"
+	ModuleStatusShutdown   ModuleStatus = "shutdown"
+	ModuleStatusDisabled   ModuleStatus = "disabled"
+)
+
+// ModuleInfo describes a module for admin introspection. Serialize
+// directly to JSON for admin API responses.
+type ModuleInfo struct {
+	Name         string       `json:"name"`
+	Status       ModuleStatus `json:"status"`
+	Tags         []string     `json:"tags,omitempty"`
+	Dependencies []string     `json:"dependencies,omitempty"`
+}
+
 // Use adds modules to the application. Modules are registered and booted
 // in the order they are added.
 func (a *App) Use(modules ...Module) {
@@ -134,6 +153,51 @@ func (a *App) Version() string {
 // during Run, defaulting to "development".
 func (a *App) Env() string {
 	return a.env
+}
+
+// ModuleInfo returns metadata about all registered modules, including
+// disabled ones. Status reflects the current lifecycle position. Safe
+// to call from HTTP handlers during the running phase.
+func (a *App) ModuleInfo() []ModuleInfo {
+	bootedSet := make(map[string]bool, len(a.booted))
+	for _, m := range a.booted {
+		bootedSet[m.Name()] = true
+	}
+
+	infos := make([]ModuleInfo, len(a.modules))
+	for i, m := range a.modules {
+		var status ModuleStatus
+		switch {
+		case isDisabled(m):
+			status = ModuleStatusDisabled
+		case !bootedSet[m.Name()]:
+			status = ModuleStatusRegistered
+		case a.ready.Load():
+			status = ModuleStatusBooted
+		default:
+			status = ModuleStatusShutdown
+		}
+
+		info := ModuleInfo{
+			Name:   m.Name(),
+			Status: status,
+		}
+
+		// For disabled wrappers, read metadata from the inner module.
+		target := m
+		if d, ok := m.(*disabledModule); ok {
+			target = d.inner
+		}
+		if t, ok := target.(Tagger); ok {
+			info.Tags = t.Tags()
+		}
+		if dd, ok := target.(DependencyDeclarer); ok {
+			info.Dependencies = dd.DependsOn()
+		}
+
+		infos[i] = info
+	}
+	return infos
 }
 
 // Run executes the full application lifecycle. It blocks until a shutdown
@@ -191,6 +255,12 @@ func (a *App) run() error {
 		return err
 	}
 	registerMs := time.Since(phaseStart).Milliseconds()
+
+	// Validate declared module dependencies. Catches misconfigured
+	// module ordering before any framework service initialization.
+	if err := a.validateDependencies(); err != nil {
+		return err
+	}
 
 	// Phase 2: Init framework services.
 	phaseStart = time.Now()
@@ -345,7 +415,21 @@ func (a *App) run() error {
 // ---------------------------------------------------------------------------
 
 func (a *App) register() error {
+	// Validate: no duplicate module names.
+	seen := make(map[string]bool, len(a.modules))
 	for _, m := range a.modules {
+		name := m.Name()
+		if seen[name] {
+			return fmt.Errorf("duplicate module name: %q", name)
+		}
+		seen[name] = true
+	}
+
+	for _, m := range a.modules {
+		if isDisabled(m) {
+			slog.Debug("module disabled", "module", m.Name())
+			continue
+		}
 		slog.Debug("registering module", "module", m.Name())
 		if err := m.Register(); err != nil {
 			return fmt.Errorf("register %q: %w", m.Name(), err)
@@ -356,6 +440,9 @@ func (a *App) register() error {
 
 func (a *App) boot() error {
 	for _, m := range a.modules {
+		if isDisabled(m) {
+			continue
+		}
 		t := time.Now()
 		if err := m.Boot(); err != nil {
 			// Rollback: shutdown modules that already booted.
@@ -412,10 +499,38 @@ func (a *App) shutdownModules(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
+func (a *App) validateDependencies() error {
+	registered := make(map[string]bool, len(a.modules))
+	for _, m := range a.modules {
+		if !isDisabled(m) {
+			registered[m.Name()] = true
+		}
+	}
+	for _, m := range a.modules {
+		if isDisabled(m) {
+			continue
+		}
+		dd, ok := m.(DependencyDeclarer)
+		if !ok {
+			continue
+		}
+		for _, dep := range dd.DependsOn() {
+			if !registered[dep] {
+				return fmt.Errorf("module %q depends on %q, which is not registered or is disabled", m.Name(), dep)
+			}
+		}
+	}
+	return nil
+}
+
 func (a *App) moduleNames() []string {
 	names := make([]string, len(a.modules))
 	for i, m := range a.modules {
-		names[i] = m.Name()
+		if isDisabled(m) {
+			names[i] = m.Name() + " (disabled)"
+		} else {
+			names[i] = m.Name()
+		}
 	}
 	return names
 }
