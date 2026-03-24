@@ -131,6 +131,7 @@ func (a *App) run() error {
 	// Phase 1: Register all modules. Every module's Register() runs before
 	// any module's Boot(). Only container.Provide / config.SetDefault calls
 	// belong in Register.
+	slog.Info("registering modules", "count", len(a.modules), "modules", a.moduleNames())
 	if err := a.register(); err != nil {
 		return err
 	}
@@ -203,6 +204,7 @@ func (a *App) run() error {
 
 func (a *App) register() error {
 	for _, m := range a.modules {
+		slog.Debug("registering module", "module", m.Name())
 		if err := m.Register(); err != nil {
 			return fmt.Errorf("register %q: %w", m.Name(), err)
 		}
@@ -212,6 +214,7 @@ func (a *App) register() error {
 
 func (a *App) boot() error {
 	for _, m := range a.modules {
+		slog.Debug("booting module", "module", m.Name())
 		if err := m.Boot(); err != nil {
 			// Rollback: shutdown modules that already booted.
 			_ = a.shutdownModules(context.Background())
@@ -230,6 +233,14 @@ func (a *App) shutdownModules(ctx context.Context) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func (a *App) moduleNames() []string {
+	names := make([]string, len(a.modules))
+	for i, m := range a.modules {
+		names[i] = m.Name()
+	}
+	return names
 }
 
 func (a *App) waitForSignal() {

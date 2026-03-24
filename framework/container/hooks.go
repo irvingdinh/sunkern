@@ -31,7 +31,7 @@ func (c *Container) StartHooks(ctx context.Context) error {
 			// Rollback: stop already-started hooks in reverse.
 			rollbackErr := stopHooksReverse(ctx, hooks[:i])
 			return errors.Join(
-				fmt.Errorf("container: starting hook %d: %w", i, err),
+				fmt.Errorf("container: starting hook %s: %w", hookLabel(h, i), err),
 				rollbackErr,
 			)
 		}
@@ -55,6 +55,15 @@ func (c *Container) StopHooks(ctx context.Context) error {
 // Internal
 // ---------------------------------------------------------------------------
 
+// hookLabel returns a display label for a hook: the Name if set, otherwise
+// the positional index.
+func hookLabel(h Hook, index int) string {
+	if h.Name != "" {
+		return fmt.Sprintf("%q", h.Name)
+	}
+	return fmt.Sprintf("%d", index)
+}
+
 func stopHooksReverse(ctx context.Context, hooks []Hook) error {
 	var errs []error
 	for i := len(hooks) - 1; i >= 0; i-- {
@@ -63,7 +72,7 @@ func stopHooksReverse(ctx context.Context, hooks []Hook) error {
 			continue
 		}
 		if err := h.OnStop(ctx); err != nil {
-			errs = append(errs, fmt.Errorf("container: stopping hook %d: %w", i, err))
+			errs = append(errs, fmt.Errorf("container: stopping hook %s: %w", hookLabel(h, i), err))
 		}
 	}
 	return errors.Join(errs...)

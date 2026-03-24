@@ -388,6 +388,96 @@ func TestModuleGroup(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// ModuleGroup boot rollback
+// ---------------------------------------------------------------------------
+
+func TestModuleGroupBootRollback(t *testing.T) {
+	// When a child module fails Boot inside a ModuleGroup, previously-booted
+	// children must be shut down (rollback).
+	var order []string
+	record := func(s string) { order = append(order, s) }
+
+	g := &ModuleGroup{
+		GroupName: "admin",
+		Modules: []Module{
+			&testModule{
+				BaseModule: BaseModule{ModuleName: "auth"},
+				bootFn:     func() error { record("auth:boot"); return nil },
+				shutdownFn: func(_ context.Context) error { record("auth:shutdown"); return nil },
+			},
+			&testModule{
+				BaseModule: BaseModule{ModuleName: "users"},
+				bootFn:     func() error { record("users:boot"); return nil },
+				shutdownFn: func(_ context.Context) error { record("users:shutdown"); return nil },
+			},
+			&testModule{
+				BaseModule: BaseModule{ModuleName: "logs"},
+				bootFn:     func() error { return fmt.Errorf("logs boot failed") },
+				shutdownFn: func(_ context.Context) error { record("logs:shutdown"); return nil },
+			},
+			&testModule{
+				BaseModule: BaseModule{ModuleName: "settings"},
+				bootFn:     func() error { record("settings:boot"); return nil },
+				shutdownFn: func(_ context.Context) error { record("settings:shutdown"); return nil },
+			},
+		},
+	}
+
+	err := g.Boot()
+	if err == nil || !strings.Contains(err.Error(), "logs boot failed") {
+		t.Fatalf("expected boot error, got: %v", err)
+	}
+
+	// auth and users booted, then logs failed.
+	// settings should never have booted.
+	// auth and users should be shut down in reverse.
+	want := []string{
+		"auth:boot", "users:boot",
+		"users:shutdown", "auth:shutdown",
+	}
+	if len(order) != len(want) {
+		t.Fatalf("events = %v, want %v", order, want)
+	}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Errorf("events[%d] = %q, want %q", i, order[i], want[i])
+		}
+	}
+}
+
+func TestModuleGroupShutdownOnlyBooted(t *testing.T) {
+	// Shutdown should only shut down children that completed Boot.
+	var shutdowns []string
+
+	g := &ModuleGroup{
+		GroupName: "group",
+		Modules: []Module{
+			&testModule{
+				BaseModule: BaseModule{ModuleName: "a"},
+				shutdownFn: func(_ context.Context) error { shutdowns = append(shutdowns, "a"); return nil },
+			},
+			&testModule{
+				BaseModule: BaseModule{ModuleName: "b"},
+				bootFn:     func() error { return fmt.Errorf("b failed") },
+				shutdownFn: func(_ context.Context) error { shutdowns = append(shutdowns, "b"); return nil },
+			},
+		},
+	}
+
+	// Boot fails at b → only a booted.
+	_ = g.Boot()
+
+	// Reset and call Shutdown explicitly — only a should be shut down.
+	// But a was already rolled back during Boot failure. After rollback,
+	// booted is empty, so Shutdown should be a no-op.
+	shutdowns = nil
+	_ = g.Shutdown(context.Background())
+	if len(shutdowns) != 0 {
+		t.Errorf("Shutdown after failed Boot should be no-op, got %v", shutdowns)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Edge cases
 // ---------------------------------------------------------------------------
 

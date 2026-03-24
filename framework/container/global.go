@@ -32,6 +32,21 @@ func MustMake[T any]() T {
 	return mustMakeFromContainer[T](global)
 }
 
+// Override replaces the registration for type T with a new lazy provider.
+// Unlike Provide, this does not panic on duplicate registration — it
+// silently replaces the existing provider (and discards any cached instance).
+// If T is not registered, it is registered as new. Intended for testing and
+// environment switching.
+func Override[T any](provider func() (T, error)) {
+	overrideToContainer[T](global, provider)
+}
+
+// OverrideSupply replaces the registration for type T with a pre-built
+// value. Same semantics as Override but without a lazy provider.
+func OverrideSupply[T any](value T) {
+	overrideSupplyToContainer[T](global, value)
+}
+
 // Has reports whether type T is registered.
 func Has[T any]() bool {
 	return hasInContainer[T](global)

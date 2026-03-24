@@ -53,6 +53,7 @@ func NewServer() (Server, error) {
 	}
 
 	container.AppendHook(container.Hook{
+		Name: "http",
 		OnStart: func(_ context.Context) error {
 			ln, err := net.Listen("tcp", srv.Addr)
 			if err != nil {

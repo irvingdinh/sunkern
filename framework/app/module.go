@@ -43,11 +43,15 @@ func (b *BaseModule) Shutdown(_ context.Context) error { return nil }
 
 // ModuleGroup composes multiple modules into a single Module. Register and
 // Boot delegate to children in order; Shutdown delegates in reverse order.
+// Only children that completed Boot are shut down — if Boot fails partway
+// through, already-booted children are rolled back immediately.
+//
 // This maps to Sunkern's hierarchical module structure (e.g., adminmod
 // containing auth, usermgmt, logmgmt sub-modules).
 type ModuleGroup struct {
 	GroupName string
 	Modules   []Module
+	booted    []Module // children that completed Boot (for rollback)
 }
 
 func (g *ModuleGroup) Name() string { return g.GroupName }
@@ -64,18 +68,26 @@ func (g *ModuleGroup) Register() error {
 func (g *ModuleGroup) Boot() error {
 	for _, m := range g.Modules {
 		if err := m.Boot(); err != nil {
+			// Rollback: shutdown children that already booted, in reverse.
+			_ = g.shutdownBooted(context.Background())
+			g.booted = nil // prevent double-shutdown if parent also calls Shutdown
 			return fmt.Errorf("module %s/%s boot: %w", g.GroupName, m.Name(), err)
 		}
+		g.booted = append(g.booted, m)
 	}
 	return nil
 }
 
 func (g *ModuleGroup) Shutdown(ctx context.Context) error {
+	return g.shutdownBooted(ctx)
+}
+
+func (g *ModuleGroup) shutdownBooted(ctx context.Context) error {
 	var errs []error
-	for i := len(g.Modules) - 1; i >= 0; i-- {
-		if err := g.Modules[i].Shutdown(ctx); err != nil {
+	for i := len(g.booted) - 1; i >= 0; i-- {
+		if err := g.booted[i].Shutdown(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("module %s/%s shutdown: %w",
-				g.GroupName, g.Modules[i].Name(), err))
+				g.GroupName, g.booted[i].Name(), err))
 		}
 	}
 	return errors.Join(errs...)

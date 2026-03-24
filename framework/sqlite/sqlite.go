@@ -91,6 +91,7 @@ func Load() {
 	global.mu.Unlock()
 
 	container.AppendHook(container.Hook{
+		Name: "sqlite",
 		OnStop: func(_ context.Context) error {
 			return Close()
 		},

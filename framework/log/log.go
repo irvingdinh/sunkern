@@ -62,6 +62,7 @@ func Load() {
 	container.Supply[*slog.LevelVar](&consoleLevel)
 
 	container.AppendHook(container.Hook{
+		Name: "log",
 		OnStop: func(_ context.Context) error {
 			return Close()
 		},

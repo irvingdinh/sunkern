@@ -20,7 +20,11 @@ type service struct {
 
 // Hook pairs an optional start callback with an optional stop callback.
 // Hooks are executed in registration order on start and reverse order on stop.
+// Name is optional — when set, it appears in error messages instead of the
+// hook's positional index (e.g., "starting hook 'http-server'" vs "starting
+// hook 2").
 type Hook struct {
+	Name    string
 	OnStart func(ctx context.Context) error
 	OnStop  func(ctx context.Context) error
 }

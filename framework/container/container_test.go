@@ -394,6 +394,117 @@ func TestMakeErrorCached(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Override
+// ---------------------------------------------------------------------------
+
+func TestOverride(t *testing.T) {
+	resetContainer(t)
+
+	type Svc struct{ Name string }
+	Provide(func() (*Svc, error) { return &Svc{Name: "original"}, nil })
+
+	Override(func() (*Svc, error) { return &Svc{Name: "replaced"}, nil })
+
+	got := MustMake[*Svc]()
+	if got.Name != "replaced" {
+		t.Errorf("Name = %q, want %q", got.Name, "replaced")
+	}
+}
+
+func TestOverrideAfterBuild(t *testing.T) {
+	resetContainer(t)
+
+	type Svc struct{ Name string }
+	Provide(func() (*Svc, error) { return &Svc{Name: "original"}, nil })
+
+	// Build the original.
+	orig := MustMake[*Svc]()
+	if orig.Name != "original" {
+		t.Fatalf("Name = %q, want %q", orig.Name, "original")
+	}
+
+	// Override discards the cached instance.
+	Override(func() (*Svc, error) { return &Svc{Name: "replaced"}, nil })
+
+	got := MustMake[*Svc]()
+	if got.Name != "replaced" {
+		t.Errorf("Name = %q, want %q", got.Name, "replaced")
+	}
+	if got == orig {
+		t.Error("expected different instance after Override")
+	}
+}
+
+func TestOverrideSupply(t *testing.T) {
+	resetContainer(t)
+
+	type Cfg struct{ Port int }
+	Supply(&Cfg{Port: 3000})
+
+	OverrideSupply(&Cfg{Port: 8080})
+
+	got := MustMake[*Cfg]()
+	if got.Port != 8080 {
+		t.Errorf("Port = %d, want 8080", got.Port)
+	}
+}
+
+func TestOverrideUnregistered(t *testing.T) {
+	resetContainer(t)
+
+	type Svc struct{ Name string }
+	// Override on an unregistered type should work like Provide.
+	Override(func() (*Svc, error) { return &Svc{Name: "new"}, nil })
+
+	got := MustMake[*Svc]()
+	if got.Name != "new" {
+		t.Errorf("Name = %q, want %q", got.Name, "new")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Named hooks
+// ---------------------------------------------------------------------------
+
+func TestNamedHookErrorMessage(t *testing.T) {
+	resetContainer(t)
+
+	AppendHook(Hook{
+		Name: "database",
+		OnStart: func(_ context.Context) error {
+			return fmt.Errorf("connection refused")
+		},
+	})
+
+	err := global.StartHooks(context.Background())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), `"database"`) {
+		t.Errorf("error = %q, want hook name %q in message", err.Error(), "database")
+	}
+}
+
+func TestNamedHookStopErrorMessage(t *testing.T) {
+	resetContainer(t)
+
+	AppendHook(Hook{
+		Name: "cache",
+		OnStop: func(_ context.Context) error {
+			return fmt.Errorf("flush failed")
+		},
+	})
+
+	err := global.StopHooks(context.Background())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), `"cache"`) {
+		t.Errorf("error = %q, want hook name %q in message", err.Error(), "cache")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Concurrency
 // ---------------------------------------------------------------------------
 
