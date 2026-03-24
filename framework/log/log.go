@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 
 	"sunkern.local/framework/config"
 	"sunkern.local/framework/container"
@@ -24,10 +23,11 @@ var global state
 
 // Load creates the dual-output structured logger and sets it as the slog
 // default, after [config.Load] has run. It reads "log.level" from config for
-// the handler level (default "INFO") and "log.format" for the console output
-// format ("json" default, or "text" for human-readable dev output). File logs
-// are always JSON. On failure it panics (same spirit as config.Load). Call
-// Close to flush and close the file writer during shutdown.
+// the handler level (default "INFO"). Both console and file produce JSON with
+// identical structure; console output is pretty-printed (2-space indent) for
+// readability, file output is compact JSONL for machine consumption. On
+// failure it panics (same spirit as config.Load). Call Close to flush and
+// close the file writer during shutdown.
 func Load() {
 	levelStr := config.GetOr[string]("log.level", "INFO")
 	var consoleLevel slog.LevelVar
@@ -35,29 +35,10 @@ func Load() {
 		panic(fmt.Sprintf("log: %v", err))
 	}
 
-	formatStr := strings.ToLower(strings.TrimSpace(config.GetOr[string]("log.format", "json")))
-
-	var consoleHandler slog.Handler
-	switch formatStr {
-	case "json":
-		consoleHandler = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-			Level: &consoleLevel,
-		})
-	case "text":
-		consoleHandler = slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-			Level: &consoleLevel,
-			ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
-				if len(groups) == 0 && a.Key == slog.TimeKey {
-					if t, ok := a.Value.Any().(time.Time); ok {
-						a.Value = slog.StringValue(t.Format("15:04:05.000"))
-					}
-				}
-				return a
-			},
-		})
-	default:
-		panic(fmt.Sprintf("log: unknown format %q (expected \"json\" or \"text\")", formatStr))
-	}
+	consoleHandler := slog.NewJSONHandler(&prettyWriter{out: os.Stdout}, &slog.HandlerOptions{
+		Level:     &consoleLevel,
+		AddSource: true,
+	})
 
 	dataDir := config.Get[string]("data_dir")
 	logsDir := filepath.Join(dataDir, "logs")

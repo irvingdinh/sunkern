@@ -98,7 +98,7 @@ All runtime and stateful data lives under a single directory.
 
 ```
 {DATA_DIR}/
-  config.yaml         # application config (optional, can use env vars instead)
+  config.json         # application config (optional, can use env vars instead)
   database.sqlite     # the one and only database
   uploads/            # file uploads
     {YYYY}/{MM}/{DD}/{nanoid}/{filename}
@@ -304,10 +304,10 @@ Two distinct systems for application parameters. This distinction is fundamental
 ### Config — Static, Boot-Time
 
 - Set before or at application start, **cannot change at runtime**
-- Resolution order (each layer overrides the previous):
-    1. Defaults (hardcoded in the framework)
-    2. `{DATA_DIR}/config.yaml`
-    3. Environment variables
+- Resolution order (highest priority first):
+    1. Environment variables
+    2. `{DATA_DIR}/config.json`
+    3. Defaults (hardcoded in the framework)
 - Env var naming: **flat, no prefix** (e.g., `PORT`, `DATA_DIR`, `JWT_SECRET` — not `SUNKERN_PORT`)
 - Contains everything static: port, data dir path, log level, DB pragmas, secrets (JWT secret, S3 credentials, Resend API token, etc.)
 

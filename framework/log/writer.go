@@ -1,12 +1,35 @@
 package log
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 )
+
+// prettyWriter wraps an io.Writer and reformats each compact JSON blob into
+// indented JSON (2-space indent) before writing. Used for console output so
+// the developer can scan log entries visually. Non-JSON input passes through
+// unchanged.
+type prettyWriter struct {
+	out io.Writer
+}
+
+func (w *prettyWriter) Write(p []byte) (int, error) {
+	var buf bytes.Buffer
+	if err := json.Indent(&buf, bytes.TrimSpace(p), "", "  "); err != nil {
+		return w.out.Write(p)
+	}
+	buf.WriteByte('\n')
+	if _, err := w.out.Write(buf.Bytes()); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
 
 // dailyFileWriter is the file sink behind the JSON file handler: a
 // thread-safe io.WriteCloser that appends bytes to one JSONL file per calendar

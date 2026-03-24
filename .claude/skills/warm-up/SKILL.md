@@ -17,7 +17,7 @@ These go into YOUR context directly — you need them for all downstream work:
 
 1. **Read `IDEA.md`** — architecture and design bible for this project.
 2. **Read `Makefile`** — defined workflows. Use these; do not invent commands.
-3. **Load the `go-best-practices` skill** — always, regardless of the task.
+3. **Load the `go-best-practices`, `sunkern-go-best-practices` skill** — always, regardless of the task.
 
 ### Step 2 — Explore the codebase (parallel subagents)
 

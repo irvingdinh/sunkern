@@ -146,13 +146,13 @@ func (a *App) run() error {
 	}
 
 	a.ready.Store(true)
-	slog.Info("application started", "log_type", "lifecycle", "addr", config.GetOr[string]("http.addr", sunkernhttp.DefaultAddr))
+	slog.Info("application started")
 
 	// Phase 5: Wait for shutdown signal.
 	a.waitForSignal()
 
 	// Phase 6: Graceful shutdown.
-	slog.Info("shutting down", "log_type", "lifecycle")
+	slog.Info("shutting down")
 	a.shutdown.once.Do(func() { close(a.shutdown.ch) })
 	a.ready.Store(false)
 

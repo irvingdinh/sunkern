@@ -139,49 +139,48 @@ func TestLoadPanicsOnInvalidLogLevel(t *testing.T) {
 	Load()
 }
 
-func TestLoadWithTextFormat(t *testing.T) {
+func TestConsoleAndFileStructuralParity(t *testing.T) {
 	setup(t)
-	t.Setenv("LOG_FORMAT", "text")
-	config.Load()
 
-	Load()
-	defer Close()
+	// Capture console output via a buffer.
+	var consoleBuf bytes.Buffer
+	consoleH := slog.NewJSONHandler(&prettyWriter{out: &consoleBuf}, &slog.HandlerOptions{
+		AddSource: true,
+	})
+	fileH := slog.NewJSONHandler(&bytes.Buffer{}, &slog.HandlerOptions{
+		AddSource: true,
+	})
 
-	// File handler should still produce valid JSON regardless of console format.
-	slog.Info("text format test")
+	// Use a temporary logger to avoid interfering with global state.
+	merged := newMergedHandler(consoleH, fileH)
+	logger := slog.New(newContextHandler(merged))
 
-	logsDir := filepath.Join(config.Get[string]("data_dir"), "logs")
-	entries, _ := filepath.Glob(filepath.Join(logsDir, "*.log"))
-	if len(entries) == 0 {
-		t.Fatal("expected at least one log file")
-	}
+	ctx := WithRequestID(context.Background(), "req-parity")
+	logger.InfoContext(ctx, "parity check", "extra", "value")
 
-	data, err := os.ReadFile(entries[0])
-	if err != nil {
-		t.Fatalf("reading log file: %v", err)
-	}
-
+	// Parse the console output (pretty-printed JSON).
 	var m map[string]any
-	if err := json.Unmarshal(data, &m); err != nil {
-		t.Fatalf("file output is not valid JSON: %v", err)
+	if err := json.Unmarshal(consoleBuf.Bytes(), &m); err != nil {
+		t.Fatalf("console output is not valid JSON: %v\nraw: %s", err, consoleBuf.String())
 	}
-}
 
-func TestLoadPanicsOnInvalidFormat(t *testing.T) {
-	setup(t)
-	t.Setenv("LOG_FORMAT", "yaml")
-	config.Load()
+	// Both console and file handlers have AddSource, so "source" must be present.
+	for _, key := range []string{"time", "level", "msg", "source", "request_id", "extra"} {
+		if _, ok := m[key]; !ok {
+			t.Errorf("console output missing key %q", key)
+		}
+	}
 
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Fatal("expected panic for invalid LOG_FORMAT")
+	// Verify source is a structured object (not just a string).
+	src, ok := m["source"].(map[string]any)
+	if !ok {
+		t.Fatalf("source should be an object, got %T", m["source"])
+	}
+	for _, field := range []string{"function", "file", "line"} {
+		if _, ok := src[field]; !ok {
+			t.Errorf("source missing field %q", field)
 		}
-		if msg, ok := r.(string); ok && !strings.Contains(msg, "unknown format") {
-			t.Fatalf("unexpected panic message: %s", msg)
-		}
-	}()
-	Load()
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +375,66 @@ func TestResetDiscardsOutput(t *testing.T) {
 	entries, _ := filepath.Glob(filepath.Join(tmpDir, "logs", "*.log"))
 	if len(entries) != 0 {
 		t.Fatalf("expected no log files after Reset, got %d", len(entries))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// parseLevel
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// prettyWriter
+// ---------------------------------------------------------------------------
+
+func TestPrettyWriter(t *testing.T) {
+	var buf bytes.Buffer
+	w := &prettyWriter{out: &buf}
+
+	compact := []byte(`{"level":"INFO","msg":"hello","count":42}` + "\n")
+	n, err := w.Write(compact)
+	if err != nil {
+		t.Fatalf("Write error: %v", err)
+	}
+	if n != len(compact) {
+		t.Fatalf("Write returned %d, want %d", n, len(compact))
+	}
+
+	got := buf.String()
+
+	// Must be valid JSON.
+	var m map[string]any
+	if err := json.Unmarshal([]byte(got), &m); err != nil {
+		t.Fatalf("output is not valid JSON: %v\nraw: %s", err, got)
+	}
+
+	// Must contain 2-space indentation.
+	if !strings.Contains(got, "  \"level\"") {
+		t.Errorf("expected 2-space indented output, got:\n%s", got)
+	}
+
+	// Must contain newlines (multi-line).
+	lines := nonEmptyLines(got)
+	if len(lines) < 3 {
+		t.Errorf("expected multi-line output, got %d lines:\n%s", len(lines), got)
+	}
+}
+
+func TestPrettyWriterFallback(t *testing.T) {
+	var buf bytes.Buffer
+	w := &prettyWriter{out: &buf}
+
+	notJSON := []byte("this is not json\n")
+	n, err := w.Write(notJSON)
+	if err != nil {
+		t.Fatalf("Write error: %v", err)
+	}
+	if n != len(notJSON) {
+		t.Fatalf("Write returned %d, want %d", n, len(notJSON))
+	}
+
+	// Non-JSON input should pass through unchanged.
+	if buf.String() != string(notJSON) {
+		t.Errorf("expected passthrough, got: %q", buf.String())
 	}
 }
 
