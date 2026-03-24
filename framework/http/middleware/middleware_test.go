@@ -193,6 +193,46 @@ func TestResponseRecorderDoubleWriteHeader(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// SubjectFromCtx / RoleFromCtx
+// ---------------------------------------------------------------------------
+
+func TestSubjectFromCtxWithClaims(t *testing.T) {
+	ctx := WithClaims(t.Context(), &Claims{Subject: "user-42", Role: "admin"})
+	if got := SubjectFromCtx(ctx); got != "user-42" {
+		t.Errorf("SubjectFromCtx = %q, want %q", got, "user-42")
+	}
+}
+
+func TestSubjectFromCtxNoClaims(t *testing.T) {
+	if got := SubjectFromCtx(t.Context()); got != "" {
+		t.Errorf("SubjectFromCtx = %q, want empty", got)
+	}
+}
+
+func TestRoleFromCtxWithClaims(t *testing.T) {
+	ctx := WithClaims(t.Context(), &Claims{Subject: "user-1", Role: "editor"})
+	if got := RoleFromCtx(ctx); got != "editor" {
+		t.Errorf("RoleFromCtx = %q, want %q", got, "editor")
+	}
+}
+
+func TestRoleFromCtxNoClaims(t *testing.T) {
+	if got := RoleFromCtx(t.Context()); got != "" {
+		t.Errorf("RoleFromCtx = %q, want empty", got)
+	}
+}
+
+func TestSubjectRoleFromCtxEmptyFields(t *testing.T) {
+	ctx := WithClaims(t.Context(), &Claims{})
+	if got := SubjectFromCtx(ctx); got != "" {
+		t.Errorf("SubjectFromCtx = %q, want empty (zero Claims)", got)
+	}
+	if got := RoleFromCtx(ctx); got != "" {
+		t.Errorf("RoleFromCtx = %q, want empty (zero Claims)", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Integration: RequestID + RequestLogger
 // ---------------------------------------------------------------------------
 

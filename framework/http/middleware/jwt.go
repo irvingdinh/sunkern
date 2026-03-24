@@ -168,6 +168,28 @@ func ClaimsFromCtx(ctx context.Context) *Claims {
 	return nil
 }
 
+// SubjectFromCtx extracts the authenticated user's subject (typically a
+// user ID) from the request context. Returns an empty string if no auth
+// claims are present. This is a convenience shorthand for:
+//
+//	claims := middleware.ClaimsFromCtx(ctx)
+//	if claims != nil { userID = claims.Subject }
+func SubjectFromCtx(ctx context.Context) string {
+	if c := ClaimsFromCtx(ctx); c != nil {
+		return c.Subject
+	}
+	return ""
+}
+
+// RoleFromCtx extracts the authenticated user's role from the request
+// context. Returns an empty string if no auth claims are present.
+func RoleFromCtx(ctx context.Context) string {
+	if c := ClaimsFromCtx(ctx); c != nil {
+		return c.Role
+	}
+	return ""
+}
+
 // ---------------------------------------------------------------------------
 // Internal
 // ---------------------------------------------------------------------------
