@@ -8,7 +8,7 @@
 
 ## Current State
 
-**Last session**: 2026-03-24 — Session 13 (framework/app + framework/container revisited — introspection, App-in-container, lifecycle timing)
+**Last session**: 2026-03-24 — Session 14 (framework/http revisited — SSE support for real-time streaming)
 **Working tree**: clean
 **Branch**: with-experiment
 
@@ -20,7 +20,7 @@
 | `framework/container` | **Maturing** | Session 13 | Revisited: introspection APIs (Keys, Inspect, Len), ServiceInfo/ServiceStatus types, Hooks() accessor. Previous: Override/OverrideSupply, named hooks, all framework hooks named |
 | `framework/config` | **Growing** | Session 7 | Added Has, All, Keys, Sub, DataDir, EnvName, SetDefaults; Load creates data dir; improved panic messages |
 | `framework/log` | **Growing** | Session 8 | Separate console/file levels (ConsoleLevel, FileLevel types), log file management (ListFiles, CleanOldFiles, OpenFile), JSONL entry parsing + querying (Entry, Query with level/search/user_id/request_id filter + pagination) |
-| `framework/http` | **Maturing** | Session 10 | Revisited: Bind/BindForm now detect http.MaxBytesError and return 413 instead of 400. Previous: file upload handling (FormFile, FormFiles, BindForm, SaveFile, ValidateFile, DetectFileType), all sentinels |
+| `framework/http` | **Maturing** | Session 14 | Revisited: SSE support (NewEventStream, SSEWriter with Send/SendJSON/Heartbeat/Retry/Done, LastEventID, write deadline extension via ResponseController, ErrStreamingNotSupported sentinel). Previous (Session 10): Bind/BindForm MaxBytesError → 413. Previous: file upload handling, all sentinels |
 | `framework/http/middleware` | **Maturing** | Session 10 | Revisited: JWT (HMAC-SHA256 sign/verify, Claims, context helpers), Auth (Bearer token extraction + verification + user_id logging), RequireRole (role-based 403), MaxBytes (body size limiter). Plus existing: RequestID, RequestLogger, Recover, CORS, RateLimit |
 | `framework/db` | **Maturing** | Session 12 | Revisited: RETURNING clause (INSERT/UPDATE/DELETE), subqueries (IN, NOT IN, EXISTS, NOT EXISTS), CASE expressions (searched + simple). Previous (Session 5): deterministic column order, generalized pointer handling, SetNull, ModelSlice batch insert, NullBoolColumn/NullFloatColumn, cursor pagination (After + HasMore) |
 | `framework/sqlite` | **Growing** | Session 11 | Revisited: Stats (file/WAL size, page counts, pool stats), Checkpoint (WAL truncate), Optimize (PRAGMA optimize), IntegrityCheck (quick_check), Backup (VACUUM INTO). Configurable PRAGMAs via config (busy_timeout, cache_size, mmap_size, wal_autocheckpoint, journal_size_limit). PRAGMA mmap_size added (256MB default). Optimize-on-shutdown. Enhanced startup logging with PRAGMA values. |
@@ -169,6 +169,15 @@ Session 13 (app+container revisit, system monitor with ModuleGroup + heartbeat w
 - [race] No data races detected with -race flag on concurrent introspection + writes + heartbeat
 - [shutdown] Heartbeat worker detected ShuttingDown() signal and terminated cleanly
 
+Session 14 (http SSE, stock ticker with price hub + 5 tickers):
+- [sse/50 connections] 0 errors, connect p50 1.7ms, p99 2.1ms — 20 events/client over 10s
+- [sse/200 connections] 0 errors, connect p50 9.9ms, p99 14ms — 20 events/client over 10s
+- [sse/500 connections] 0 errors, connect p50 21ms, p99 50ms — 20 events/client over 10s
+- [sse/events] 0 dropped events across all tests (19,100 total events sent, 850 total connections)
+- [sse+crud/GET list] 18,327 req/s, p99 5.2ms — with 100 active SSE connections (SSE does not degrade CRUD)
+- [memory] 42.6 MB RSS after 850+ SSE connections + sustained load
+- [race] No data races detected with -race flag on concurrent SSE + CRUD
+
 ## Design Decisions
 
 <!-- Key decisions and rationale so future sessions don't reverse them. Format:
@@ -254,12 +263,21 @@ Session 13 (app+container revisit, system monitor with ModuleGroup + heartbeat w
 - [container] Keys() and Len() use RLock on the container, not individual service locks — lightweight for frequent polling (60k+ req/s overhead-free). Keys() returns sorted for deterministic display. (Session 13)
 - [container] Hooks() returns a copy of the hooks slice — mutation-safe for iteration in admin endpoints. Same copy pattern as StartHooks/StopHooks internal snapshot. (Session 13)
 
+- [http] SSE lives in framework/http/sse.go as response-level primitives (NewEventStream, SSEWriter) — parallel to response.go (JSON, Error, NoContent). Not a new package — SSE is an HTTP response pattern. The event bus → SSE broker pattern will layer on top when the event bus exists. (Session 14)
+- [http] SSE uses http.ResponseController (Go 1.20+) to extend write deadlines per-connection. Each write extends the deadline by 30 seconds, overriding the server's 15s WriteTimeout. This is the modern Go approach — no need to disable server timeouts globally. (Session 14)
+- [http] SSE headers: Content-Type: text/event-stream, Cache-Control: no-cache, Connection: keep-alive, X-Accel-Buffering: no (nginx compatibility). All set in NewEventStream before flushing. (Session 14)
+- [http] SSEWriter.Done() returns r.Context().Done() — client disconnect detection via context cancellation. The caller's select loop checks this alongside event channels and heartbeat tickers. No framework-owned goroutines — the caller drives the event loop. (Session 14)
+- [http] SSEWriter is not goroutine-safe by design — the caller's single event loop is the expected pattern (select with Done/events/heartbeat). This matches Go's ResponseWriter contract. (Session 14)
+- [http] SSE event IDs enable client reconnection via Last-Event-ID header. LastEventID(r) extracts it. The framework provides the primitive; replay logic is the caller's responsibility (typically fetching missed events from DB). (Session 14)
+- [http] Heartbeat sends SSE comment (": heartbeat\n\n") — invisible to EventSource API but keeps the connection alive through proxies and resets write deadline. Recommended interval: 15 seconds. (Session 14)
+- [http] ErrStreamingNotSupported is an APIError sentinel (500) — returned if the ResponseWriter can't flush. In practice this never fires with Sunkern's middleware stack (responseRecorder implements Flush+Unwrap), but guards against broken third-party middleware. (Session 14)
+
 ## Next Priorities
 
 <!-- What the last session thinks should come next, in order -->
 
-1. **Revisit `framework/http`** — SSE support for real-time events (event bus → SSE endpoint pattern from IDEA.md Section 9)
-2. **Revisit `framework/http/middleware`** — request timeout middleware (context deadline for slow handlers), password hashing (bcrypt via stdlib crypto), API token middleware (separate from JWT — long-lived, revocable)
+1. **Revisit `framework/http/middleware`** — request timeout middleware (context deadline for slow handlers), password hashing (bcrypt via stdlib crypto), API token middleware (separate from JWT — long-lived, revocable)
+2. **Revisit `framework/http`** — consider: SSE broker/hub pattern as a higher-level abstraction (manages multiple connections, fan-out from event source, stats), once event bus exists
 3. **Revisit `framework/config`** — consider config validation (type constraints, allowed values)
 4. **Revisit `framework/log`** — consider Query performance optimization (mmap/indexing), log sampling for high-traffic paths
 5. **Revisit `framework/db`** — JOINs with RETURNING (currently untested), raw RETURNING with db.Raw columns, COALESCE/IFNULL expressions, window functions
