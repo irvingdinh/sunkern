@@ -8,7 +8,7 @@
 
 ## Current State
 
-**Last session**: 2026-03-25 — Session 29 (framework/config revisited — source tracking, sensitive masking, export for admin, config freeze)
+**Last session**: 2026-03-25 — Session 30 (framework/app revisited — PostBooter/PreShutdowner lifecycle hooks, phase timing)
 **Working tree**: clean
 **Branch**: with-experiment
 
@@ -16,7 +16,7 @@
 
 | Package | Maturity | Last Touched | Notes |
 |---------|----------|--------------|-------|
-| `framework/app` | **Maturing** | Session 25 | Revisited: health check system (HealthChecker/CheckFunc/HealthReport, concurrent CheckHealth, AddHealthCheck), ReadyCh() symmetric with ShuttingDown(), Env()/Version() with config integration, sqlite health auto-registered, startup log includes env/health_checks/version. Previous (Session 13): *App supplied to container, boot/shutdown timing, startup summary. Previous: ModuleGroup boot rollback fix, lifecycle logging |
+| `framework/app` | **Maturing** | Session 30 | Revisited: PostBooter optional interface (PostBoot() after ALL modules Boot — data seeding, cache warm-up, cross-module workers), PreShutdowner optional interface (PreShutdown(ctx) before individual Shutdown — drain work, flush buffers), phase timing in startup log (boot_time_ms broken into register_ms/framework_ms/module_boot_ms/post_boot_ms/hooks_ms), ModuleGroup delegates PostBoot/PreShutdown to children, 8 new tests (21 total). Previous (Session 25): health check system, ReadyCh, Env/Version. Previous (Session 13): *App supplied to container, boot/shutdown timing. Previous: ModuleGroup boot rollback fix |
 | `framework/container` | **Maturing** | Session 26 | Revisited: ServiceInfo enriched with JSON tags, Kind (supplied/provided), Caller (file:line), ErrorText; ServiceStatus.MarshalJSON; HookReport with per-hook timing from StartHooks/StopHooks; caller tracking in Provide/Supply/Override (runtime.Caller); duplicate-registration panics show both original+duplicate call sites; app.go logs hook start/stop at Debug level. Previous (Session 13): introspection APIs (Keys, Inspect, Len), ServiceInfo/ServiceStatus types, Hooks() accessor. Previous: Override/OverrideSupply, named hooks, all framework hooks named |
 | `framework/config` | **Maturing** | Session 29 | Revisited: Source tracking (resolveWithSource returns env/file/default per key), MarkSensitive/IsSensitive for masking secrets in Export, Export() returns []Entry with key/value/source/env_name sorted by key, Freeze/IsFrozen (auto-freeze after Validate, SetDefault/SetDefaults/AddRule/MarkSensitive panic if frozen), Load() resets frozen+sensitive for test reuse. Previous (Session 16): config validation (AddRule, Validate, 10 built-in rules). Previous (Session 7): Has, All, Keys, Sub, DataDir, EnvName, SetDefaults; Load creates data dir; improved panic messages |
 | `framework/log` | **Maturing** | Session 17 | Revisited: buffered file writer (64KB bufio.Writer + 200ms periodic flush goroutine — ~145k log writes/sec), Flush() export, Query improvements (Order desc/asc, After/Before time range, CountOnly mode). Previous (Session 8): Separate console/file levels, log file management, JSONL entry parsing + querying |
@@ -342,6 +342,18 @@ Session 29 (config revisit, settings inspector with Export + source tracking + s
 - [sensitive masking] api.secret → "***" in Export, original value accessible via Get[string]("api.secret")
 - [freeze] POST /freeze-test → panic caught by Recover → 500 with "config: SetDefault called after config is frozen"
 
+Session 30 (app revisit, task queue simulator with PostBoot seeding + PreShutdown drain, 510+ rows):
+- [app/GET list] 16,684 req/s, p99 7.4ms — paginated list on 510 rows with background worker running
+- [app/GET single] 56,357 req/s, p99 2.9ms — single read by ID
+- [app/POST create] 30,222 req/s, p99 2.9ms — JSON bind + INSERT
+- [app/GET worker-status] 68,430 req/s, p99 2.5ms — atomic int + bool read
+- [app/GET stats] 21,219 req/s, p99 6.1ms — 3 COUNT queries with WHERE filters
+- [memory] 33 MB RSS after 510+ writes and 60k+ load test requests
+- [race] No data races detected with -race flag on concurrent CRUD + worker processing + PostBoot + PreShutdown
+- [PostBoot] tasks module seeded 10 tasks, worker module verified count=10 in its PostBoot — cross-module ordering confirmed
+- [PreShutdown] worker drained in-flight work before shutdown; tasks module stopped processing flag — both logged correctly
+- [phase timing] startup log: boot_time_ms=9, register_ms=1, framework_ms=4, module_boot_ms=0, post_boot_ms=0, hooks_ms=0
+
 ## Design Decisions
 
 <!-- Key decisions and rationale so future sessions don't reverse them. Format:
@@ -550,19 +562,26 @@ Session 29 (config revisit, settings inspector with Export + source tracking + s
 - [config] Environment-specific config files (config.{env}.json) were considered and rejected — Viper research confirmed env vars are the primary override mechanism for container-native deployments. Adding file variants would complicate the mental model without solving a real problem. (Session 29)
 - [config] Entry struct has JSON tags on all fields — ready for direct serialization in admin API responses. Value is `any` (not string) to preserve original types from SetDefault (int, bool, duration) in the JSON output. Env source values are always strings (from os.LookupEnv). (Session 29)
 
+- [app] PostBooter is an optional interface (type assertion via `m.(PostBooter)`) — modules not implementing it are silently skipped. No impact on existing modules. Chosen over callback registration (a.OnPostBoot(fn)) because interface approach is discoverable via Go docs and integrates naturally with ModuleGroup delegation. (Session 30)
+- [app] PreShutdowner is best-effort (errors collected, not fatal) — differs from PostBooter (fatal on error). Rationale: during shutdown, we want to drain as much as possible before releasing resources. A failing PreShutdown shouldn't prevent other modules from draining. (Session 30)
+- [app] PostBoot runs after ALL modules Boot, before container start hooks. If PostBoot fails, a.shutdownModules rolls back ALL booted modules (same as Boot failure). The postBoot() method handles its own rollback internally, consistent with boot(). (Session 30)
+- [app] PreShutdown runs before stop hooks and before module Shutdown. Order: close shutdown channel → PreShutdown → stop hooks → module Shutdown. This lets modules drain work while infrastructure is still running (e.g., HTTP server still accepting, DB still available). (Session 30)
+- [app] ModuleGroup always implements PostBooter and PreShutdowner (methods exist on the type). When no children implement the interface, the loop is a no-op. This avoids conditional implementation complexity and is consistent with Register/Boot/Shutdown delegation pattern. (Session 30)
+- [app] Phase timing uses int64 milliseconds (not time.Duration string) for JSON-friendly output. boot_time_ms is the total, individual phases are additive: register_ms + framework_ms + module_boot_ms + post_boot_ms + hooks_ms ≈ boot_time_ms. Changed from previous boot_time (Duration.String()) to boot_time_ms for consistency. (Session 30)
+
 ## Next Priorities
 
 <!-- What the last session thinks should come next, in order -->
 
-1. **Revisit `framework/app`** — last touched Session 25 (4 sessions ago). Lifecycle hooks for plugins (pre-boot, post-boot callbacks), module dependency declaration, boot order optimization
-2. **Revisit `framework/log`** — last touched Session 17 (12 sessions ago). Log sampling handler for high-traffic paths, mmap-based query for very large files (deferred — current linear scan is acceptable for admin viewer with daily rotation)
-3. **Revisit `framework/http/middleware`** — last touched Session 28 (error consolidation only). Auth flow ergonomics, middleware composition helpers, consider request context enrichment helpers
-4. **Revisit `framework/http`** — last touched Session 28. SSE broker/hub pattern (manages multiple connections, fan-out from event source, stats)
-5. **Revisit `framework/sqlite`** — last touched Session 18 (11 sessions ago). PRAGMA runtime reconfiguration (cache_size, mmap_size changes without restart), table-level size stats for admin dashboard
-6. **Revisit `framework/sqlite/migrate`** — last touched Session 19 (10 sessions ago). Migration versioning validation (detect gaps, detect orphaned DB records), checksum mismatch warnings in Up() log output, batch status queries
-7. **Revisit `framework/sqlite/driver`** — last touched Session 20 (9 sessions ago). sqlite3_busy_handler (callback-based backoff), sqlite3_wal_hook (WAL monitoring), sqlite3_trace_v2 (statement tracing for debug), blob I/O for large objects
+1. **Revisit `framework/log`** — last touched Session 17 (13 sessions ago). Log sampling handler for high-traffic paths, mmap-based query for very large files (deferred — current linear scan is acceptable for admin viewer with daily rotation)
+2. **Revisit `framework/sqlite`** — last touched Session 18 (12 sessions ago). PRAGMA runtime reconfiguration (cache_size, mmap_size changes without restart), table-level size stats for admin dashboard
+3. **Revisit `framework/sqlite/migrate`** — last touched Session 19 (11 sessions ago). Migration versioning validation (detect gaps, detect orphaned DB records), checksum mismatch warnings in Up() log output, batch status queries
+4. **Revisit `framework/sqlite/driver`** — last touched Session 20 (10 sessions ago). sqlite3_busy_handler (callback-based backoff), sqlite3_wal_hook (WAL monitoring), sqlite3_trace_v2 (statement tracing for debug), blob I/O for large objects
+5. **Revisit `framework/http/middleware`** — last touched Session 28. Auth flow ergonomics, middleware composition helpers, consider request context enrichment helpers
+6. **Revisit `framework/http`** — last touched Session 28. SSE broker/hub pattern (manages multiple connections, fan-out from event source, stats)
+7. **Revisit `framework/app`** — just revisited in Session 30. Future: module dependency declaration (explicit DependsOn for boot ordering), module tags/labels for admin introspection, conditional modules (enabled/disabled via config)
 8. **Revisit `framework/db`** — db package is now comprehensive. Consider: batch update/delete helpers (UpdateAll, DeleteAll for common patterns), query logging/tracing hook, prepared statement caching
-9. **Revisit `framework/config`** — just revisited in Session 29. Future: config value change detection (compare Export snapshots), config documentation generator (list all keys with types/defaults/env names for docs)
+9. **Revisit `framework/config`** — last revisited in Session 29. Future: config value change detection (compare Export snapshots), config documentation generator (list all keys with types/defaults/env names for docs)
 10. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
 
 ## In-Progress Work
