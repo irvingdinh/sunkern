@@ -8,7 +8,7 @@
 
 ## Current State
 
-**Last session**: 2026-03-25 — Session 32 (framework/sqlite + driver revisited — Connector per-connection PRAGMAs, runtime introspection, table stats)
+**Last session**: 2026-03-25 — Session 33 (framework/sqlite/migrate revisited — validation, orphan detection, dirty checksums, HasPending)
 **Working tree**: clean
 **Branch**: with-experiment
 
@@ -25,7 +25,7 @@
 | `framework/db` | **Maturing** | Session 27 | Revisited: INSERT...SELECT (FromSelect on InsertBuilder), DoUpdateAll (auto SET excluded for non-target/non-immutable columns), ConflictBuilder.Where (partial unique index), ConflictWhere (conditional DO UPDATE WHERE), Excluded() helper (reference incoming values in WHERE), Returning accepts ...Expr (backward compatible, columns use unqualified names, Expr uses WriteSQL), ReturningStar() on all mutation builders. Previous (Session 24): CTEs, With() on all builders. Previous (Session 23): set operations, FILTER, Query interface. Previous (Session 22): window functions, GROUP_CONCAT. Previous (Session 21): JOIN ergonomics. Previous (Session 12): RETURNING, subqueries, CASE. Previous (Session 5): nullable types, cursor pagination |
 | `framework/sqlite` | **Maturing** | Session 32 | Revisited: driver.Connector for per-connection PRAGMA init (fixes latent bug — all pool connections now get PRAGMAs), sql.OpenDB replaces sql.Open, GetPragma/SetPragma/Pragmas for runtime introspection, TableStats() via dbstat vtable (per-table rows/pages/size), Stats enriched with CurrentPragmas field, CheckpointResult JSON tags. Previous (Session 18): maintenance goroutine, Health(ctx), optimize_interval/wal_checkpoint_threshold. Previous (Session 11): Stats, Checkpoint, Optimize, IntegrityCheck, Backup. |
 | `framework/sqlite/driver` | **Maturing** | Session 32 | Revisited: Connector type (driver.Connector interface) applies init PRAGMAs to every new connection via Connect(), SetPragma updates connector thread-safely, SQLITE_ENABLE_DBSTAT_VTAB compile flag, compile-time assertion for Connector. Previous (Session 20): structured Error type, context cancellation via sqlite3_interrupt, MemoryUsed/MemoryHighwater, time.Time bind with ms+UTC, nil guards. Previous (Session 11): blob binding safety fix. |
-| `framework/sqlite/migrate` | **Maturing** | Session 19 | Revisited: SHA-256 checksums (drift detection via Dirty field), execution_ms tracking, UpTo/DownTo/Version/Redo methods, MigrationStatus enriched with HasDown/StmtCount/Checksum/Dirty/ExecutionMs + JSON tags, backward-compatible schema upgrade (ALTER TABLE ADD COLUMN), Checksum() exported, applyUp/applyDown split, *Engine supplied to container. Previous (Session 11): migration timing, Pending(), error context with statement index. |
+| `framework/sqlite/migrate` | **Maturing** | Session 33 | Revisited: Validate() method (orphan detection + dirty checksum report), HasPending() lightweight check, Status() includes orphaned DB records (Orphaned field on MigrationStatus), Up()/UpTo() log dirty checksum warnings for already-applied migrations, appliedRecords() internal refactor (richer DB data shared across all methods), ValidationResult/OrphanedMigration/DirtyMigration types with JSON tags, app.go validates at startup and logs orphan+dirty warnings. Load tested: Status 28K req/s, Validate 29K req/s, HasPending 30K req/s, Version 34K req/s — all sub-5ms p99, 25 MB RSS. Previous (Session 19): SHA-256 checksums, UpTo/DownTo/Version/Redo, MigrationStatus enriched. Previous (Session 11): migration timing, Pending(), error context. |
 
 ## Friction Log
 
@@ -619,19 +619,26 @@ Session 32 (sqlite+driver revisit, DB admin app with 3 tables — 500 products, 
 - [sqlite] TableStats() joins dbstat with sqlite_master ON type='table' to exclude index btrees. dbstat lists both table and index btrees under the `name` column — without the join, COUNT(*) on an index name causes "no such table" errors. Row counts use COUNT(*) per table (separate query per table, table names from sqlite_master so safe for quoting). (Session 32)
 - [sqlite] Stats.CurrentPragmas is map[string]any — populated by Pragmas() during Stats(). Admin dashboard gets complete PRAGMA state alongside file/pool/memory stats in one call. Native types preserved: int64 for integer PRAGMAs, string for text PRAGMAs (journal_mode). (Session 32)
 
+- [migrate] appliedRecords() replaces appliedVersions() — returns map[int]appliedRecord with name, checksum, appliedAt, executionMs. One DB query fetches all columns. Shared by Up, UpTo, Down, DownTo, Pending, HasPending, Status, Validate — previously Status had its own inline query duplicating the logic. (Session 33)
+- [migrate] Up()/UpTo() dirty checksum detection: when iterating, already-applied migrations get checksum compared. Empty DB checksum (pre-checksum era) is silently skipped. Only non-empty mismatches emit slog.Warn with version, name, db_checksum, file_checksum. This fires before Validate() — gives immediate feedback during migration phase. (Session 33)
+- [migrate] Status() now includes orphaned records. matched map tracks which DB records correspond to files. Unmatched records become MigrationStatus with Orphaned=true, Applied=true, file-derived fields zero-valued. Result re-sorted by version since orphans may interleave with file-based entries. (Session 33)
+- [migrate] Validate() is read-only — safe to call from admin endpoints under load. Returns ValidationResult with Orphaned ([]OrphanedMigration) and Dirty ([]DirtyMigration). Clean() helper for quick boolean check. Both slices sorted by version. Types have JSON tags for direct API serialization. (Session 33)
+- [migrate] app.go calls Validate() after Up() completes. Logs individual warnings per orphan and per dirty migration. Validate() failure itself is non-fatal (logged as Warn, not returned as error) — startup continues. The double logging (Up warns about dirty, then Validate warns about dirty) is intentional: Up warns during migration phase, Validate provides the structured summary for admin observability. (Session 33)
+- [migrate] HasPending() short-circuits on first unapplied migration — O(n) worst case but typically O(1) for up-to-date databases. Uses appliedRecords() which is slightly heavier than needed (fetches all columns), but the simplicity of one shared function outweighs the cost. Migration tables are tiny (tens of rows). (Session 33)
+
 ## Next Priorities
 
 <!-- What the last session thinks should come next, in order -->
 
-1. **Revisit `framework/sqlite/migrate`** — last touched Session 19 (13 sessions ago). Migration versioning validation (detect gaps, detect orphaned DB records), checksum mismatch warnings in Up() log output, batch status queries
-2. **Revisit `framework/sqlite/driver`** — last touched Session 32 (Connector added). sqlite3_busy_handler (callback-based backoff), sqlite3_wal_hook (WAL monitoring), sqlite3_trace_v2 (statement tracing for debug), blob I/O for large objects
-3. **Revisit `framework/http/middleware`** — last touched Session 28 (4 sessions ago). Auth flow ergonomics, middleware composition helpers, consider request context enrichment helpers
-4. **Revisit `framework/http`** — last touched Session 28. SSE broker/hub pattern (manages multiple connections, fan-out from event source, stats)
+1. **Revisit `framework/sqlite/driver`** — last touched Session 32. sqlite3_busy_handler (callback-based backoff), sqlite3_wal_hook (WAL monitoring), sqlite3_trace_v2 (statement tracing for debug), blob I/O for large objects
+2. **Revisit `framework/http/middleware`** — last touched Session 28 (5 sessions ago). Auth flow ergonomics, middleware composition helpers, consider request context enrichment helpers
+3. **Revisit `framework/http`** — last touched Session 28. SSE broker/hub pattern (manages multiple connections, fan-out from event source, stats)
+4. **Revisit `framework/db`** — last touched Session 27 (6 sessions ago). Consider: batch update/delete helpers, query logging/tracing hook, prepared statement caching
 5. **Revisit `framework/app`** — last touched Session 30. Future: module dependency declaration (explicit DependsOn for boot ordering), module tags/labels for admin introspection, conditional modules (enabled/disabled via config)
-6. **Revisit `framework/db`** — last touched Session 27 (5 sessions ago). Consider: batch update/delete helpers, query logging/tracing hook, prepared statement caching
-7. **Revisit `framework/config`** — last touched Session 29. Future: config value change detection (compare Export snapshots), config documentation generator
-9. **Revisit `framework/log`** — just revisited in Session 31. Future: mmap-based query for very large files (deferred — current linear scan acceptable for admin viewer with daily rotation), log rotation callback (notify when file rotates), per-request sampling (sample by request_id hash for consistent traces)
-10. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
+6. **Revisit `framework/config`** — last touched Session 29. Future: config value change detection (compare Export snapshots), config documentation generator
+7. **Revisit `framework/log`** — last touched Session 31. Future: mmap-based query for very large files (deferred — current linear scan acceptable for admin viewer with daily rotation), log rotation callback (notify when file rotates), per-request sampling (sample by request_id hash for consistent traces)
+8. **Revisit `framework/sqlite/migrate`** — just revisited in Session 33. Future: dry-run mode (validate SQL syntax without applying), migration locking (prevent concurrent Up() calls), migration hooks (pre/post callbacks)
+9. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
 
 ## In-Progress Work
 

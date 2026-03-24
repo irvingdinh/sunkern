@@ -211,6 +211,28 @@ func (a *App) run() error {
 	} else if n > 0 {
 		slog.Info("migrations applied", "count", n, "took", time.Since(t))
 	}
+
+	// Validate migration integrity — warn about orphaned DB records
+	// (applied but no file) and dirty checksums (file changed after apply).
+	if vr, err := migrationEngine.Validate(context.Background()); err != nil {
+		slog.Warn("migration validation failed", "error", err)
+	} else if !vr.Clean() {
+		for _, o := range vr.Orphaned {
+			slog.Warn("orphaned migration: applied in database but no file found",
+				"version", o.Version,
+				"name", o.Name,
+				"applied_at", o.AppliedAt,
+			)
+		}
+		for _, d := range vr.Dirty {
+			slog.Warn("dirty migration: file changed after apply",
+				"version", d.Version,
+				"name", d.Name,
+				"file_checksum", d.FileChecksum,
+				"db_checksum", d.DBChecksum,
+			)
+		}
+	}
 	container.Supply(migrationEngine)
 
 	// TODO: init cache, event bus, cron, queue.

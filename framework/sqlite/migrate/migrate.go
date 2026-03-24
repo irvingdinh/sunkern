@@ -25,6 +25,10 @@ type Migration struct {
 // MigrationStatus reports the state of a migration, combining information
 // from the migration file (statement counts, checksum) and the database
 // record (applied time, execution duration).
+//
+// When Orphaned is true, the migration exists in the database but has no
+// corresponding file. File-derived fields (HasDown, UpStmtCount,
+// DownStmtCount, Checksum) are zero-valued for orphaned entries.
 type MigrationStatus struct {
 	Version       int        `json:"version"`
 	Name          string     `json:"name"`
@@ -36,6 +40,7 @@ type MigrationStatus struct {
 	DownStmtCount int        `json:"down_stmt_count"`
 	Checksum      string     `json:"checksum"`
 	Dirty         bool       `json:"dirty"`
+	Orphaned      bool       `json:"orphaned,omitempty"`
 }
 
 // Engine manages schema migrations against a SQLite database.
@@ -111,20 +116,33 @@ func (e *Engine) Collect(sources ...fs.FS) error {
 }
 
 // Up applies all pending migrations in version order. Returns the count
-// of applied migrations.
+// of applied migrations. Already-applied migrations with changed checksums
+// are logged as warnings.
 func (e *Engine) Up(ctx context.Context) (int, error) {
 	if err := e.ensureTable(ctx); err != nil {
 		return 0, err
 	}
 
-	applied, err := e.appliedVersions(ctx)
+	records, err := e.appliedRecords(ctx)
 	if err != nil {
 		return 0, err
 	}
 
 	count := 0
 	for _, m := range e.migrations {
-		if applied[m.Version] {
+		if rec, ok := records[m.Version]; ok {
+			// Already applied — check for checksum drift.
+			if rec.checksum != "" {
+				cs := Checksum(m)
+				if rec.checksum != cs {
+					slog.Warn("migration file changed after apply",
+						"version", m.Version,
+						"name", m.Name,
+						"db_checksum", rec.checksum,
+						"file_checksum", cs,
+					)
+				}
+			}
 			continue
 		}
 
@@ -145,13 +163,14 @@ func (e *Engine) Up(ctx context.Context) (int, error) {
 }
 
 // UpTo applies pending migrations up to and including the specified version.
-// Returns the count of applied migrations.
+// Returns the count of applied migrations. Already-applied migrations with
+// changed checksums are logged as warnings.
 func (e *Engine) UpTo(ctx context.Context, version int) (int, error) {
 	if err := e.ensureTable(ctx); err != nil {
 		return 0, err
 	}
 
-	applied, err := e.appliedVersions(ctx)
+	records, err := e.appliedRecords(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -161,7 +180,18 @@ func (e *Engine) UpTo(ctx context.Context, version int) (int, error) {
 		if m.Version > version {
 			break
 		}
-		if applied[m.Version] {
+		if rec, ok := records[m.Version]; ok {
+			if rec.checksum != "" {
+				cs := Checksum(m)
+				if rec.checksum != cs {
+					slog.Warn("migration file changed after apply",
+						"version", m.Version,
+						"name", m.Name,
+						"db_checksum", rec.checksum,
+						"file_checksum", cs,
+					)
+				}
+			}
 			continue
 		}
 
@@ -188,7 +218,7 @@ func (e *Engine) Down(ctx context.Context, count int) (int, error) {
 		return 0, err
 	}
 
-	applied, err := e.appliedVersions(ctx)
+	records, err := e.appliedRecords(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -197,7 +227,7 @@ func (e *Engine) Down(ctx context.Context, count int) (int, error) {
 	var toRollback []Migration
 	for i := len(e.migrations) - 1; i >= 0; i-- {
 		m := e.migrations[i]
-		if applied[m.Version] {
+		if _, ok := records[m.Version]; ok {
 			toRollback = append(toRollback, m)
 		}
 	}
@@ -236,7 +266,7 @@ func (e *Engine) DownTo(ctx context.Context, version int) (int, error) {
 		return 0, err
 	}
 
-	applied, err := e.appliedVersions(ctx)
+	records, err := e.appliedRecords(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -248,7 +278,7 @@ func (e *Engine) DownTo(ctx context.Context, version int) (int, error) {
 		if m.Version <= version {
 			break
 		}
-		if applied[m.Version] {
+		if _, ok := records[m.Version]; ok {
 			toRollback = append(toRollback, m)
 		}
 	}
@@ -347,42 +377,25 @@ func (e *Engine) Version(ctx context.Context) (int, error) {
 }
 
 // Status returns the status of all known migrations, combining file
-// metadata with database records. The Dirty field is true when an
-// applied migration's checksum differs from its current file content.
+// metadata with database records. Includes orphaned entries — migrations
+// that exist in the database but have no corresponding file. The result
+// is sorted by version. The Dirty field is true when an applied
+// migration's checksum differs from its current file content.
 func (e *Engine) Status(ctx context.Context) ([]MigrationStatus, error) {
 	if err := e.ensureTable(ctx); err != nil {
 		return nil, err
 	}
 
-	rows, err := e.db.QueryContext(ctx,
-		"SELECT version, applied_at, checksum, execution_ms FROM _migrations ORDER BY version")
+	records, err := e.appliedRecords(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("query _migrations: %w", err)
-	}
-	defer rows.Close()
-
-	type record struct {
-		appliedAt   time.Time
-		checksum    string
-		executionMs int64
-	}
-	records := make(map[int]record)
-	for rows.Next() {
-		var version int
-		var at, cs string
-		var ms int64
-		if err := rows.Scan(&version, &at, &cs, &ms); err != nil {
-			return nil, fmt.Errorf("scan _migrations: %w", err)
-		}
-		t, _ := time.Parse("2006-01-02 15:04:05", at)
-		records[version] = record{appliedAt: t, checksum: cs, executionMs: ms}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate _migrations: %w", err)
+		return nil, err
 	}
 
-	result := make([]MigrationStatus, len(e.migrations))
-	for i, m := range e.migrations {
+	// Track which DB records are matched to files.
+	matched := make(map[int]bool, len(e.migrations))
+
+	result := make([]MigrationStatus, 0, len(e.migrations))
+	for _, m := range e.migrations {
 		cs := Checksum(m)
 		s := MigrationStatus{
 			Version:       m.Version,
@@ -393,6 +406,7 @@ func (e *Engine) Status(ctx context.Context) ([]MigrationStatus, error) {
 			Checksum:      cs,
 		}
 		if rec, ok := records[m.Version]; ok {
+			matched[m.Version] = true
 			s.Applied = true
 			s.AppliedAt = &rec.appliedAt
 			s.ExecutionMs = rec.executionMs
@@ -401,8 +415,28 @@ func (e *Engine) Status(ctx context.Context) ([]MigrationStatus, error) {
 			// checksum tracking was added — not considered dirty.
 			s.Dirty = rec.checksum != "" && rec.checksum != cs
 		}
-		result[i] = s
+		result = append(result, s)
 	}
+
+	// Detect orphaned records — applied in DB but no corresponding file.
+	for v, rec := range records {
+		if matched[v] {
+			continue
+		}
+		result = append(result, MigrationStatus{
+			Version:   v,
+			Name:      rec.name,
+			Applied:   true,
+			AppliedAt: &rec.appliedAt,
+			ExecutionMs: rec.executionMs,
+			Orphaned:  true,
+		})
+	}
+
+	// Re-sort by version since orphaned entries may be interleaved.
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Version < result[j].Version
+	})
 
 	return result, nil
 }
@@ -414,18 +448,126 @@ func (e *Engine) Pending(ctx context.Context) ([]Migration, error) {
 		return nil, err
 	}
 
-	applied, err := e.appliedVersions(ctx)
+	records, err := e.appliedRecords(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	var pending []Migration
 	for _, m := range e.migrations {
-		if !applied[m.Version] {
+		if _, ok := records[m.Version]; !ok {
 			pending = append(pending, m)
 		}
 	}
 	return pending, nil
+}
+
+// HasPending returns true if there are unapplied migrations. This is a
+// lightweight check — it does not load full migration data.
+func (e *Engine) HasPending(ctx context.Context) (bool, error) {
+	if err := e.ensureTable(ctx); err != nil {
+		return false, err
+	}
+
+	records, err := e.appliedRecords(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	for _, m := range e.migrations {
+		if _, ok := records[m.Version]; !ok {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// ValidationResult reports integrity issues between collected migration
+// files and the database state. Orphaned entries are applied migrations
+// with no corresponding file. Dirty entries are applied migrations whose
+// file content has changed since being applied.
+type ValidationResult struct {
+	Orphaned []OrphanedMigration `json:"orphaned,omitempty"`
+	Dirty    []DirtyMigration    `json:"dirty,omitempty"`
+}
+
+// Clean returns true when no issues were found.
+func (v ValidationResult) Clean() bool {
+	return len(v.Orphaned) == 0 && len(v.Dirty) == 0
+}
+
+// OrphanedMigration represents a migration that exists in the database
+// but has no corresponding file in the collected sources.
+type OrphanedMigration struct {
+	Version   int       `json:"version"`
+	Name      string    `json:"name"`
+	AppliedAt time.Time `json:"applied_at"`
+}
+
+// DirtyMigration represents a migration whose file content has changed
+// since it was applied.
+type DirtyMigration struct {
+	Version      int    `json:"version"`
+	Name         string `json:"name"`
+	FileChecksum string `json:"file_checksum"`
+	DBChecksum   string `json:"db_checksum"`
+}
+
+// Validate checks for integrity issues between collected migration files
+// and the database. Returns a ValidationResult with any orphaned records
+// (applied but no file) and dirty checksums (file changed after apply).
+// Does not modify state — safe to call at any time.
+func (e *Engine) Validate(ctx context.Context) (ValidationResult, error) {
+	var result ValidationResult
+
+	if err := e.ensureTable(ctx); err != nil {
+		return result, err
+	}
+
+	records, err := e.appliedRecords(ctx)
+	if err != nil {
+		return result, err
+	}
+
+	// Build set of collected versions for orphan detection.
+	collected := make(map[int]bool, len(e.migrations))
+	for _, m := range e.migrations {
+		collected[m.Version] = true
+	}
+
+	// Detect orphaned DB records.
+	for v, rec := range records {
+		if collected[v] {
+			continue
+		}
+		result.Orphaned = append(result.Orphaned, OrphanedMigration{
+			Version:   v,
+			Name:      rec.name,
+			AppliedAt: rec.appliedAt,
+		})
+	}
+	sort.Slice(result.Orphaned, func(i, j int) bool {
+		return result.Orphaned[i].Version < result.Orphaned[j].Version
+	})
+
+	// Detect dirty checksums.
+	for _, m := range e.migrations {
+		rec, ok := records[m.Version]
+		if !ok || rec.checksum == "" {
+			continue
+		}
+		cs := Checksum(m)
+		if rec.checksum != cs {
+			result.Dirty = append(result.Dirty, DirtyMigration{
+				Version:      m.Version,
+				Name:         m.Name,
+				FileChecksum: cs,
+				DBChecksum:   rec.checksum,
+			})
+		}
+	}
+
+	return result, nil
 }
 
 // Migrations returns the collected migrations for inspection.
@@ -481,22 +623,39 @@ func (e *Engine) ensureTable(ctx context.Context) error {
 	return nil
 }
 
-func (e *Engine) appliedVersions(ctx context.Context) (map[int]bool, error) {
-	rows, err := e.db.QueryContext(ctx, "SELECT version FROM _migrations")
+// appliedRecord holds the database state of a single applied migration.
+type appliedRecord struct {
+	name        string
+	checksum    string
+	appliedAt   time.Time
+	executionMs int64
+}
+
+func (e *Engine) appliedRecords(ctx context.Context) (map[int]appliedRecord, error) {
+	rows, err := e.db.QueryContext(ctx,
+		"SELECT version, name, applied_at, checksum, execution_ms FROM _migrations ORDER BY version")
 	if err != nil {
-		return nil, fmt.Errorf("query applied versions: %w", err)
+		return nil, fmt.Errorf("query applied records: %w", err)
 	}
 	defer rows.Close()
 
-	applied := make(map[int]bool)
+	records := make(map[int]appliedRecord)
 	for rows.Next() {
 		var v int
-		if err := rows.Scan(&v); err != nil {
-			return nil, fmt.Errorf("scan applied version: %w", err)
+		var name, at, cs string
+		var ms int64
+		if err := rows.Scan(&v, &name, &at, &cs, &ms); err != nil {
+			return nil, fmt.Errorf("scan applied record: %w", err)
 		}
-		applied[v] = true
+		t, _ := time.Parse("2006-01-02 15:04:05", at)
+		records[v] = appliedRecord{
+			name:        name,
+			checksum:    cs,
+			appliedAt:   t,
+			executionMs: ms,
+		}
 	}
-	return applied, rows.Err()
+	return records, rows.Err()
 }
 
 // applyUp executes the migration's Up statements inside a transaction,
