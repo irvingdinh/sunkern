@@ -8,7 +8,7 @@
 
 ## Current State
 
-**Last session**: 2026-03-24 — Session 14 (framework/http revisited — SSE support for real-time streaming)
+**Last session**: 2026-03-24 — Session 15 (framework/http/middleware revisited — timeout, password hashing, API tokens)
 **Working tree**: clean
 **Branch**: with-experiment
 
@@ -21,7 +21,7 @@
 | `framework/config` | **Growing** | Session 7 | Added Has, All, Keys, Sub, DataDir, EnvName, SetDefaults; Load creates data dir; improved panic messages |
 | `framework/log` | **Growing** | Session 8 | Separate console/file levels (ConsoleLevel, FileLevel types), log file management (ListFiles, CleanOldFiles, OpenFile), JSONL entry parsing + querying (Entry, Query with level/search/user_id/request_id filter + pagination) |
 | `framework/http` | **Maturing** | Session 14 | Revisited: SSE support (NewEventStream, SSEWriter with Send/SendJSON/Heartbeat/Retry/Done, LastEventID, write deadline extension via ResponseController, ErrStreamingNotSupported sentinel). Previous (Session 10): Bind/BindForm MaxBytesError → 413. Previous: file upload handling, all sentinels |
-| `framework/http/middleware` | **Maturing** | Session 10 | Revisited: JWT (HMAC-SHA256 sign/verify, Claims, context helpers), Auth (Bearer token extraction + verification + user_id logging), RequireRole (role-based 403), MaxBytes (body size limiter). Plus existing: RequestID, RequestLogger, Recover, CORS, RateLimit |
+| `framework/http/middleware` | **Maturing** | Session 15 | Revisited: Timeout (context deadline per route), PBKDF2-SHA256 password hashing (HashPassword/CheckPassword, 600k iterations, PHC format, stdlib-only), APIToken middleware (opaque bearer tokens with DB lookup via TokenLookup callback), GenerateToken (32-byte random hex). Previous (Session 10): JWT (HMAC-SHA256 sign/verify, Claims, context helpers), Auth (Bearer token + user_id logging), RequireRole (role-based 403), MaxBytes (body size limiter). Plus existing: RequestID, RequestLogger, Recover, CORS, RateLimit |
 | `framework/db` | **Maturing** | Session 12 | Revisited: RETURNING clause (INSERT/UPDATE/DELETE), subqueries (IN, NOT IN, EXISTS, NOT EXISTS), CASE expressions (searched + simple). Previous (Session 5): deterministic column order, generalized pointer handling, SetNull, ModelSlice batch insert, NullBoolColumn/NullFloatColumn, cursor pagination (After + HasMore) |
 | `framework/sqlite` | **Growing** | Session 11 | Revisited: Stats (file/WAL size, page counts, pool stats), Checkpoint (WAL truncate), Optimize (PRAGMA optimize), IntegrityCheck (quick_check), Backup (VACUUM INTO). Configurable PRAGMAs via config (busy_timeout, cache_size, mmap_size, wal_autocheckpoint, journal_size_limit). PRAGMA mmap_size added (256MB default). Optimize-on-shutdown. Enhanced startup logging with PRAGMA values. |
 | `framework/sqlite/driver` | **Growing** | Session 11 | Fixed blob binding: replaced nil (SQLITE_STATIC) with C.CBytes+C.free — matching string binding pattern. Prevents potential GC-related unsoundness. |
@@ -178,6 +178,18 @@ Session 14 (http SSE, stock ticker with price hub + 5 tickers):
 - [memory] 42.6 MB RSS after 850+ SSE connections + sustained load
 - [race] No data races detected with -race flag on concurrent SSE + CRUD
 
+Session 15 (middleware auth, secure notes with password hashing + API tokens + timeout, 10k+ notes):
+- [password/POST login] 123 req/s, p99 96ms — PBKDF2-SHA256 600k iterations (CPU-bound by design, ~80ms/hash)
+- [jwt/GET list] 16,085 req/s, p99 7.4ms — JWT verify + Timeout(5s) + paginated list on 202 rows
+- [apitoken/GET list] 13,498 req/s, p99 8.3ms — API token DB lookup + Timeout(5s) + paginated list on 202 rows
+- [jwt/POST create] 27,606 req/s, p99 3.0ms — JWT verify + JSON bind + INSERT
+- [apitoken/POST create] 22,722 req/s, p99 3.7ms — API token DB lookup + JSON bind + INSERT
+- [401 reject] 61,065 req/s, p99 4.3ms — Auth middleware short-circuit (no token)
+- [apitoken/401 reject] 50,745 req/s, p99 2.9ms — API token middleware with invalid token (DB miss)
+- [memory] 31 MB RSS after 10k+ writes under sustained load
+- [race] No data races detected with -race flag on concurrent JWT + API token + login + writes
+- [apitoken overhead] ~16% vs JWT for reads (~19% for writes) — DB lookup per request, acceptable trade-off
+
 ## Design Decisions
 
 <!-- Key decisions and rationale so future sessions don't reverse them. Format:
@@ -272,16 +284,24 @@ Session 14 (http SSE, stock ticker with price hub + 5 tickers):
 - [http] Heartbeat sends SSE comment (": heartbeat\n\n") — invisible to EventSource API but keeps the connection alive through proxies and resets write deadline. Recommended interval: 15 seconds. (Session 14)
 - [http] ErrStreamingNotSupported is an APIError sentinel (500) — returned if the ResponseWriter can't flush. In practice this never fires with Sunkern's middleware stack (responseRecorder implements Flush+Unwrap), but guards against broken third-party middleware. (Session 14)
 
+- [middleware] Timeout uses context.WithTimeout (not http.TimeoutHandler) — does NOT buffer the response. The handler and downstream ops (DB, HTTP) that respect context will abort on deadline. Server WriteTimeout is the hard backstop. SSE endpoints should NOT use Timeout. This is the Go-idiomatic approach (gRPC deadlines work the same way). (Session 15)
+- [middleware] Password hashing uses PBKDF2-HMAC-SHA256 (RFC 2898), not bcrypt — bcrypt requires golang.org/x/crypto which violates zero-dep rule. PBKDF2 is implementable with stdlib crypto/hmac + crypto/sha256 alone. 600k iterations per OWASP 2023 recommendation. (Session 15)
+- [middleware] Password hash format is PHC/Modular Crypt: $pbkdf2-sha256$600000$<base64-salt>$<base64-hash>. Self-describing — the hash carries its own algorithm, iteration count, and salt. CheckPassword extracts parameters from the hash, no external config needed. (Session 15)
+- [middleware] Password max length capped at 72 bytes (matching bcrypt's limit). Prevents DoS via extremely long passwords that would take proportionally longer to hash. (Session 15)
+- [middleware] APIToken middleware takes a TokenLookup callback — the framework doesn't know how tokens are stored. Service layer provides the lookup (typically: hash token with SHA-256, query DB). Separation of concerns: framework does HTTP plumbing, service owns storage. (Session 15)
+- [middleware] APIToken and Auth share the same Claims context key (WithClaims/ClaimsFromCtx). They are mutually exclusive auth methods for the same route group. Downstream handlers don't need to know which auth method was used. (Session 15)
+- [middleware] GenerateToken produces 32 random bytes (64 hex chars) — ~256 bits of entropy. Service should store SHA-256(token) in DB, not the plaintext. Token is shown to user once on creation. (Session 15)
+- [middleware] extractBearerToken is case-insensitive on "Bearer " prefix per RFC 6750. Auth middleware still uses case-sensitive check (legacy). Minor inconsistency, not worth changing tested code. (Session 15)
+
 ## Next Priorities
 
 <!-- What the last session thinks should come next, in order -->
 
-1. **Revisit `framework/http/middleware`** — request timeout middleware (context deadline for slow handlers), password hashing (bcrypt via stdlib crypto), API token middleware (separate from JWT — long-lived, revocable)
-2. **Revisit `framework/http`** — consider: SSE broker/hub pattern as a higher-level abstraction (manages multiple connections, fan-out from event source, stats), once event bus exists
-3. **Revisit `framework/config`** — consider config validation (type constraints, allowed values)
-4. **Revisit `framework/log`** — consider Query performance optimization (mmap/indexing), log sampling for high-traffic paths
-5. **Revisit `framework/db`** — JOINs with RETURNING (currently untested), raw RETURNING with db.Raw columns, COALESCE/IFNULL expressions, window functions
-6. **Revisit `framework/sqlite`** — consider: periodic auto-optimize (cron integration when cron package exists), connection pool health endpoint, PRAGMA runtime reconfiguration
+1. **Revisit `framework/http`** — consider: SSE broker/hub pattern as a higher-level abstraction (manages multiple connections, fan-out from event source, stats), once event bus exists
+2. **Revisit `framework/config`** — consider config validation (type constraints, allowed values)
+3. **Revisit `framework/log`** — consider Query performance optimization (mmap/indexing), log sampling for high-traffic paths
+4. **Revisit `framework/db`** — JOINs with RETURNING (currently untested), raw RETURNING with db.Raw columns, COALESCE/IFNULL expressions, window functions
+5. **Revisit `framework/sqlite`** — consider: periodic auto-optimize (cron integration when cron package exists), connection pool health endpoint, PRAGMA runtime reconfiguration
 7. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
 
 ## In-Progress Work
