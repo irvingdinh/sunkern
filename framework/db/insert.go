@@ -11,9 +11,10 @@ import (
 
 // InsertBuilder builds an INSERT query. Create one with Insert().
 type InsertBuilder struct {
-	table   *TableInfo
-	columns []column
-	values  [][]any // one inner slice per row
+	table    *TableInfo
+	columns  []column
+	values   [][]any // one inner slice per row
+	conflict *conflictClause
 }
 
 // Insert starts an INSERT query for the given table.
@@ -32,6 +33,18 @@ func (b *InsertBuilder) Columns(cols ...column) *InsertBuilder {
 func (b *InsertBuilder) Values(vals ...any) *InsertBuilder {
 	b.values = append(b.values, vals)
 	return b
+}
+
+// OnConflict begins an ON CONFLICT clause targeting the given columns.
+// Call DoNothing() or DoUpdate() on the returned ConflictBuilder to complete it.
+//
+//	db.Insert(&Settings.TableInfo).
+//	    Model(setting).
+//	    OnConflict(Settings.Key).
+//	    DoUpdate(db.SetExcluded(Settings.Value)).
+//	    Exec(ctx, writeDB)
+func (b *InsertBuilder) OnConflict(cols ...column) *ConflictBuilder {
+	return &ConflictBuilder{insert: b, targets: cols}
 }
 
 // Model reads a struct's db tags to determine columns and values. It:
@@ -120,6 +133,11 @@ func (b *InsertBuilder) Build() (string, []any) {
 			args = append(args, val)
 		}
 		buf.WriteString(")")
+	}
+
+	// ON CONFLICT
+	if b.conflict != nil {
+		b.conflict.writeConflict(&buf, &args)
 	}
 
 	return buf.String(), args

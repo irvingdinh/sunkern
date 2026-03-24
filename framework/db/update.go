@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
+	"time"
 )
 
 // UpdateBuilder builds an UPDATE query. Create one with Update().
@@ -16,8 +18,9 @@ type UpdateBuilder struct {
 }
 
 type setClause struct {
-	col column
-	val any
+	col  column
+	val  any  // used when expr is nil
+	expr Expr // when non-nil, takes precedence over val
 }
 
 // Update starts an UPDATE query for the given table.
@@ -25,9 +28,98 @@ func Update(table *TableInfo) *UpdateBuilder {
 	return &UpdateBuilder{table: table}
 }
 
-// Set adds a "column = value" assignment.
+// Set adds a "column = value" assignment with a parameterized value.
 func (b *UpdateBuilder) Set(col column, val any) *UpdateBuilder {
 	b.sets = append(b.sets, setClause{col: col, val: val})
+	return b
+}
+
+// SetExpr adds a "column = <expression>" assignment where the expression is
+// any Expr. Use with Raw() for arithmetic:
+//
+//	db.Update(&Jobs.TableInfo).
+//	    SetExpr(Jobs.Attempts, db.Raw(`"jobs"."attempts" + ?`, 1)).
+//	    Where(Jobs.ID.Eq(jobID))
+func (b *UpdateBuilder) SetExpr(col column, expr Expr) *UpdateBuilder {
+	b.sets = append(b.sets, setClause{col: col, expr: expr})
+	return b
+}
+
+// Increment adds "column = column + amount" to the SET clause.
+func (b *UpdateBuilder) Increment(col column, amount int64) *UpdateBuilder {
+	return b.SetExpr(col, Raw(
+		quoteIdent(b.table.name)+"."+quoteIdent(col.columnName())+" + ?", amount,
+	))
+}
+
+// Decrement adds "column = column - amount" to the SET clause.
+func (b *UpdateBuilder) Decrement(col column, amount int64) *UpdateBuilder {
+	return b.SetExpr(col, Raw(
+		quoteIdent(b.table.name)+"."+quoteIdent(col.columnName())+" - ?", amount,
+	))
+}
+
+// SetModel reads a struct's db tags and adds SET clauses for all non-zero
+// fields. It:
+//   - Always sets updated_at to time.Now()
+//   - Skips "id" and "created_at" (never update these)
+//   - Skips nil *time.Time fields (preserves existing DB value)
+//   - Skips zero-value fields (zero = "don't update this field")
+//
+// For explicit zero-value updates, chain .Set() after .SetModel().
+func (b *UpdateBuilder) SetModel(v any) *UpdateBuilder {
+	rv := reflect.ValueOf(v)
+	if rv.Kind() == reflect.Ptr {
+		rv = rv.Elem()
+	}
+	rt := rv.Type()
+
+	m := getMapping(rt)
+	now := time.Now()
+
+	for colName, idx := range m.colToIndex {
+		// Never update primary key or creation timestamp.
+		if colName == "id" || colName == "created_at" {
+			continue
+		}
+
+		field := rv.FieldByIndex(idx)
+		fieldType := field.Type()
+		val := field.Interface()
+
+		// Always set updated_at to now.
+		if colName == "updated_at" {
+			col := newSyntheticColumn(b.table.name, colName)
+			b.sets = append(b.sets, setClause{col: col, val: now})
+			continue
+		}
+
+		// Handle *time.Time: skip nil (preserves DB value).
+		if fieldType == reflect.TypeOf((*time.Time)(nil)) {
+			if field.IsNil() {
+				continue
+			}
+			col := newSyntheticColumn(b.table.name, colName)
+			b.sets = append(b.sets, setClause{col: col, val: *val.(*time.Time)})
+			continue
+		}
+
+		// Skip zero-value fields.
+		if field.IsZero() {
+			continue
+		}
+
+		// Handle time.Time: format for SQLite.
+		if fieldType == reflect.TypeOf(time.Time{}) {
+			col := newSyntheticColumn(b.table.name, colName)
+			b.sets = append(b.sets, setClause{col: col, val: val.(time.Time)})
+			continue
+		}
+
+		col := newSyntheticColumn(b.table.name, colName)
+		b.sets = append(b.sets, setClause{col: col, val: val})
+	}
+
 	return b
 }
 
@@ -59,8 +151,13 @@ func (b *UpdateBuilder) Build() (string, []any, error) {
 			buf.WriteString(", ")
 		}
 		buf.WriteString(quoteIdent(s.col.columnName()))
-		buf.WriteString(" = ?")
-		args = append(args, s.val)
+		buf.WriteString(" = ")
+		if s.expr != nil {
+			s.expr.WriteSQL(&buf, &args)
+		} else {
+			buf.WriteString("?")
+			args = append(args, s.val)
+		}
 	}
 
 	// WHERE

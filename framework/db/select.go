@@ -9,15 +9,16 @@ import (
 
 // SelectBuilder builds a SELECT query. Create one with Select().
 type SelectBuilder struct {
-	table   *TableInfo
-	columns []Expr // if empty, uses table.Star()
-	where   []Expr // ANDed together
-	orderBy []OrderExpr
-	limit   *int
-	offset  *int
-	joins   []joinClause
-	groupBy []Expr
-	having  []Expr
+	table    *TableInfo
+	columns  []Expr // if empty, uses table.Star()
+	distinct bool
+	where    []Expr // ANDed together
+	orderBy  []OrderExpr
+	limit    *int
+	offset   *int
+	joins    []joinClause
+	groupBy  []Expr
+	having   []Expr
 }
 
 type joinClause struct {
@@ -29,6 +30,12 @@ type joinClause struct {
 // Select starts a SELECT query for the given table.
 func Select(table *TableInfo) *SelectBuilder {
 	return &SelectBuilder{table: table}
+}
+
+// Distinct causes SELECT DISTINCT to be generated.
+func (b *SelectBuilder) Distinct() *SelectBuilder {
+	b.distinct = true
+	return b
 }
 
 // Columns sets the explicit column list. If not called, all columns from
@@ -101,6 +108,9 @@ func (b *SelectBuilder) Build() (string, []any) {
 
 	// SELECT
 	buf.WriteString("SELECT ")
+	if b.distinct {
+		buf.WriteString("DISTINCT ")
+	}
 	cols := b.columns
 	if len(cols) == 0 {
 		cols = b.table.Star()
@@ -180,7 +190,18 @@ func (b *SelectBuilder) buildCount() (string, []any) {
 	var buf strings.Builder
 	var args []any
 
-	buf.WriteString("SELECT COUNT(*) FROM ")
+	if b.distinct && len(b.columns) > 0 {
+		buf.WriteString("SELECT COUNT(DISTINCT ")
+		for i, col := range b.columns {
+			if i > 0 {
+				buf.WriteString(", ")
+			}
+			col.WriteSQL(&buf, &args)
+		}
+		buf.WriteString(") FROM ")
+	} else {
+		buf.WriteString("SELECT COUNT(*) FROM ")
+	}
 	b.table.WriteSQL(&buf, &args)
 
 	for _, j := range b.joins {
