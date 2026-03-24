@@ -8,7 +8,7 @@
 
 ## Current State
 
-**Last session**: 2026-03-24 — Session 11 (framework/sqlite mature — ops API, configurable PRAGMAs, driver fix)
+**Last session**: 2026-03-24 — Session 12 (framework/db revisited — RETURNING clause, subqueries, CASE expressions)
 **Working tree**: clean
 **Branch**: with-experiment
 
@@ -22,7 +22,7 @@
 | `framework/log` | **Growing** | Session 8 | Separate console/file levels (ConsoleLevel, FileLevel types), log file management (ListFiles, CleanOldFiles, OpenFile), JSONL entry parsing + querying (Entry, Query with level/search/user_id/request_id filter + pagination) |
 | `framework/http` | **Maturing** | Session 10 | Revisited: Bind/BindForm now detect http.MaxBytesError and return 413 instead of 400. Previous: file upload handling (FormFile, FormFiles, BindForm, SaveFile, ValidateFile, DetectFileType), all sentinels |
 | `framework/http/middleware` | **Maturing** | Session 10 | Revisited: JWT (HMAC-SHA256 sign/verify, Claims, context helpers), Auth (Bearer token extraction + verification + user_id logging), RequireRole (role-based 403), MaxBytes (body size limiter). Plus existing: RequestID, RequestLogger, Recover, CORS, RateLimit |
-| `framework/db` | **Maturing** | Session 5 | Revisited: deterministic column order, generalized pointer handling, SetNull, ModelSlice batch insert, NullBoolColumn/NullFloatColumn, cursor pagination (After + HasMore) |
+| `framework/db` | **Maturing** | Session 12 | Revisited: RETURNING clause (INSERT/UPDATE/DELETE), subqueries (IN, NOT IN, EXISTS, NOT EXISTS), CASE expressions (searched + simple). Previous (Session 5): deterministic column order, generalized pointer handling, SetNull, ModelSlice batch insert, NullBoolColumn/NullFloatColumn, cursor pagination (After + HasMore) |
 | `framework/sqlite` | **Growing** | Session 11 | Revisited: Stats (file/WAL size, page counts, pool stats), Checkpoint (WAL truncate), Optimize (PRAGMA optimize), IntegrityCheck (quick_check), Backup (VACUUM INTO). Configurable PRAGMAs via config (busy_timeout, cache_size, mmap_size, wal_autocheckpoint, journal_size_limit). PRAGMA mmap_size added (256MB default). Optimize-on-shutdown. Enhanced startup logging with PRAGMA values. |
 | `framework/sqlite/driver` | **Growing** | Session 11 | Fixed blob binding: replaced nil (SQLITE_STATIC) with C.CBytes+C.free — matching string binding pattern. Prevents potential GC-related unsoundness. |
 | `framework/sqlite/migrate` | **Growing** | Session 11 | Migration timing in Up/Down log messages. Added Pending(ctx) for dry-run/admin display. Improved error context: "statement 2/5: ..." with SQL dump. |
@@ -149,6 +149,15 @@ Session 11 (sqlite ops, bookmark manager with 25k rows):
 - [sqlite/POST create] 26,533 req/s, p99 8.3ms — JSON bind + INSERT
 - [memory] 65 MB RSS after 25k+ writes and 60k+ load test requests
 
+Session 12 (db revisit, task tracker with tags, 15k+ rows):
+- [db/POST insert-returning] 21,201 req/s, p99 10ms — INSERT + RETURNING scan, 15k rows
+- [db/PATCH update-returning] ~50k req/s, p99 7.7ms — single-row UPDATE RETURNING
+- [db/GET exists-subquery] 44,759 req/s, p99 4.1ms — EXISTS correlated subquery (small result)
+- [db/GET in-subquery] 1,524 req/s, p99 114ms — IN subquery returning ~1200 rows (IO-bound, JSON serialization)
+- [db/GET case-summary] 1,546 req/s, p99 179ms — CASE + GROUP BY full table scan on 15k rows (expected)
+- [memory] 94 MB RSS after 15k+ writes and 30k+ load test requests
+- [race] No data races detected with -race flag on concurrent RETURNING + subquery + CASE
+
 ## Design Decisions
 
 <!-- Key decisions and rationale so future sessions don't reverse them. Format:
@@ -219,19 +228,26 @@ Session 11 (sqlite ops, bookmark manager with 25k rows):
 - [migrate] Pending() mirrors Status() but returns only unapplied migrations — useful for admin "N pending migrations" display or dry-run before deployment. (Session 11)
 - [migrate] Error messages now include statement index "statement 2/5: ..." — helps identify which SQL statement within a migration failed, especially useful for multi-statement migrations. (Session 11)
 
+- [db] RETURNING uses an unexported `returnable` interface with `build() (string, []any, error)` — satisfied by InsertBuilder, UpdateBuilder, DeleteBuilder. Restricts the Returning/ReturningAll generic functions to mutation builders only (not SelectBuilder). API: `db.Returning[T](ctx, q, builder)` and `db.ReturningAll[T](ctx, q, builder)`. (Session 12)
+- [db] RETURNING writes unqualified column names (no table prefix) — SQLite's RETURNING clause only accepts bare column names, not "table"."column" qualified references. writeReturning() uses quoteIdent(col.columnName()) not col.WriteSQL(). (Session 12)
+- [db] Subquery types (subqueryExpr, inSubqueryExpr, existsExpr) wrap a *SelectBuilder. They call sb.Build() inside WriteSQL() to generate the inner SELECT, then wrap in parentheses. Args are appended in-order — compatible with SQLite's positional parameter binding. (Session 12)
+- [db] ExistsSubquery/NotExistsSubquery named to avoid collision with existing Exists() function (which executes a COUNT and returns bool). The subquery versions are expressions (Expr interface) for use in WHERE. (Session 12)
+- [db] CaseBuilder supports both searched CASE (Case().When(predicate, result)) and simple CASE (CaseOf(expr).When(value, result)). When/Else accept any — if already an Expr, used as-is; otherwise wrapped in Raw("?", val). This allows mixing column refs and scalar values naturally. (Session 12)
+- [db] CaseBuilder implements Expr (not column) — it can appear in SELECT, WHERE, ORDER BY, SET, and anywhere else an expression is accepted. For SELECT with alias, combine with RawColumn or use WriteSQL() manually with fmt.Sprintf. (Session 12)
+- [db] toExpr() helper converts any to Expr — shared by CaseBuilder.When() and CaseBuilder.Else(). Simple type switch: Expr passthrough, everything else becomes Raw("?", v). (Session 12)
+
 ## Next Priorities
 
 <!-- What the last session thinks should come next, in order -->
 
 1. **Revisit `framework/http`** — SSE support for real-time events (event bus → SSE endpoint pattern from IDEA.md Section 9)
 2. **Revisit `framework/http/middleware`** — request timeout middleware (context deadline for slow handlers), password hashing (bcrypt via stdlib crypto), API token middleware (separate from JWT — long-lived, revocable)
-3. **`framework/db` advanced** — RETURNING clause (eliminate update-then-fetch pattern), subqueries in WHERE, CASE expressions
-4. **Revisit `framework/app` / `framework/container`** — now Growing, revisit after other packages evolve
-5. **Revisit `framework/config`** — consider config validation (type constraints, allowed values)
-6. **Revisit `framework/log`** — consider Query performance optimization (mmap/indexing), log sampling for high-traffic paths
-7. **Revisit `framework/db`** — fresh perspective on API ergonomics after http fully matures
-8. **Revisit `framework/sqlite`** — consider: periodic auto-optimize (cron integration when cron package exists), connection pool health endpoint, PRAGMA runtime reconfiguration
-9. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
+3. **Revisit `framework/app` / `framework/container`** — now Growing, revisit after other packages evolve (last touch Session 4, 8 sessions ago)
+4. **Revisit `framework/config`** — consider config validation (type constraints, allowed values)
+5. **Revisit `framework/log`** — consider Query performance optimization (mmap/indexing), log sampling for high-traffic paths
+6. **Revisit `framework/db`** — JOINs with RETURNING (currently untested), raw RETURNING with db.Raw columns, COALESCE/IFNULL expressions, window functions
+7. **Revisit `framework/sqlite`** — consider: periodic auto-optimize (cron integration when cron package exists), connection pool health endpoint, PRAGMA runtime reconfiguration
+8. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
 
 ## In-Progress Work
 

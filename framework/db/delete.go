@@ -10,8 +10,9 @@ import (
 
 // DeleteBuilder builds a DELETE query. Create one with Delete().
 type DeleteBuilder struct {
-	table *TableInfo
-	where []Expr
+	table     *TableInfo
+	where     []Expr
+	returning []column
 }
 
 // Delete starts a DELETE query for the given table.
@@ -40,7 +41,28 @@ func (b *DeleteBuilder) Build() (string, []any, error) {
 	buf.WriteString(" WHERE ")
 	writeExprs(&buf, &args, b.where)
 
+	// RETURNING
+	if len(b.returning) > 0 {
+		writeReturning(&buf, b.returning)
+	}
+
 	return buf.String(), args, nil
+}
+
+// Returning sets the columns to return from the DELETE. Use with the
+// package-level Returning or ReturningAll functions to scan the results.
+//
+//	q := db.Delete(&Users.TableInfo).Where(Users.ID.Eq(id)).
+//	    Returning(Users.ID, Users.Email)
+//	deleted, err := db.Returning[User](ctx, writeDB, q)
+func (b *DeleteBuilder) Returning(cols ...column) *DeleteBuilder {
+	b.returning = cols
+	return b
+}
+
+// build implements the returnable interface.
+func (b *DeleteBuilder) build() (string, []any, error) {
+	return b.Build()
 }
 
 // Exec executes the DELETE and returns the result.

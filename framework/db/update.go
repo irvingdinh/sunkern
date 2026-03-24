@@ -12,9 +12,10 @@ import (
 
 // UpdateBuilder builds an UPDATE query. Create one with Update().
 type UpdateBuilder struct {
-	table *TableInfo
-	sets  []setClause
-	where []Expr
+	table     *TableInfo
+	sets      []setClause
+	where     []Expr
+	returning []column
 }
 
 type setClause struct {
@@ -190,7 +191,28 @@ func (b *UpdateBuilder) Build() (string, []any, error) {
 	buf.WriteString(" WHERE ")
 	writeExprs(&buf, &args, b.where)
 
+	// RETURNING
+	if len(b.returning) > 0 {
+		writeReturning(&buf, b.returning)
+	}
+
 	return buf.String(), args, nil
+}
+
+// Returning sets the columns to return from the UPDATE. Use with the
+// package-level Returning or ReturningAll functions to scan the results.
+//
+//	q := db.Update(&Users.TableInfo).Set(Users.Name, "New").
+//	    Where(Users.ID.Eq(id)).Returning(Users.ID, Users.Name, Users.UpdatedAt)
+//	updated, err := db.Returning[User](ctx, writeDB, q)
+func (b *UpdateBuilder) Returning(cols ...column) *UpdateBuilder {
+	b.returning = cols
+	return b
+}
+
+// build implements the returnable interface.
+func (b *UpdateBuilder) build() (string, []any, error) {
+	return b.Build()
 }
 
 // Exec executes the UPDATE and returns the result.

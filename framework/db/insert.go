@@ -31,10 +31,11 @@ func autoFillBaseModel(rv reflect.Value, m *fieldMapping, now time.Time) {
 
 // InsertBuilder builds an INSERT query. Create one with Insert().
 type InsertBuilder struct {
-	table    *TableInfo
-	columns  []column
-	values   [][]any // one inner slice per row
-	conflict *conflictClause
+	table     *TableInfo
+	columns   []column
+	values    [][]any // one inner slice per row
+	conflict  *conflictClause
+	returning []column
 }
 
 // Insert starts an INSERT query for the given table.
@@ -266,7 +267,28 @@ func (b *InsertBuilder) Build() (string, []any) {
 		b.conflict.writeConflict(&buf, &args)
 	}
 
+	// RETURNING
+	if len(b.returning) > 0 {
+		writeReturning(&buf, b.returning)
+	}
+
 	return buf.String(), args
+}
+
+// Returning sets the columns to return from the INSERT. Use with the
+// package-level Returning or ReturningAll functions to scan the results.
+//
+//	q := db.Insert(&Users.TableInfo).Model(&user).Returning(Users.ID, Users.Email)
+//	created, err := db.Returning[User](ctx, writeDB, q)
+func (b *InsertBuilder) Returning(cols ...column) *InsertBuilder {
+	b.returning = cols
+	return b
+}
+
+// build implements the returnable interface.
+func (b *InsertBuilder) build() (string, []any, error) {
+	sql, args := b.Build()
+	return sql, args, nil
 }
 
 // Exec executes the INSERT and returns the result.
