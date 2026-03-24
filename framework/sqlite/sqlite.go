@@ -69,6 +69,7 @@ func Load() {
 	config.SetDefault("db.journal_size_limit", 67108864)
 	config.SetDefault("db.optimize_interval", "1h")
 	config.SetDefault("db.wal_checkpoint_threshold", 104857600) // 100 MB
+	config.SetDefault("db.trace", false)
 
 	// Read tuning parameters from config.
 	busyTimeout := config.GetOr[int]("db.busy_timeout", 5000)
@@ -101,6 +102,26 @@ func Load() {
 	// Write-only PRAGMAs.
 	writeConn.SetPragma("journal_size_limit", journalSizeLimit)
 	writeConn.SetPragma("wal_autocheckpoint", walAutocheckpoint)
+
+	// SQL tracing — opt-in via DB_TRACE=true. Logs every statement to
+	// slog.Debug with expanded SQL and execution time. Useful for
+	// debugging but adds overhead; leave disabled in production.
+	if config.GetOr[bool]("db.trace", false) {
+		traceFn := func(info driver.TraceInfo) {
+			switch info.EventType {
+			case driver.TraceStmt:
+				slog.Debug("sqlite: trace", "event", "stmt", "sql", info.SQL)
+			case driver.TraceProfile:
+				slog.Debug("sqlite: trace", "event", "profile",
+					"sql", info.SQL,
+					"duration_us", info.Duration.Microseconds(),
+				)
+			}
+		}
+		mask := driver.TraceStmt | driver.TraceProfile
+		writeConn.SetTrace(traceFn, mask)
+		readConn.SetTrace(traceFn, mask)
+	}
 
 	writeDB := sql.OpenDB(writeConn)
 	writeDB.SetMaxOpenConns(1)
@@ -173,14 +194,18 @@ func Load() {
 		},
 	})
 
-	slog.Info("sqlite: database opened",
+	logAttrs := []any{
 		"path", dbPath,
 		"read_conns", readConns,
 		"busy_timeout_ms", busyTimeout,
 		"cache_size", cacheSize,
 		"mmap_size", mmapSize,
 		"optimize_interval", optimizeInterval,
-	)
+	}
+	if config.GetOr[bool]("db.trace", false) {
+		logAttrs = append(logAttrs, "trace", true)
+	}
+	slog.Info("sqlite: database opened", logAttrs...)
 }
 
 // Global returns the global DB instance. Panics if Load has not been called.

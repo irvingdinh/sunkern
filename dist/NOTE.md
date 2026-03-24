@@ -8,7 +8,7 @@
 
 ## Current State
 
-**Last session**: 2026-03-25 — Session 33 (framework/sqlite/migrate revisited — validation, orphan detection, dirty checksums, HasPending)
+**Last session**: 2026-03-25 — Session 34 (framework/sqlite/driver revisited — sqlite3_trace_v2, sqlite3_busy_handler, sqlite3_wal_hook)
 **Working tree**: clean
 **Branch**: with-experiment
 
@@ -23,8 +23,8 @@
 | `framework/http` | **Maturing** | Session 28 | Revisited: PaginationParams (embeddable, Paginate() returns page/perPage/offset with defaults 20/100), BindQuery/BindForm embedded struct recursion (enables shared param types), Created() response helper (201 shorthand), configurable server timeouts (http.read_timeout/write_timeout/idle_timeout via config), middleware writeErrorJSON consolidation (DRY'd 4 files into shared helper). Previous (Session 14): SSE support. Previous (Session 10): Bind/BindForm MaxBytesError → 413. Previous: file upload handling, all sentinels |
 | `framework/http/middleware` | **Maturing** | Session 28 | Revisited: writeErrorJSON shared helper (extracted from auth, apitoken, recover, ratelimit — DRY'd 4 inline JSON blocks into error.go). Previous (Session 15): Timeout, PBKDF2-SHA256 password hashing, APIToken middleware, GenerateToken. Previous (Session 10): JWT, Auth, RequireRole, MaxBytes. Plus existing: RequestID, RequestLogger, Recover, CORS, RateLimit |
 | `framework/db` | **Maturing** | Session 27 | Revisited: INSERT...SELECT (FromSelect on InsertBuilder), DoUpdateAll (auto SET excluded for non-target/non-immutable columns), ConflictBuilder.Where (partial unique index), ConflictWhere (conditional DO UPDATE WHERE), Excluded() helper (reference incoming values in WHERE), Returning accepts ...Expr (backward compatible, columns use unqualified names, Expr uses WriteSQL), ReturningStar() on all mutation builders. Previous (Session 24): CTEs, With() on all builders. Previous (Session 23): set operations, FILTER, Query interface. Previous (Session 22): window functions, GROUP_CONCAT. Previous (Session 21): JOIN ergonomics. Previous (Session 12): RETURNING, subqueries, CASE. Previous (Session 5): nullable types, cursor pagination |
-| `framework/sqlite` | **Maturing** | Session 32 | Revisited: driver.Connector for per-connection PRAGMA init (fixes latent bug — all pool connections now get PRAGMAs), sql.OpenDB replaces sql.Open, GetPragma/SetPragma/Pragmas for runtime introspection, TableStats() via dbstat vtable (per-table rows/pages/size), Stats enriched with CurrentPragmas field, CheckpointResult JSON tags. Previous (Session 18): maintenance goroutine, Health(ctx), optimize_interval/wal_checkpoint_threshold. Previous (Session 11): Stats, Checkpoint, Optimize, IntegrityCheck, Backup. |
-| `framework/sqlite/driver` | **Maturing** | Session 32 | Revisited: Connector type (driver.Connector interface) applies init PRAGMAs to every new connection via Connect(), SetPragma updates connector thread-safely, SQLITE_ENABLE_DBSTAT_VTAB compile flag, compile-time assertion for Connector. Previous (Session 20): structured Error type, context cancellation via sqlite3_interrupt, MemoryUsed/MemoryHighwater, time.Time bind with ms+UTC, nil guards. Previous (Session 11): blob binding safety fix. |
+| `framework/sqlite` | **Maturing** | Session 34 | Revisited: db.trace config key (DB_TRACE env, default false) — opt-in SQL tracing to slog.Debug with expanded SQL and execution time (microseconds). Trace flag visible in startup log. Previous (Session 32): Connector per-connection PRAGMAs, sql.OpenDB, GetPragma/SetPragma/Pragmas, TableStats, Stats.CurrentPragmas. Previous (Session 18): maintenance goroutine, Health(ctx). Previous (Session 11): Stats, Checkpoint, Optimize, IntegrityCheck, Backup. |
+| `framework/sqlite/driver` | **Maturing** | Session 34 | Revisited: sqlite3_trace_v2 (TraceStmt/TraceProfile with expanded SQL and Duration), sqlite3_busy_handler (callback-based retry with DefaultBusyHandler exponential backoff), sqlite3_wal_hook (WAL commit notification with page count), CGo callback trampolines via hook.c + cgo.Handle for safe Go↔C bridging, Connector.SetTrace/SetBusyHandler/SetWALHook, conn.handle lifecycle (cgo.Handle freed on Close). Framework db.trace config key (DB_TRACE env) installs slog.Debug trace on both pools. Load tested: 2% write overhead, 13% read overhead with trace (debug-only). Previous (Session 32): Connector per-connection PRAGMAs, DBSTAT_VTAB. Previous (Session 20): structured Error type, context cancellation, MemoryUsed/MemoryHighwater. |
 | `framework/sqlite/migrate` | **Maturing** | Session 33 | Revisited: Validate() method (orphan detection + dirty checksum report), HasPending() lightweight check, Status() includes orphaned DB records (Orphaned field on MigrationStatus), Up()/UpTo() log dirty checksum warnings for already-applied migrations, appliedRecords() internal refactor (richer DB data shared across all methods), ValidationResult/OrphanedMigration/DirtyMigration types with JSON tags, app.go validates at startup and logs orphan+dirty warnings. Load tested: Status 28K req/s, Validate 29K req/s, HasPending 30K req/s, Version 34K req/s — all sub-5ms p99, 25 MB RSS. Previous (Session 19): SHA-256 checksums, UpTo/DownTo/Version/Redo, MigrationStatus enriched. Previous (Session 11): migration timing, Pending(), error context. |
 
 ## Friction Log
@@ -384,6 +384,14 @@ Session 32 (sqlite+driver revisit, DB admin app with 3 tables — 500 products, 
 - [memory] 34 MB RSS after sustained load
 - [race] No data races detected with -race flag on concurrent Stats+TableStats+Pragmas+SetPragma+CRUD
 
+Session 34 (driver revisit, events app with trace+busy+WAL hooks, 100 hook-test rows + 5100 events):
+- [driver/GET list] 18,906 req/s, p99 6.3ms — paginated list on 200 rows, trace hooks active on main DB (DB_TRACE=true)
+- [driver/POST create] 29,737 req/s, p99 2.9ms — JSON bind + INSERT, trace + WAL hooks active
+- [driver/GET hook-stats] atomic counter reads — sub-ms, no DB overhead
+- [driver/trace overhead] reads: -13% (18.9K vs 21.7K req/s), writes: -2.4% (29.7K vs 30.5K req/s) — debug-only, disabled by default
+- [driver/direct hooks] 102 trace stmts, 102 trace profiles, 101 WAL commits, 0 busy invocations — all 3 hook types verified via direct Connector test
+- [memory] 26.6 MB RSS under sustained load with all hooks active
+
 ## Design Decisions
 
 <!-- Key decisions and rationale so future sessions don't reverse them. Format:
@@ -626,18 +634,27 @@ Session 32 (sqlite+driver revisit, DB admin app with 3 tables — 500 products, 
 - [migrate] app.go calls Validate() after Up() completes. Logs individual warnings per orphan and per dirty migration. Validate() failure itself is non-fatal (logged as Warn, not returned as error) — startup continues. The double logging (Up warns about dirty, then Validate warns about dirty) is intentional: Up warns during migration phase, Validate provides the structured summary for admin observability. (Session 33)
 - [migrate] HasPending() short-circuits on first unapplied migration — O(n) worst case but typically O(1) for up-to-date databases. Uses appliedRecords() which is slightly heavier than needed (fetches all columns), but the simplicity of one shared function outweighs the cost. Migration tables are tiny (tens of rows). (Session 33)
 
+- [driver] CGo callback pattern: hook.c defines C trampolines matching SQLite callback signatures (trace_v2, busy_handler, wal_hook). Trampolines are static, wrapped by non-static install functions (sunkern_install_trace/busy/wal) callable from Go. Go side uses //export for sunkernTraceCallback, sunkernBusyCallback, sunkernWALCallback — these are called by the C trampolines. This two-layer pattern avoids function pointer type casting in Go. (Session 34)
+- [driver] cgo.Handle (runtime/cgo) replaces manual handle registry. Each connection with hooks gets a cgo.Handle storing *connHooks (trace, busy, wal callbacks). Handle passed as void* context to C callbacks. cgo.Handle.Delete() called in conn.Close() before sqlite3_close_v2. This is the officially recommended pattern for passing Go values through C callbacks. (Session 34)
+- [driver] TraceStmt (mask 0x01) fires at statement start — callback receives original SQL text via X parameter (const char*). TraceProfile (mask 0x02) fires at statement end — callback receives sqlite3_stmt* via P, from which sqlite3_expanded_sql() extracts SQL with bound parameters (must free with sqlite3_free), and sqlite3_int64* via X for nanosecond execution time. Falls back to sqlite3_sql() if expanded_sql returns NULL (BLOB params). (Session 34)
+- [driver] BusyFunc receives count (0-based, per locking event). DefaultBusyHandler(maxWait) precomputes max retries: exponential ramp 1→32ms (6 retries = 63ms), then flat 50ms per retry. Total retries = 6 + (maxWait - 63ms) / 50ms. Stateless — safe to share across connections. time.Sleep in the callback is blocking but acceptable (SQLite busy handler is synchronous). (Session 34)
+- [driver] WALFunc receives dbName (always "main" for regular databases) and pages (WAL frame count after commit). Runs synchronously in the committing goroutine. Cannot run checkpoint inside callback (would deadlock) — use goroutine/channel signaling for proactive checkpointing. Return value (SQLITE_OK) is currently ignored by SQLite but included for forward compatibility. (Session 34)
+- [driver] Connector stores hooks (trace/traceMask/busy/wal) alongside pragmas. Connect() snapshots all under single RLock, applies PRAGMAs first, then installs hooks via conn.installHooks(). If any hooks are set, cgo.NewHandle allocates a handle; otherwise handle stays zero (no overhead for hookless connections). (Session 34)
+- [sqlite] db.trace config key (DB_TRACE env var) installs slog.Debug trace on both write and read connectors. Only affects future connections (set before sql.OpenDB). TraceStmt logs original SQL; TraceProfile logs expanded SQL + duration_us. Trace fires at DEBUG level — invisible unless LOG_LEVEL=DEBUG, zero slog overhead at INFO+. Startup log conditionally includes trace=true attribute. (Session 34)
+- [driver] Load test overhead: trace adds ~2% write overhead (29.7K vs 30.5K req/s) and ~13% read overhead (18.9K vs 21.7K req/s). Read overhead is higher because reads do COUNT + SELECT (two callbacks per request). Memory: 26.6 MB RSS under load with trace. All within maturity targets. (Session 34)
+
 ## Next Priorities
 
 <!-- What the last session thinks should come next, in order -->
 
-1. **Revisit `framework/sqlite/driver`** — last touched Session 32. sqlite3_busy_handler (callback-based backoff), sqlite3_wal_hook (WAL monitoring), sqlite3_trace_v2 (statement tracing for debug), blob I/O for large objects
-2. **Revisit `framework/http/middleware`** — last touched Session 28 (5 sessions ago). Auth flow ergonomics, middleware composition helpers, consider request context enrichment helpers
-3. **Revisit `framework/http`** — last touched Session 28. SSE broker/hub pattern (manages multiple connections, fan-out from event source, stats)
-4. **Revisit `framework/db`** — last touched Session 27 (6 sessions ago). Consider: batch update/delete helpers, query logging/tracing hook, prepared statement caching
-5. **Revisit `framework/app`** — last touched Session 30. Future: module dependency declaration (explicit DependsOn for boot ordering), module tags/labels for admin introspection, conditional modules (enabled/disabled via config)
-6. **Revisit `framework/config`** — last touched Session 29. Future: config value change detection (compare Export snapshots), config documentation generator
-7. **Revisit `framework/log`** — last touched Session 31. Future: mmap-based query for very large files (deferred — current linear scan acceptable for admin viewer with daily rotation), log rotation callback (notify when file rotates), per-request sampling (sample by request_id hash for consistent traces)
-8. **Revisit `framework/sqlite/migrate`** — just revisited in Session 33. Future: dry-run mode (validate SQL syntax without applying), migration locking (prevent concurrent Up() calls), migration hooks (pre/post callbacks)
+1. **Revisit `framework/http/middleware`** — last touched Session 28 (6 sessions ago). Auth flow ergonomics, middleware composition helpers, consider request context enrichment helpers
+2. **Revisit `framework/http`** — last touched Session 28. SSE broker/hub pattern (manages multiple connections, fan-out from event source, stats)
+3. **Revisit `framework/db`** — last touched Session 27 (7 sessions ago). Consider: batch update/delete helpers, query logging/tracing hook (can now leverage driver trace), prepared statement caching
+4. **Revisit `framework/app`** — last touched Session 30. Future: module dependency declaration (explicit DependsOn for boot ordering), module tags/labels for admin introspection, conditional modules (enabled/disabled via config)
+5. **Revisit `framework/config`** — last touched Session 29. Future: config value change detection (compare Export snapshots), config documentation generator
+6. **Revisit `framework/log`** — last touched Session 31. Future: mmap-based query for very large files (deferred — current linear scan acceptable for admin viewer with daily rotation), log rotation callback (notify when file rotates), per-request sampling (sample by request_id hash for consistent traces)
+7. **Revisit `framework/sqlite/driver`** — just revisited in Session 34. Future: blob I/O (sqlite3_blob_open/read/write/close for incremental large object access), sqlite3_update_hook (row-level change notifications), WAL hook integration with maintenance goroutine (proactive checkpoint triggering instead of polling)
+8. **Revisit `framework/sqlite/migrate`** — last touched Session 33. Future: dry-run mode (validate SQL syntax without applying), migration locking (prevent concurrent Up() calls), migration hooks (pre/post callbacks)
 9. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
 
 ## In-Progress Work

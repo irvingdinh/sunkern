@@ -47,6 +47,7 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"io"
+	"runtime/cgo"
 	"sort"
 	"strings"
 	"sync"
@@ -149,10 +150,14 @@ func MemoryHighwater(reset bool) int64 {
 //	c.SetPragma("journal_mode", "WAL")
 //	db := sql.OpenDB(c)
 type Connector struct {
-	dsn     string
-	mu      sync.RWMutex
-	pragmas map[string]string // PRAGMA name → full statement
-	drv     *Driver
+	dsn       string
+	mu        sync.RWMutex
+	pragmas   map[string]string // PRAGMA name → full statement
+	trace     TraceFunc         // SQL trace callback (nil = disabled)
+	traceMask TraceMask         // events to trace (TraceStmt, TraceProfile)
+	busy      BusyFunc          // busy handler (nil = use PRAGMA busy_timeout)
+	wal       WALFunc           // WAL commit hook (nil = disabled)
+	drv       *Driver
 }
 
 // NewConnector creates a Connector for the given DSN. PRAGMAs are applied to
@@ -175,8 +180,9 @@ func (c *Connector) SetPragma(name string, value any) {
 	c.mu.Unlock()
 }
 
-// Connect opens a new SQLite connection and applies all registered PRAGMAs.
-// Called by database/sql whenever the pool needs a new connection.
+// Connect opens a new SQLite connection, applies all registered PRAGMAs, and
+// installs any configured hooks (trace, busy handler, WAL). Called by
+// database/sql whenever the pool needs a new connection.
 func (c *Connector) Connect(_ context.Context) (driver.Conn, error) {
 	dc, err := c.drv.Open(c.dsn)
 	if err != nil {
@@ -185,7 +191,7 @@ func (c *Connector) Connect(_ context.Context) (driver.Conn, error) {
 
 	cn := dc.(*conn)
 
-	// Apply init PRAGMAs in sorted order for deterministic execution.
+	// Snapshot connector state under read lock.
 	c.mu.RLock()
 	keys := make([]string, 0, len(c.pragmas))
 	for k := range c.pragmas {
@@ -196,14 +202,32 @@ func (c *Connector) Connect(_ context.Context) (driver.Conn, error) {
 	for i, k := range keys {
 		stmts[i] = c.pragmas[k]
 	}
+	traceFn := c.trace
+	traceMask := c.traceMask
+	busyFn := c.busy
+	walFn := c.wal
 	c.mu.RUnlock()
 
+	// Apply init PRAGMAs in sorted order for deterministic execution.
 	for _, p := range stmts {
 		if err := cn.exec(p); err != nil {
 			cn.Close()
 			return nil, fmt.Errorf("sqlite3: init pragma: %w", err)
 		}
 	}
+
+	// Install hooks if any are configured. The cgo.Handle lets C callbacks
+	// reach the Go functions without passing Go pointers through C.
+	if traceFn != nil || busyFn != nil || walFn != nil {
+		hooks := &connHooks{
+			trace: traceFn,
+			busy:  busyFn,
+			wal:   walFn,
+		}
+		cn.handle = cgo.NewHandle(hooks)
+		cn.installHooks(hooks, traceMask, cn.handle)
+	}
+
 	return cn, nil
 }
 
@@ -215,7 +239,8 @@ func (c *Connector) Driver() driver.Driver { return c.drv }
 // ---------------------------------------------------------------------------
 
 type conn struct {
-	db *C.sqlite3
+	db     *C.sqlite3
+	handle cgo.Handle // non-zero if hooks are installed; freed on Close
 }
 
 func (c *conn) Prepare(query string) (driver.Stmt, error) {
@@ -234,6 +259,11 @@ func (c *conn) Prepare(query string) (driver.Stmt, error) {
 func (c *conn) Close() error {
 	if c.db == nil {
 		return nil
+	}
+	// Free the hook handle before closing — after close, no callbacks fire.
+	if c.handle != 0 {
+		c.handle.Delete()
+		c.handle = 0
 	}
 	rc := C.sqlite3_close_v2(c.db)
 	if rc != C.SQLITE_OK {
