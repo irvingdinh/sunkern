@@ -8,7 +8,7 @@
 
 ## Current State
 
-**Last session**: 2026-03-25 — Session 23 (framework/db revisited — UNION/UNION ALL/INTERSECT/EXCEPT set operations, aggregate FILTER clause, Query interface for generic query functions)
+**Last session**: 2026-03-25 — Session 25 (framework/app revisited — health check system, ReadyCh, Env/Version, sqlite health auto-registered)
 **Working tree**: clean
 **Branch**: with-experiment
 
@@ -16,13 +16,13 @@
 
 | Package | Maturity | Last Touched | Notes |
 |---------|----------|--------------|-------|
-| `framework/app` | **Maturing** | Session 13 | Revisited: *App supplied to container (modules access Ready/ShuttingDown without explicit passing), boot/shutdown timing for modules and framework services, startup summary log (boot_time, module count, service count, hook count), shutdown timing. Previous: ModuleGroup boot rollback fix, lifecycle logging, module name tracking |
+| `framework/app` | **Maturing** | Session 25 | Revisited: health check system (HealthChecker/CheckFunc/HealthReport, concurrent CheckHealth, AddHealthCheck), ReadyCh() symmetric with ShuttingDown(), Env()/Version() with config integration, sqlite health auto-registered, startup log includes env/health_checks/version. Previous (Session 13): *App supplied to container, boot/shutdown timing, startup summary. Previous: ModuleGroup boot rollback fix, lifecycle logging |
 | `framework/container` | **Maturing** | Session 13 | Revisited: introspection APIs (Keys, Inspect, Len), ServiceInfo/ServiceStatus types, Hooks() accessor. Previous: Override/OverrideSupply, named hooks, all framework hooks named |
 | `framework/config` | **Maturing** | Session 16 | Revisited: config validation (AddRule, Validate, 10 built-in rules: Required, NotEmpty, Positive, NonNegative, OneOf, Min, Max, Range, MinLen, MaxLen). Rule type is a function — composable, zero boilerplate. Validate() integrated into app lifecycle after framework init, before module Boot. Previous (Session 7): Has, All, Keys, Sub, DataDir, EnvName, SetDefaults; Load creates data dir; improved panic messages |
 | `framework/log` | **Maturing** | Session 17 | Revisited: buffered file writer (64KB bufio.Writer + 200ms periodic flush goroutine — ~145k log writes/sec), Flush() export, Query improvements (Order desc/asc, After/Before time range, CountOnly mode). Previous (Session 8): Separate console/file levels, log file management, JSONL entry parsing + querying |
 | `framework/http` | **Maturing** | Session 14 | Revisited: SSE support (NewEventStream, SSEWriter with Send/SendJSON/Heartbeat/Retry/Done, LastEventID, write deadline extension via ResponseController, ErrStreamingNotSupported sentinel). Previous (Session 10): Bind/BindForm MaxBytesError → 413. Previous: file upload handling, all sentinels |
 | `framework/http/middleware` | **Maturing** | Session 15 | Revisited: Timeout (context deadline per route), PBKDF2-SHA256 password hashing (HashPassword/CheckPassword, 600k iterations, PHC format, stdlib-only), APIToken middleware (opaque bearer tokens with DB lookup via TokenLookup callback), GenerateToken (32-byte random hex). Previous (Session 10): JWT (HMAC-SHA256 sign/verify, Claims, context helpers), Auth (Bearer token + user_id logging), RequireRole (role-based 403), MaxBytes (body size limiter). Plus existing: RequestID, RequestLogger, Recover, CORS, RateLimit |
-| `framework/db` | **Maturing** | Session 23 | Revisited: Query interface (backward-compatible — QueryAll/QueryOne/QueryVal accept both SelectBuilder and SetBuilder), SetBuilder for UNION/UNION ALL/INTERSECT/EXCEPT with OrderBy/Limit/Offset, aggregate FILTER clause (Filter(agg, where) → FILTER (WHERE condition), composes with As/Over). Previous (Session 22): window functions, GROUP_CONCAT. Previous (Session 21): JOIN ergonomics. Previous (Session 12): RETURNING, subqueries, CASE. Previous (Session 5): nullable types, cursor pagination |
+| `framework/db` | **Maturing** | Session 24 | Revisited: CTEDef type (NewCTE/NewRecursiveCTE, Columns/As/Ref/Col methods), With() on all 5 builders, writeCTEs shared helper, Select(nil) for tableless SELECT. Previous (Session 23): set operations, FILTER, Query interface. Previous (Session 22): window functions, GROUP_CONCAT. Previous (Session 21): JOIN ergonomics. Previous (Session 12): RETURNING, subqueries, CASE. Previous (Session 5): nullable types, cursor pagination |
 | `framework/sqlite` | **Maturing** | Session 18 | Revisited: background maintenance goroutine (periodic PRAGMA optimize + WAL auto-checkpoint when WAL exceeds threshold), Health(ctx) for readiness checks, 2 new config keys (db.optimize_interval, db.wal_checkpoint_threshold). Maintenance lifecycle managed by container hooks (OnStart/OnStop). Previous (Session 11): Stats, Checkpoint, Optimize, IntegrityCheck, Backup. Configurable PRAGMAs. |
 | `framework/sqlite/driver` | **Maturing** | Session 20 | Revisited: structured Error type with primary+extended result codes (Code/ExtendedCode/Message), context cancellation via sqlite3_interrupt (ExecContext/QueryContext on conn+stmt), MemoryUsed/MemoryHighwater exported functions, time.Time bind with ms precision + UTC, extended result codes enabled per connection, nil guards on Close, compile-time interface assertions. Previous (Session 11): blob binding safety fix (CBytes+C.free pattern). |
 | `framework/sqlite/migrate` | **Maturing** | Session 19 | Revisited: SHA-256 checksums (drift detection via Dirty field), execution_ms tracking, UpTo/DownTo/Version/Redo methods, MigrationStatus enriched with HasDown/StmtCount/Checksum/Dirty/ExecutionMs + JSON tags, backward-compatible schema upgrade (ALTER TABLE ADD COLUMN), Checksum() exported, applyUp/applyDown split, *Engine supplied to container. Previous (Session 11): migration timing, Pending(), error context with statement index. |
@@ -276,6 +276,28 @@ Session 23 (db revisit, sales analytics with set operations + FILTER — 20 prod
 - [memory] 40 MB RSS after 35k+ load test requests
 - [race] No data races detected with -race flag on concurrent requests across all 7 endpoints
 
+Session 24 (db revisit, org hierarchy with CTEs — 15 departments, 520 employees, 3-level dept tree):
+- [db/CTE+JOIN] 24,380 req/s, p99 5.9ms — non-recursive CTE with dept stats aggregate + INNER JOIN
+- [db/CTE+window] 9,555 req/s, p99 18.8ms — CTE with ROW_NUMBER window function, top 3 per dept
+- [db/multi-CTE] 9,530 req/s, p99 19.1ms — 2 CTEs with LEFT JOINs (emp_counts + salary_stats)
+- [db/recursive dept-tree] 12,377 req/s, p99 14.1ms — WITH RECURSIVE 3-level tree traversal with path concatenation
+- [db/recursive org-chain] 15,325 req/s, p99 11.0ms — recursive walk up 5-level management chain
+- [db/recursive+non-recursive] 9,055 req/s, p99 19.9ms — recursive subtree + non-recursive emp_counts combined
+- [db/pure recursive 100] 36,727 req/s, p99 4.0ms — tableless SELECT base case, 100 rows generated
+- [db/pure recursive 10k] 1,422 req/s, p99 34.0ms — 10,000 rows generated (IO-bound: JSON serialization)
+- [memory] 33 MB RSS after sustained load across all 7 CTE endpoints
+- [race] No data races detected with -race flag on concurrent CTE requests
+
+Session 25 (app revisit, health monitor with heartbeat worker, custom health checks, ReadyCh):
+- [app/GET health] 82,689 req/s, p99 3.4ms — concurrent CheckHealth (sqlite + custom check), JSON response
+- [app/GET ready] 68,034 req/s, p99 2.5ms — Ready() atomic bool check
+- [app/GET info] 63,083 req/s, p99 2.5ms — Env() + Version() + Ready() + container.Len()
+- [app/GET heartbeats] 20,258 req/s, p99 6.1ms — paginated list with COUNT + SELECT
+- [app/POST heartbeats] 31,736 req/s, p99 6.7ms — JSON bind + INSERT
+- [memory] 30 MB RSS after 10k+ writes and 50k+ load test requests
+- [race] No data races detected with -race flag on concurrent health + CRUD + heartbeat writer
+- [ReadyCh] Heartbeat worker confirmed: started only after ReadyCh closed, stopped cleanly on ShuttingDown
+
 ## Design Decisions
 
 <!-- Key decisions and rationale so future sessions don't reverse them. Format:
@@ -440,14 +462,28 @@ Session 23 (db revisit, sales analytics with set operations + FILTER — 20 prod
 - [db] Filter(agg, where) wraps any Expr with FILTER (WHERE condition). It's a simple wrapper — no special knowledge of aggregates. This means it composes with any expression, though it only makes semantic sense on aggregates. Consistent with the established pattern: package-level function returning Expr, no modification to existing types. (Session 23)
 - [db] Filter composes with Over for conditional window aggregates: `db.Over(db.Filter(db.Sum(col, ""), pred), win)`. SQLite executes FILTER before OVER — the filter restricts which rows contribute to the aggregate within each window partition. (Session 23)
 
+- [db] CTEDef is a struct with name, columns, query, recursive fields. NewCTE/NewRecursiveCTE are package-level constructors — consistent with NewTableInfo, Select, Union patterns. CTEDef is mutable (As() sets body after construction) — necessary for recursive CTEs where the body references the CTE's own Ref(). (Session 24)
+- [db] Ref() returns *TableInfo — reuses the existing table reference system. The TableInfo has no registered columns (Star() returns nil), so users must specify explicit Columns() on the SelectBuilder. This is correct: CTE columns are dynamic, not schema-as-code. Ref() caches the TableInfo to avoid repeated allocation. (Session 24)
+- [db] Col(name) returns Raw(quoteIdent(cte) + "." + quoteIdent(col)) — a simple Expr without typed methods (no .Eq(), .Gt() etc.). For comparisons, users use ColEq(cte.Col("x"), someCol) or Raw expressions. CTE columns are dynamic; adding typed methods would require a column factory pattern that adds complexity without proportional value. (Session 24)
+- [db] writeCTEs() is a shared helper used by all 5 builders. If ANY CTE in the list is recursive, WITH RECURSIVE is used (per SQL standard — the keyword applies to the entire WITH block). Non-recursive CTEs can coexist in a WITH RECURSIVE block. CTEs are comma-separated, each with optional column list. (Session 24)
+- [db] Select(nil) produces a FROM-less SELECT — valid SQL needed for CTE base cases (SELECT 1) and scalar expressions (SELECT datetime('now')). Build() and buildCount() guard against nil table: skip FROM clause, skip Star() call. Empty column list with nil table produces invalid SQL, but that's a programmer error caught by the database. (Session 24)
+- [db] With() method added to all 5 builders (SelectBuilder, SetBuilder, InsertBuilder, UpdateBuilder, DeleteBuilder) — SQLite supports CTEs with all DML statements. The With clause is prepended in Build() before the main statement. CTE body must implement Query interface (SelectBuilder or SetBuilder). (Session 24)
+
+- [app] Health check system uses HealthChecker interface (Name + Check) + CheckFunc adapter — same pattern as http.Handler/http.HandlerFunc. Interface for complex checkers, function adapter for simple ones. AddHealthCheck is mutex-protected (concurrent module Boot in ModuleGroup). (Session 25)
+- [app] CheckHealth runs all checks concurrently with sync.WaitGroup. Each goroutine gets its own slice index — no append data race. Snapshot checkers under RLock before spawning goroutines — safe to add more checkers while a check is running. Status: "healthy" (all pass), "unhealthy" (any fail), "unavailable" (no checkers registered). (Session 25)
+- [app] ReadyCh is a channel closed exactly once when app.ready.Store(true). Symmetric with ShuttingDown() — background goroutines select on both to start after boot and stop on shutdown. No Close() method needed — it's a one-time signal. (Session 25)
+- [app] Env() resolved from config key "app.env" (APP_ENV env var) after config.Load(), default "development". SetDefault called before Load for discoverability via config.Keys()/All(). Version from WithVersion option only — not from config, since version is a build-time concern. (Session 25)
+- [app] Sqlite health check auto-registered in run() right after sunkerndb.Load() — uses CheckFunc adapter wrapping sunkerndb.Global().Health. Framework manages its own health checks; modules add custom ones. (Session 25)
+- [app] Startup log uses variadic []any for attrs to conditionally include "version" only when set. Avoids empty version field in JSON output for apps that don't set it. env, health_checks always included. (Session 25)
+
 ## Next Priorities
 
 <!-- What the last session thinks should come next, in order -->
 
-1. **Revisit `framework/db`** — raw RETURNING with db.Raw columns, Common Table Expressions (WITH/WITH RECURSIVE)
-2. **Revisit `framework/app`** — lifecycle hooks for plugins (pre-boot, post-boot callbacks), health check endpoint integration (now that sqlite.Health exists). Last touched Session 13 (9 sessions ago)
-3. **Revisit `framework/container`** — also last touched Session 13. Fresh eyes on the API after all the evolution since
-4. **Revisit `framework/http`** — SSE broker/hub pattern as a higher-level abstraction (manages multiple connections, fan-out from event source, stats), once event bus exists
+1. **Revisit `framework/container`** — last touched Session 13 (12 sessions ago — most stale). Fresh eyes on the API after all the evolution since
+2. **Revisit `framework/db`** — raw RETURNING with db.Raw columns. CTE done. Consider: INSERT...SELECT builder, upsert improvements
+3. **Revisit `framework/http`** — SSE broker/hub pattern as a higher-level abstraction (manages multiple connections, fan-out from event source, stats), once event bus exists
+4. **Revisit `framework/app`** — lifecycle hooks for plugins (pre-boot, post-boot callbacks), module dependency declaration, boot order optimization. Health check system done
 5. **Revisit `framework/log`** — log sampling handler for high-traffic paths, mmap-based query for very large files (deferred — current linear scan is acceptable for admin viewer with daily rotation)
 6. **Revisit `framework/sqlite`** — PRAGMA runtime reconfiguration (cache_size, mmap_size changes without restart), table-level size stats for admin dashboard
 7. **Revisit `framework/sqlite/migrate`** — migration versioning validation (detect gaps, detect orphaned DB records), checksum mismatch warnings in Up() log output, batch status queries

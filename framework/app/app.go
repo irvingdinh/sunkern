@@ -33,13 +33,20 @@ type App struct {
 		ch   chan struct{} // closed when shutdown begins
 	}
 	ready   atomic.Bool
-	runOnce sync.Once // ensures Run is called exactly once
+	readyCh chan struct{} // closed when app is ready
+	runOnce sync.Once    // ensures Run is called exactly once
+
+	// Health checks registered by framework services and modules.
+	healthCheckers []HealthChecker
+	healthMu       sync.RWMutex
 
 	// For testing: override signal context creation.
 	signalCtxFunc func() (context.Context, context.CancelFunc)
 
 	shutdownTimeout  time.Duration
 	migrationSources []fs.FS
+	version          string
+	env              string // resolved from config during Run
 }
 
 // New creates an application. Options are applied in order.
@@ -48,6 +55,7 @@ func New(opts ...Option) *App {
 		shutdownTimeout: 30 * time.Second,
 	}
 	a.shutdown.ch = make(chan struct{})
+	a.readyCh = make(chan struct{})
 	for _, opt := range opts {
 		opt(a)
 	}
@@ -68,6 +76,13 @@ func WithShutdownTimeout(d time.Duration) Option {
 // are merged and applied in version order during boot.
 func WithMigrations(sources ...fs.FS) Option {
 	return func(a *App) { a.migrationSources = append(a.migrationSources, sources...) }
+}
+
+// WithVersion sets the application version string. Included in the startup
+// log and available via App.Version(). Typically set from build-time ldflags
+// or a constant in main.go.
+func WithVersion(v string) Option {
+	return func(a *App) { a.version = v }
 }
 
 // Use adds modules to the application. Modules are registered and booted
@@ -94,6 +109,31 @@ func (a *App) Ready() bool {
 //	}
 func (a *App) ShuttingDown() <-chan struct{} {
 	return a.shutdown.ch
+}
+
+// ReadyCh returns a channel that is closed when the application finishes
+// booting and begins accepting traffic. Use it in background goroutines
+// that should wait for full readiness before starting work:
+//
+//	go func() {
+//	    <-app.ReadyCh()
+//	    // all modules booted, safe to start
+//	}()
+func (a *App) ReadyCh() <-chan struct{} {
+	return a.readyCh
+}
+
+// Version returns the application version string set via WithVersion.
+// Returns empty string if not set.
+func (a *App) Version() string {
+	return a.version
+}
+
+// Env returns the application environment ("development", "production",
+// "test", etc.). Resolved from the "app.env" config key (APP_ENV env var)
+// during Run, defaulting to "development".
+func (a *App) Env() string {
+	return a.env
 }
 
 // Run executes the full application lifecycle. It blocks until a shutdown
@@ -123,13 +163,21 @@ func (a *App) run() error {
 
 	bootStart := time.Now()
 
+	// Register app-level config defaults for discoverability via
+	// config.Keys() and config.All().
+	config.SetDefault("app.env", "development")
+
 	// Load config from file + env vars. The global container is already
 	// initialized by its package init — no Reset() needed here. Reset()
 	// exists solely for tests that need a clean container between cases.
 	config.Load()
 
+	// Resolve environment after config loads.
+	a.env = config.GetOr[string]("app.env", "development")
+
 	// Supply the App itself so modules can resolve it from the container
-	// to access Ready() and ShuttingDown() without explicit passing.
+	// to access Ready(), ShuttingDown(), ReadyCh(), CheckHealth() without
+	// explicit passing.
 	container.Supply(a)
 
 	sunkernlog.Load()
@@ -146,6 +194,7 @@ func (a *App) run() error {
 	t := time.Now()
 	sunkerndb.Load()
 	container.Supply[*sunkerndb.DB](sunkerndb.Global())
+	a.AddHealthCheck(CheckFunc{CheckerName: "sqlite", Fn: sunkerndb.Global().Health})
 	slog.Debug("framework service initialized", "service", "sqlite", "took", time.Since(t))
 
 	// Run migrations.
@@ -190,12 +239,20 @@ func (a *App) run() error {
 	}
 
 	a.ready.Store(true)
-	slog.Info("application started",
+	close(a.readyCh)
+
+	startAttrs := []any{
+		"env", a.env,
 		"boot_time", time.Since(bootStart),
 		"modules", len(a.modules),
 		"services", container.Len(),
 		"hooks", len(container.Global().Hooks()),
-	)
+		"health_checks", len(a.healthCheckers),
+	}
+	if a.version != "" {
+		startAttrs = append(startAttrs, "version", a.version)
+	}
+	slog.Info("application started", startAttrs...)
 
 	// Phase 5: Wait for shutdown signal.
 	a.waitForSignal()
