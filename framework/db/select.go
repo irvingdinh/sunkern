@@ -81,6 +81,12 @@ func (b *SelectBuilder) LeftJoin(table *TableInfo, on Expr) *SelectBuilder {
 	return b
 }
 
+// CrossJoin adds a CROSS JOIN (cartesian product). No ON condition.
+func (b *SelectBuilder) CrossJoin(table *TableInfo) *SelectBuilder {
+	b.joins = append(b.joins, joinClause{joinType: "CROSS JOIN", table: table})
+	return b
+}
+
 // GroupBy sets the GROUP BY columns.
 func (b *SelectBuilder) GroupBy(cols ...Expr) *SelectBuilder {
 	b.groupBy = append(b.groupBy, cols...)
@@ -127,14 +133,7 @@ func (b *SelectBuilder) Build() (string, []any) {
 	b.table.WriteSQL(&buf, &args)
 
 	// JOINs
-	for _, j := range b.joins {
-		buf.WriteString(" ")
-		buf.WriteString(j.joinType)
-		buf.WriteString(" ")
-		j.table.WriteSQL(&buf, &args)
-		buf.WriteString(" ON ")
-		j.on.WriteSQL(&buf, &args)
-	}
+	writeJoins(&buf, &args, b.joins)
 
 	// WHERE
 	if len(b.where) > 0 {
@@ -185,6 +184,20 @@ func (b *SelectBuilder) Build() (string, []any) {
 	return buf.String(), args
 }
 
+// writeJoins renders JOIN clauses. CROSS JOIN omits the ON clause.
+func writeJoins(buf *strings.Builder, args *[]any, joins []joinClause) {
+	for _, j := range joins {
+		buf.WriteString(" ")
+		buf.WriteString(j.joinType)
+		buf.WriteString(" ")
+		j.table.WriteSQL(buf, args)
+		if j.on != nil {
+			buf.WriteString(" ON ")
+			j.on.WriteSQL(buf, args)
+		}
+	}
+}
+
 // buildCount generates a SELECT COUNT(*) query reusing FROM/WHERE/JOIN.
 func (b *SelectBuilder) buildCount() (string, []any) {
 	var buf strings.Builder
@@ -204,14 +217,7 @@ func (b *SelectBuilder) buildCount() (string, []any) {
 	}
 	b.table.WriteSQL(&buf, &args)
 
-	for _, j := range b.joins {
-		buf.WriteString(" ")
-		buf.WriteString(j.joinType)
-		buf.WriteString(" ")
-		j.table.WriteSQL(&buf, &args)
-		buf.WriteString(" ON ")
-		j.on.WriteSQL(&buf, &args)
-	}
+	writeJoins(&buf, &args, b.joins)
 
 	if len(b.where) > 0 {
 		buf.WriteString(" WHERE ")

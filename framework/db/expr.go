@@ -12,6 +12,115 @@ type Expr interface {
 }
 
 // ---------------------------------------------------------------------------
+// Alias — "expr AS alias"
+// ---------------------------------------------------------------------------
+
+type aliasExpr struct {
+	inner Expr
+	alias string
+}
+
+// As wraps any expression with an alias: expr AS "alias". Use in SELECT
+// column lists to disambiguate columns from JOINed tables, or to name
+// computed expressions for struct-tag scanning.
+//
+//	db.Select(&Users.TableInfo).
+//	    Columns(db.As(Users.ID, "user_id"), db.As(Posts.ID, "post_id")).
+//	    Join(&Posts.TableInfo, Posts.UserID.EqCol(Users.ID))
+func As(expr Expr, alias string) Expr {
+	return aliasExpr{inner: expr, alias: alias}
+}
+
+func (e aliasExpr) WriteSQL(buf *strings.Builder, args *[]any) {
+	e.inner.WriteSQL(buf, args)
+	buf.WriteString(" AS ")
+	buf.WriteString(quoteIdent(e.alias))
+}
+
+// ---------------------------------------------------------------------------
+// Column-to-column comparison (cross-type) — for JOIN conditions
+// ---------------------------------------------------------------------------
+
+// ColEq creates a column-to-column equality expression between any two
+// expressions. Useful for JOIN ON conditions between different column types
+// (e.g., StringColumn and NullStringColumn).
+//
+//	db.Select(&Users.TableInfo).
+//	    Join(&Posts.TableInfo, db.ColEq(Posts.AuthorID, Users.ID))
+func ColEq(left, right Expr) Expr { return newColComp(left, "=", right) }
+
+// ColNe creates a column-to-column inequality expression.
+func ColNe(left, right Expr) Expr { return newColComp(left, "<>", right) }
+
+// ColGt creates a column-to-column greater-than expression.
+func ColGt(left, right Expr) Expr { return newColComp(left, ">", right) }
+
+// ColLt creates a column-to-column less-than expression.
+func ColLt(left, right Expr) Expr { return newColComp(left, "<", right) }
+
+// ColGte creates a column-to-column greater-than-or-equal expression.
+func ColGte(left, right Expr) Expr { return newColComp(left, ">=", right) }
+
+// ColLte creates a column-to-column less-than-or-equal expression.
+func ColLte(left, right Expr) Expr { return newColComp(left, "<=", right) }
+
+// ---------------------------------------------------------------------------
+// COALESCE / IFNULL — NULL handling expressions
+// ---------------------------------------------------------------------------
+
+type coalesceExpr struct {
+	exprs []Expr
+}
+
+// Coalesce returns a COALESCE(a, b, ...) expression that evaluates to the
+// first non-NULL argument. Common in LEFT JOINs to provide fallback values.
+//
+//	db.As(db.Coalesce(Posts.Title, db.Raw("'(no title)'")), "title")
+func Coalesce(exprs ...Expr) Expr {
+	return coalesceExpr{exprs: exprs}
+}
+
+func (e coalesceExpr) WriteSQL(buf *strings.Builder, args *[]any) {
+	buf.WriteString("COALESCE(")
+	for i, expr := range e.exprs {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		expr.WriteSQL(buf, args)
+	}
+	buf.WriteString(")")
+}
+
+type ifNullExpr struct {
+	expr     Expr
+	fallback Expr
+}
+
+// IfNull returns an IFNULL(expr, fallback) expression — SQLite's two-argument
+// shorthand for COALESCE. Returns fallback when expr is NULL.
+//
+//	db.As(db.IfNull(Posts.Title, db.Raw("'(untitled)'")), "title")
+func IfNull(expr, fallback Expr) Expr {
+	return ifNullExpr{expr: expr, fallback: fallback}
+}
+
+func (e ifNullExpr) WriteSQL(buf *strings.Builder, args *[]any) {
+	buf.WriteString("IFNULL(")
+	e.expr.WriteSQL(buf, args)
+	buf.WriteString(", ")
+	e.fallback.WriteSQL(buf, args)
+	buf.WriteString(")")
+}
+
+// Val wraps a Go value as a parameterized expression (? placeholder).
+// Use with Coalesce, IfNull, or anywhere a literal value is needed as an Expr.
+//
+//	db.IfNull(Posts.Title, db.Val("(untitled)"))
+func Val(v any) Expr {
+	return Raw("?", v)
+}
+
+// ---------------------------------------------------------------------------
 // Raw expression escape hatch
 // ---------------------------------------------------------------------------
 

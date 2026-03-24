@@ -8,7 +8,7 @@
 
 ## Current State
 
-**Last session**: 2026-03-25 — Session 20 (framework/sqlite/driver revisited — structured errors, context cancellation, memory stats, time format)
+**Last session**: 2026-03-25 — Session 21 (framework/db revisited — JOIN ergonomics: As aliasing, CrossJoin, Coalesce/IfNull/Val, ColEq family, Asc/Desc package-level)
 **Working tree**: clean
 **Branch**: with-experiment
 
@@ -22,7 +22,7 @@
 | `framework/log` | **Maturing** | Session 17 | Revisited: buffered file writer (64KB bufio.Writer + 200ms periodic flush goroutine — ~145k log writes/sec), Flush() export, Query improvements (Order desc/asc, After/Before time range, CountOnly mode). Previous (Session 8): Separate console/file levels, log file management, JSONL entry parsing + querying |
 | `framework/http` | **Maturing** | Session 14 | Revisited: SSE support (NewEventStream, SSEWriter with Send/SendJSON/Heartbeat/Retry/Done, LastEventID, write deadline extension via ResponseController, ErrStreamingNotSupported sentinel). Previous (Session 10): Bind/BindForm MaxBytesError → 413. Previous: file upload handling, all sentinels |
 | `framework/http/middleware` | **Maturing** | Session 15 | Revisited: Timeout (context deadline per route), PBKDF2-SHA256 password hashing (HashPassword/CheckPassword, 600k iterations, PHC format, stdlib-only), APIToken middleware (opaque bearer tokens with DB lookup via TokenLookup callback), GenerateToken (32-byte random hex). Previous (Session 10): JWT (HMAC-SHA256 sign/verify, Claims, context helpers), Auth (Bearer token + user_id logging), RequireRole (role-based 403), MaxBytes (body size limiter). Plus existing: RequestID, RequestLogger, Recover, CORS, RateLimit |
-| `framework/db` | **Maturing** | Session 12 | Revisited: RETURNING clause (INSERT/UPDATE/DELETE), subqueries (IN, NOT IN, EXISTS, NOT EXISTS), CASE expressions (searched + simple). Previous (Session 5): deterministic column order, generalized pointer handling, SetNull, ModelSlice batch insert, NullBoolColumn/NullFloatColumn, cursor pagination (After + HasMore) |
+| `framework/db` | **Maturing** | Session 21 | Revisited: JOIN ergonomics — As(expr, alias) for column aliasing in JOINs, CrossJoin(table), Coalesce(exprs...), IfNull(expr, fallback), Val(v) for parameterized literals, ColEq/ColNe/ColGt/ColLt/ColGte/ColLte for cross-type column comparisons in JOIN ON, Asc(expr)/Desc(expr) package-level ORDER BY from arbitrary expressions. writeJoins() helper extracted for DRY. Previous (Session 12): RETURNING clause, subqueries, CASE expressions. Previous (Session 5): deterministic column order, generalized pointer handling, SetNull, ModelSlice batch insert, NullBoolColumn/NullFloatColumn, cursor pagination (After + HasMore) |
 | `framework/sqlite` | **Maturing** | Session 18 | Revisited: background maintenance goroutine (periodic PRAGMA optimize + WAL auto-checkpoint when WAL exceeds threshold), Health(ctx) for readiness checks, 2 new config keys (db.optimize_interval, db.wal_checkpoint_threshold). Maintenance lifecycle managed by container hooks (OnStart/OnStop). Previous (Session 11): Stats, Checkpoint, Optimize, IntegrityCheck, Backup. Configurable PRAGMAs. |
 | `framework/sqlite/driver` | **Maturing** | Session 20 | Revisited: structured Error type with primary+extended result codes (Code/ExtendedCode/Message), context cancellation via sqlite3_interrupt (ExecContext/QueryContext on conn+stmt), MemoryUsed/MemoryHighwater exported functions, time.Time bind with ms precision + UTC, extended result codes enabled per connection, nil guards on Close, compile-time interface assertions. Previous (Session 11): blob binding safety fix (CBytes+C.free pattern). |
 | `framework/sqlite/migrate` | **Maturing** | Session 19 | Revisited: SHA-256 checksums (drift detection via Dirty field), execution_ms tracking, UpTo/DownTo/Version/Redo methods, MigrationStatus enriched with HasDown/StmtCount/Checksum/Dirty/ExecutionMs + JSON tags, backward-compatible schema upgrade (ALTER TABLE ADD COLUMN), Checksum() exported, applyUp/applyDown split, *Engine supplied to container. Previous (Session 11): migration timing, Pending(), error context with statement index. |
@@ -242,6 +242,17 @@ Session 20 (driver revisit, events app with structured errors + context cancel +
 - [memory] SQLite memory_used: 22 MB, memory_highwater: 23 MB after 5k+ writes and 30k+ load test requests
 - [race] No data races detected with -race flag on concurrent CRUD + error extraction + context cancellation + stats
 
+Session 21 (db revisit, blog app with JOINs — 500 posts, 2000 comments, 10 users, 6 tags, post_tags junction):
+- [db/INNER JOIN] 13,668 req/s, p99 1.5ms — paginated posts+users JOIN with As() aliasing, COUNT + SELECT
+- [db/LEFT JOIN+GROUP BY] 9,652 req/s, p99 2.1ms — post stats with LEFT JOIN comments, COUNT per post
+- [db/Comments JOIN] 44,742 req/s, p99 0.6ms — comments+users INNER JOIN, small result set per post
+- [db/Multi LEFT JOIN] 4,136 req/s, p99 3.4ms — posts+post_tags+tags double LEFT JOIN, 50 rows
+- [db/Author Summary] 32,754 req/s, p99 0.8ms — users LEFT JOIN posts, IfNull, ColEq, GROUP BY, 10 rows
+- [db/COALESCE] 46,898 req/s, p99 0.6ms — Coalesce + IfNull + scalar subquery, 10 rows
+- [db/EXISTS+JOIN] 14,375 req/s, p99 1.3ms — EXISTS subquery combined with INNER JOIN, 20 rows
+- [memory] 38 MB RSS after 70k+ load test requests across all endpoints
+- [race] No data races detected with -race flag on concurrent requests across all 7 JOIN endpoints
+
 ## Design Decisions
 
 <!-- Key decisions and rationale so future sessions don't reverse them. Format:
@@ -386,11 +397,18 @@ Session 20 (driver revisit, events app with structured errors + context cancel +
 - [driver] Compile-time interface assertions added: conn implements ExecerContext + QueryerContext, stmt implements StmtExecContext + StmtQueryContext. Catches interface drift at compile time rather than runtime. (Session 20)
 - [driver] Nil guards added to conn.Close() and stmt.Close() — safe to call multiple times. conn.Close() captures error message before nilling db pointer. (Session 20)
 
+- [db] As(expr, alias) is a package-level function returning aliasExpr — works with any Expr (columns, aggregates, Raw, Coalesce, etc.). This is preferred over adding As() methods on every column type — one function covers all cases. Scan target structs use `db:"alias_name"` tags to map aliased columns. (Session 21)
+- [db] ColEq/ColNe/ColGt/ColLt/ColGte/ColLte are package-level functions taking (Expr, Expr) — solve cross-type column comparisons for JOIN ON conditions. The existing per-type EqCol methods (StringColumn.EqCol(StringColumn)) still work for same-type comparisons. ColEq is the general-purpose alternative. (Session 21)
+- [db] Coalesce(exprs...) wraps COALESCE(a, b, ...). IfNull(expr, fallback) wraps IFNULL(expr, fallback) — SQLite's two-argument shorthand. Both return Expr, compose naturally with As() for aliased SELECT columns. Val(v) creates a parameterized literal (Raw("?", v)) — use inside Coalesce/IfNull to inject Go values as SQL parameters. (Session 21)
+- [db] Asc(expr)/Desc(expr) are package-level functions returning OrderExpr — allow ordering by aliases, aggregates, or computed expressions that don't have methods. The column-level .Asc()/.Desc() methods remain for the common case. (Session 21)
+- [db] CrossJoin(table) has no ON clause. writeJoins() helper extracted from Build() and buildCount() to handle both ON and no-ON cases without duplication. (Session 21)
+- [db] JOIN scan pattern: when JOINing tables with overlapping column names (e.g., both have "id"), users MUST use As() to alias and a flat scan-target struct with unique db tags. This is explicit-is-better-than-implicit — no magic prefix stripping or nested struct scanning for JOINs. (Session 21)
+
 ## Next Priorities
 
 <!-- What the last session thinks should come next, in order -->
 
-1. **Revisit `framework/db`** — JOINs (the biggest API gap for real-world usage), COALESCE/IFNULL expressions, window functions, raw RETURNING with db.Raw columns
+1. **Revisit `framework/db`** — window functions (ROW_NUMBER, RANK, DENSE_RANK), GROUP_CONCAT, raw RETURNING with db.Raw columns
 2. **Revisit `framework/http`** — SSE broker/hub pattern as a higher-level abstraction (manages multiple connections, fan-out from event source, stats), once event bus exists
 3. **Revisit `framework/app`** — consider: app lifecycle hooks for plugins (pre-boot, post-boot callbacks), health check endpoint integration (now that sqlite.Health exists)
 4. **Revisit `framework/log`** — further: log sampling handler for high-traffic paths, mmap-based query for very large files (deferred — current linear scan is acceptable for admin viewer with daily rotation)
