@@ -8,7 +8,7 @@
 
 ## Current State
 
-**Last session**: 2026-03-24 — Session 17 (framework/log revisited — buffered writer, query improvements)
+**Last session**: 2026-03-24 — Session 18 (framework/sqlite revisited — maintenance goroutine, Health())
 **Working tree**: clean
 **Branch**: with-experiment
 
@@ -23,7 +23,7 @@
 | `framework/http` | **Maturing** | Session 14 | Revisited: SSE support (NewEventStream, SSEWriter with Send/SendJSON/Heartbeat/Retry/Done, LastEventID, write deadline extension via ResponseController, ErrStreamingNotSupported sentinel). Previous (Session 10): Bind/BindForm MaxBytesError → 413. Previous: file upload handling, all sentinels |
 | `framework/http/middleware` | **Maturing** | Session 15 | Revisited: Timeout (context deadline per route), PBKDF2-SHA256 password hashing (HashPassword/CheckPassword, 600k iterations, PHC format, stdlib-only), APIToken middleware (opaque bearer tokens with DB lookup via TokenLookup callback), GenerateToken (32-byte random hex). Previous (Session 10): JWT (HMAC-SHA256 sign/verify, Claims, context helpers), Auth (Bearer token + user_id logging), RequireRole (role-based 403), MaxBytes (body size limiter). Plus existing: RequestID, RequestLogger, Recover, CORS, RateLimit |
 | `framework/db` | **Maturing** | Session 12 | Revisited: RETURNING clause (INSERT/UPDATE/DELETE), subqueries (IN, NOT IN, EXISTS, NOT EXISTS), CASE expressions (searched + simple). Previous (Session 5): deterministic column order, generalized pointer handling, SetNull, ModelSlice batch insert, NullBoolColumn/NullFloatColumn, cursor pagination (After + HasMore) |
-| `framework/sqlite` | **Growing** | Session 11 | Revisited: Stats (file/WAL size, page counts, pool stats), Checkpoint (WAL truncate), Optimize (PRAGMA optimize), IntegrityCheck (quick_check), Backup (VACUUM INTO). Configurable PRAGMAs via config (busy_timeout, cache_size, mmap_size, wal_autocheckpoint, journal_size_limit). PRAGMA mmap_size added (256MB default). Optimize-on-shutdown. Enhanced startup logging with PRAGMA values. |
+| `framework/sqlite` | **Maturing** | Session 18 | Revisited: background maintenance goroutine (periodic PRAGMA optimize + WAL auto-checkpoint when WAL exceeds threshold), Health(ctx) for readiness checks, 2 new config keys (db.optimize_interval, db.wal_checkpoint_threshold). Maintenance lifecycle managed by container hooks (OnStart/OnStop). Previous (Session 11): Stats, Checkpoint, Optimize, IntegrityCheck, Backup. Configurable PRAGMAs. |
 | `framework/sqlite/driver` | **Growing** | Session 11 | Fixed blob binding: replaced nil (SQLITE_STATIC) with C.CBytes+C.free — matching string binding pattern. Prevents potential GC-related unsoundness. |
 | `framework/sqlite/migrate` | **Growing** | Session 11 | Migration timing in Up/Down log messages. Added Pending(ctx) for dry-run/admin display. Improved error context: "statement 2/5: ..." with SQL dump. |
 
@@ -211,6 +211,17 @@ Session 17 (log revisit, log analytics app with 131k entries, 36MB log file):
 - [write scaling] Buffered writer batches ~100-300 entries per syscall (64KB buffer). Session 8 baseline was unbuffered.
 - [query scaling] Linear with file size: 15k entries → 76 req/s, 131k entries → 8 req/s (~12x, matches 12x data growth)
 
+Session 18 (sqlite revisit, bookmark manager with health + DB ops, 5500 rows):
+- [sqlite/GET health] 69,424 req/s, p99 2.6ms — dual pool PingContext (write + read)
+- [sqlite/GET stats] 57,075 req/s, p99 1.2ms — PRAGMA queries + file stats + pool stats
+- [sqlite/GET list] 20,613 req/s, p99 6.0ms — paginated list on 500 rows
+- [sqlite/POST create] 29,726 req/s, p99 — JSON bind + INSERT, concurrent with maintenance goroutine
+- [sqlite/GET integrity] 11,176 req/s, p99 — PRAGMA quick_check on 5500 rows
+- [memory] 39 MB RSS after 5500 writes + sustained load
+- [race] No data races detected with -race flag on concurrent health + stats + CRUD + maintenance
+- [maintenance] 18 optimize ticks during load test (3s interval), 2 auto-checkpoints triggered (50KB WAL threshold)
+- [shutdown] Maintenance goroutine stopped cleanly before DB close
+
 ## Design Decisions
 
 <!-- Key decisions and rationale so future sessions don't reverse them. Format:
@@ -329,17 +340,24 @@ Session 17 (log revisit, log analytics app with 131k entries, 36MB log file):
 - [log] CountOnly skips entry allocation (no append to slice) but still parses every JSON line — the bottleneck is JSON parse, not entry allocation. CountOnly saves memory, not CPU. Useful for admin dashboard badges ("42 errors today") without loading entry data. (Session 17)
 - [log] flushLoop goroutine stopped via close(done) channel in Close(). Select on done/ticker ensures clean exit. The goroutine is created in newDailyFileWriter and lives until Close(). Container shutdown hook calls Close(), so no leak in production. Tests must call Close() or Flush() before reading file contents. (Session 17)
 
+- [sqlite] maintenance.go is a single background goroutine handling both periodic optimize and WAL checkpoint. One goroutine, one ticker, one done channel. tick() has defer recover() to prevent panics from killing the maintenance loop. (Session 18)
+- [sqlite] Maintenance interval configurable via db.optimize_interval (default "1h", time.Duration). Set to "0" to disable. WAL checkpoint threshold via db.wal_checkpoint_threshold (default 100MB). Both registered as config defaults for discoverability. (Session 18)
+- [sqlite] WAL auto-checkpoint in maintenance is a backstop for the built-in wal_autocheckpoint PRAGMA. The PRAGMA runs PASSIVE checkpoints (opportunistic, don't reclaim disk space). Maintenance runs TRUNCATE checkpoints (reclaim disk space) only when WAL exceeds the size threshold. They complement each other. (Session 18)
+- [sqlite] Health(ctx) pings both pools with context — fast (~7μs), non-blocking. Suitable for liveness/readiness probes. Returns error describing which pool failed (write or read). Does NOT query the database — just verifies connectivity. (Session 18)
+- [sqlite] Maintenance lifecycle: created in Load(), started in container OnStart hook, stopped in OnStop hook (before final Optimize + Close). Same hook name "sqlite" — merged start and stop into one hook. Maintenance goroutine always stops before DB closes. (Session 18)
+- [sqlite] optimize_interval logged in startup Info message alongside other PRAGMA values. Maintenance start logged at Debug level (not cluttering normal operation). Periodic optimize at Debug, periodic checkpoint at Info (checkpoint is a notable event). (Session 18)
+
 ## Next Priorities
 
 <!-- What the last session thinks should come next, in order -->
 
-1. **Revisit `framework/sqlite`** — periodic auto-optimize, connection pool health endpoint, PRAGMA runtime reconfiguration. Still "Growing"
-2. **Revisit `framework/sqlite/driver`** — still "Growing", review blob/string binding, consider additional SQLite APIs
-3. **Revisit `framework/sqlite/migrate`** — still "Growing", consider migration rollback UI, admin-visible migration history
+1. **Revisit `framework/sqlite/driver`** — still "Growing", review blob/string binding, consider additional SQLite APIs (e.g., sqlite3_busy_handler, sqlite3_wal_hook for proactive monitoring)
+2. **Revisit `framework/sqlite/migrate`** — still "Growing", consider migration rollback UI, admin-visible migration history, dry-run mode
+3. **Revisit `framework/db`** — JOINs with RETURNING (currently untested), raw RETURNING with db.Raw columns, COALESCE/IFNULL expressions, window functions
 4. **Revisit `framework/http`** — SSE broker/hub pattern as a higher-level abstraction (manages multiple connections, fan-out from event source, stats), once event bus exists
-5. **Revisit `framework/db`** — JOINs with RETURNING (currently untested), raw RETURNING with db.Raw columns, COALESCE/IFNULL expressions, window functions
-6. **Revisit `framework/app`** — consider: app lifecycle hooks for plugins (pre-boot, post-boot callbacks), health check endpoint integration
-7. **Revisit `framework/log`** — further: log sampling handler for high-traffic paths, mmap-based query for very large files (deferred — current linear scan is acceptable for admin viewer with daily rotation)
+5. **Revisit `framework/app`** — consider: app lifecycle hooks for plugins (pre-boot, post-boot callbacks), health check endpoint integration (now that sqlite.Health exists)
+6. **Revisit `framework/log`** — further: log sampling handler for high-traffic paths, mmap-based query for very large files (deferred — current linear scan is acceptable for admin viewer with daily rotation)
+7. **Revisit `framework/sqlite`** — now "Maturing". Consider: PRAGMA runtime reconfiguration (cache_size, mmap_size changes without restart), table-level size stats for admin dashboard
 8. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
 
 ## In-Progress Work

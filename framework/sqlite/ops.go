@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -172,6 +173,19 @@ func (db *DB) Backup(destPath string) error {
 		// Clean up partial file on failure.
 		os.Remove(destPath)
 		return fmt.Errorf("sqlite backup: %w", err)
+	}
+	return nil
+}
+
+// Health pings both the read and write connection pools. Returns nil if the
+// database is reachable, or an error describing which pool failed. Suitable
+// for /health endpoints — fast and non-blocking.
+func (db *DB) Health(ctx context.Context) error {
+	if err := db.write.PingContext(ctx); err != nil {
+		return fmt.Errorf("sqlite health: write pool: %w", err)
+	}
+	if err := db.read.PingContext(ctx); err != nil {
+		return fmt.Errorf("sqlite health: read pool: %w", err)
 	}
 	return nil
 }

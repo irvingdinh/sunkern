@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"time"
 
 	_ "sunkern.local/framework/sqlite/driver"
 
@@ -61,6 +62,8 @@ func Load() {
 	config.SetDefault("db.mmap_size", 268435456)
 	config.SetDefault("db.wal_autocheckpoint", 1000)
 	config.SetDefault("db.journal_size_limit", 67108864)
+	config.SetDefault("db.optimize_interval", "1h")
+	config.SetDefault("db.wal_checkpoint_threshold", 104857600) // 100 MB
 
 	// Read tuning parameters from config.
 	busyTimeout := config.GetOr[int]("db.busy_timeout", 5000)
@@ -113,9 +116,32 @@ func Load() {
 	global.db = &DB{write: writeDB, read: readDB, path: dbPath}
 	global.mu.Unlock()
 
+	// Background maintenance: periodic PRAGMA optimize + WAL checkpoint
+	// when the WAL exceeds a configurable size threshold.
+	optimizeInterval := config.GetOr[time.Duration]("db.optimize_interval", time.Hour)
+	walCheckpointThreshold := int64(config.GetOr[int]("db.wal_checkpoint_threshold", 104857600))
+
+	var maint *maintenance
+	if optimizeInterval > 0 {
+		maint = newMaintenance(global.db, optimizeInterval, walCheckpointThreshold)
+	}
+
 	container.AppendHook(container.Hook{
 		Name: "sqlite",
+		OnStart: func(_ context.Context) error {
+			if maint != nil {
+				maint.start()
+				slog.Debug("sqlite: maintenance started",
+					"optimize_interval", maint.interval,
+					"wal_checkpoint_threshold", maint.walLimit,
+				)
+			}
+			return nil
+		},
 		OnStop: func(_ context.Context) error {
+			if maint != nil {
+				maint.stop()
+			}
 			// SQLite recommends running PRAGMA optimize before closing.
 			// This analyzes tables whose statistics are stale, improving
 			// query planner decisions for the next session.
@@ -132,6 +158,7 @@ func Load() {
 		"busy_timeout_ms", busyTimeout,
 		"cache_size", cacheSize,
 		"mmap_size", mmapSize,
+		"optimize_interval", optimizeInterval,
 	)
 }
 
