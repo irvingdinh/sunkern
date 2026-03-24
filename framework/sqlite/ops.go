@@ -42,6 +42,24 @@ type Stats struct {
 	// MemoryHighwater is the peak SQLite memory allocation in bytes since
 	// process start.
 	MemoryHighwater int64 `json:"memory_highwater"`
+	// CurrentPragmas holds the current values of all framework-managed
+	// PRAGMAs, keyed by PRAGMA name.
+	CurrentPragmas map[string]any `json:"pragmas"`
+}
+
+// TableStat holds per-table storage and row count information. Uses the
+// dbstat virtual table for page-level metrics and COUNT(*) for exact row
+// counts. Designed for the admin dashboard.
+type TableStat struct {
+	// Name is the table name.
+	Name string `json:"name"`
+	// RowCount is the exact number of rows (via COUNT(*)).
+	RowCount int64 `json:"row_count"`
+	// Pages is the number of database pages used by this table (data +
+	// overflow, excluding indexes).
+	Pages int64 `json:"pages"`
+	// Size is the total storage in bytes used by this table's pages.
+	Size int64 `json:"size"`
 }
 
 // PoolStats summarizes the state of a database/sql connection pool.
@@ -101,16 +119,19 @@ func (db *DB) Stats() (Stats, error) {
 		return s, fmt.Errorf("sqlite stats: count indexes: %w", err)
 	}
 
+	// Current PRAGMA values for admin introspection.
+	s.CurrentPragmas = db.Pragmas()
+
 	return s, nil
 }
 
 // CheckpointResult holds the outcome of a WAL checkpoint.
 type CheckpointResult struct {
 	// WALPages is the number of frames in the WAL before the checkpoint.
-	WALPages int
+	WALPages int `json:"wal_pages"`
 	// Checkpointed is the number of frames successfully moved to the main
 	// database file.
-	Checkpointed int
+	Checkpointed int `json:"checkpointed"`
 }
 
 // Checkpoint forces a WAL checkpoint using TRUNCATE mode — all WAL frames
@@ -198,6 +219,53 @@ func (db *DB) Health(ctx context.Context) error {
 		return fmt.Errorf("sqlite health: read pool: %w", err)
 	}
 	return nil
+}
+
+// TableStats returns per-table storage and row count information using the
+// dbstat virtual table. Excludes sqlite_ internal tables and _migrations.
+// Tables are returned sorted by size (largest first). Uses the read pool —
+// safe to call while the application is running.
+func (db *DB) TableStats() ([]TableStat, error) {
+	// Get per-table page usage from the dbstat virtual table. Join with
+	// sqlite_master to exclude index btrees — dbstat lists both table and
+	// index btrees under the name column.
+	rows, err := db.read.Query(`
+		SELECT d.name, COUNT(*) AS pages, SUM(d.pgsize) AS size
+		FROM dbstat d
+		INNER JOIN sqlite_master m ON m.name = d.name AND m.type = 'table'
+		WHERE d.name NOT LIKE 'sqlite_%' AND d.name != '_migrations'
+		GROUP BY d.name
+		ORDER BY size DESC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite table stats: %w", err)
+	}
+	defer rows.Close()
+
+	var stats []TableStat
+	for rows.Next() {
+		var ts TableStat
+		if err := rows.Scan(&ts.Name, &ts.Pages, &ts.Size); err != nil {
+			return nil, fmt.Errorf("sqlite table stats: scan: %w", err)
+		}
+		stats = append(stats, ts)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sqlite table stats: %w", err)
+	}
+
+	// Get exact row counts. Table names come from sqlite_master, so they
+	// are safe for interpolation. Double-quote for identifiers that may
+	// be reserved words.
+	for i := range stats {
+		if err := db.read.QueryRow(
+			fmt.Sprintf(`SELECT COUNT(*) FROM "%s"`, stats[i].Name),
+		).Scan(&stats[i].RowCount); err != nil {
+			return nil, fmt.Errorf("sqlite table stats: count %s: %w", stats[i].Name, err)
+		}
+	}
+
+	return stats, nil
 }
 
 // ---------------------------------------------------------------------------

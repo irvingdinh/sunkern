@@ -11,20 +11,25 @@ import (
 	"sync"
 	"time"
 
-	_ "sunkern.local/framework/sqlite/driver"
-
 	"sunkern.local/framework/config"
 	"sunkern.local/framework/container"
+	"sunkern.local/framework/sqlite/driver"
 )
 
 // DB holds the dual read/write connection pools to the SQLite database.
 // The write pool has MaxOpenConns=1 to serialize all writes and eliminate
 // SQLITE_BUSY errors. The read pool has MaxOpenConns matching GOMAXPROCS
 // for concurrent reads.
+//
+// Both pools use driver.Connector, which applies initialization PRAGMAs to
+// every new connection. This ensures all pooled connections have consistent
+// settings regardless of when they are created by database/sql.
 type DB struct {
-	write *sql.DB
-	read  *sql.DB
-	path  string
+	write     *sql.DB
+	read      *sql.DB
+	path      string
+	writeConn *driver.Connector
+	readConn  *driver.Connector
 }
 
 // WriteDB returns the write-only connection pool (MaxOpenConns=1).
@@ -72,10 +77,32 @@ func Load() {
 	walAutocheckpoint := config.GetOr[int]("db.wal_autocheckpoint", 1000)
 	journalSizeLimit := config.GetOr[int]("db.journal_size_limit", 67108864)
 
-	writeDB, err := sql.Open("sqlite3", "file:"+dbPath)
-	if err != nil {
-		panic(fmt.Sprintf("sqlite: open write pool: %v", err))
+	// Build connectors that apply PRAGMAs to every new connection.
+	// Shared PRAGMAs are applied to both pools; write-only PRAGMAs only
+	// to the write pool.
+	writeConn := driver.NewConnector("file:" + dbPath)
+	readConn := driver.NewConnector("file:" + dbPath + "?mode=ro")
+
+	// Shared PRAGMAs — applied to every connection in both pools.
+	shared := map[string]any{
+		"busy_timeout": busyTimeout,
+		"journal_mode": "WAL",
+		"synchronous":  "NORMAL",
+		"cache_size":   cacheSize,
+		"foreign_keys": "ON",
+		"temp_store":   "MEMORY",
+		"mmap_size":    mmapSize,
 	}
+	for k, v := range shared {
+		writeConn.SetPragma(k, v)
+		readConn.SetPragma(k, v)
+	}
+
+	// Write-only PRAGMAs.
+	writeConn.SetPragma("journal_size_limit", journalSizeLimit)
+	writeConn.SetPragma("wal_autocheckpoint", walAutocheckpoint)
+
+	writeDB := sql.OpenDB(writeConn)
 	writeDB.SetMaxOpenConns(1)
 	writeDB.SetMaxIdleConns(1)
 
@@ -83,37 +110,31 @@ func Load() {
 	if readConns < 4 {
 		readConns = 4
 	}
-	readDB, err := sql.Open("sqlite3", "file:"+dbPath+"?mode=ro")
-	if err != nil {
-		writeDB.Close()
-		panic(fmt.Sprintf("sqlite: open read pool: %v", err))
-	}
+	readDB := sql.OpenDB(readConn)
 	readDB.SetMaxOpenConns(readConns)
 	readDB.SetMaxIdleConns(readConns)
 
-	// Apply PRAGMAs with configured values.
-	pc := pragmaConfig{
-		busyTimeout:      busyTimeout,
-		cacheSize:        cacheSize,
-		mmapSize:         mmapSize,
-		walAutocheckpoint: walAutocheckpoint,
-		journalSizeLimit: journalSizeLimit,
-	}
-	if err := applyPragmas(writeDB, readDB, pc); err != nil {
-		writeDB.Close()
-		readDB.Close()
-		panic(fmt.Sprintf("sqlite: apply pragmas: %v", err))
-	}
-
-	// Verify connectivity.
+	// Verify connectivity (also forces the first connection through the
+	// connector, which applies PRAGMAs).
 	if err := writeDB.Ping(); err != nil {
 		writeDB.Close()
 		readDB.Close()
 		panic(fmt.Sprintf("sqlite: ping write pool: %v", err))
 	}
+	if err := readDB.Ping(); err != nil {
+		writeDB.Close()
+		readDB.Close()
+		panic(fmt.Sprintf("sqlite: ping read pool: %v", err))
+	}
 
 	global.mu.Lock()
-	global.db = &DB{write: writeDB, read: readDB, path: dbPath}
+	global.db = &DB{
+		write:     writeDB,
+		read:      readDB,
+		path:      dbPath,
+		writeConn: writeConn,
+		readConn:  readConn,
+	}
 	global.mu.Unlock()
 
 	// Background maintenance: periodic PRAGMA optimize + WAL checkpoint
@@ -190,51 +211,84 @@ func Reset() {
 	_ = Close()
 }
 
-// ---------------------------------------------------------------------------
-// Internal
-// ---------------------------------------------------------------------------
-
-// pragmaConfig holds tuning parameters read from config before applying.
-type pragmaConfig struct {
-	busyTimeout      int
-	cacheSize        int
-	mmapSize         int
-	walAutocheckpoint int
-	journalSizeLimit int
+// GetPragma reads the current value of a PRAGMA from the database. Uses the
+// read pool. The returned value is the native type from SQLite (int64 for
+// integers, string for text).
+func (db *DB) GetPragma(key string) (any, error) {
+	var val any
+	if err := db.read.QueryRow("PRAGMA " + key).Scan(&val); err != nil {
+		return nil, fmt.Errorf("sqlite: get pragma %s: %w", key, err)
+	}
+	return val, nil
 }
 
-func applyPragmas(write, read *sql.DB, pc pragmaConfig) error {
-	// PRAGMAs for both pools. journal_mode and synchronous are framework
-	// opinions — always WAL + NORMAL for standalone apps.
-	shared := []string{
-		fmt.Sprintf("PRAGMA busy_timeout = %d", pc.busyTimeout),
-		"PRAGMA journal_mode = WAL",
-		"PRAGMA synchronous = NORMAL",
-		fmt.Sprintf("PRAGMA cache_size = %d", pc.cacheSize),
-		"PRAGMA foreign_keys = ON",
-		"PRAGMA temp_store = MEMORY",
-		fmt.Sprintf("PRAGMA mmap_size = %d", pc.mmapSize),
+// SetPragma changes a PRAGMA at runtime on all connections in both pools.
+// It also updates both connectors so that future connections inherit the
+// change.
+//
+// Safe PRAGMAs for runtime changes: cache_size, mmap_size, busy_timeout.
+// Unsafe (do not change at runtime): journal_mode, synchronous, foreign_keys.
+func (db *DB) SetPragma(key string, value any) error {
+	pragma := fmt.Sprintf("PRAGMA %s = %v", key, value)
+
+	// Update connectors so new connections inherit the change.
+	db.writeConn.SetPragma(key, value)
+	db.readConn.SetPragma(key, value)
+
+	// Apply to write pool (1 connection — always hits it).
+	if _, err := db.write.Exec(pragma); err != nil {
+		return fmt.Errorf("sqlite: set pragma %s: write pool: %w", key, err)
 	}
 
-	// PRAGMAs only for the write pool.
-	writeOnly := []string{
-		fmt.Sprintf("PRAGMA journal_size_limit = %d", pc.journalSizeLimit),
-		fmt.Sprintf("PRAGMA wal_autocheckpoint = %d", pc.walAutocheckpoint),
-	}
+	// Apply to all read pool connections by grabbing each one.
+	// Connections that are currently in-use will get the updated PRAGMA
+	// the next time they are recycled (via the connector).
+	maxConns := db.read.Stats().MaxOpenConnections
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
 
-	for _, pool := range []*sql.DB{write, read} {
-		for _, pragma := range shared {
-			if _, err := pool.Exec(pragma); err != nil {
-				return fmt.Errorf("%s: %w", pragma, err)
-			}
+	conns := make([]*sql.Conn, 0, maxConns)
+	for range maxConns {
+		c, err := db.read.Conn(ctx)
+		if err != nil {
+			break
 		}
+		_, _ = c.ExecContext(ctx, pragma)
+		conns = append(conns, c)
 	}
-
-	for _, pragma := range writeOnly {
-		if _, err := write.Exec(pragma); err != nil {
-			return fmt.Errorf("%s: %w", pragma, err)
-		}
+	for _, c := range conns {
+		c.Close() // returns to pool
 	}
 
 	return nil
+}
+
+// Pragmas returns the current values of all framework-managed PRAGMAs.
+// Uses the read pool for per-connection PRAGMAs and the write pool for
+// write-only PRAGMAs. Designed for admin dashboard introspection.
+func (db *DB) Pragmas() map[string]any {
+	m := make(map[string]any, 10)
+
+	// Read-pool PRAGMAs (per-connection settings).
+	readKeys := []string{
+		"journal_mode", "synchronous", "cache_size", "mmap_size",
+		"busy_timeout", "foreign_keys", "temp_store",
+	}
+	for _, key := range readKeys {
+		var val any
+		if err := db.read.QueryRow("PRAGMA " + key).Scan(&val); err == nil {
+			m[key] = val
+		}
+	}
+
+	// Write-pool PRAGMAs (write-only settings).
+	writeKeys := []string{"wal_autocheckpoint", "journal_size_limit"}
+	for _, key := range writeKeys {
+		var val any
+		if err := db.write.QueryRow("PRAGMA " + key).Scan(&val); err == nil {
+			m[key] = val
+		}
+	}
+
+	return m
 }

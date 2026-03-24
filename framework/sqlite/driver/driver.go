@@ -32,6 +32,7 @@ package driver
 #cgo CFLAGS: -DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1
 #cgo CFLAGS: -DSQLITE_DEFAULT_FOREIGN_KEYS=1
 #cgo CFLAGS: -DSQLITE_ENABLE_UPDATE_DELETE_LIMIT
+#cgo CFLAGS: -DSQLITE_ENABLE_DBSTAT_VTAB
 #cgo linux LDFLAGS: -lm -ldl -lpthread
 #cgo darwin CFLAGS: -DHAVE_USLEEP=1
 
@@ -46,22 +47,25 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 )
 
 // Compile-time interface assertions.
 var (
-	_ driver.Conn           = (*conn)(nil)
-	_ driver.ExecerContext  = (*conn)(nil)
-	_ driver.QueryerContext = (*conn)(nil)
-	_ driver.Tx             = (*tx)(nil)
-	_ driver.Stmt           = (*stmt)(nil)
+	_ driver.Connector        = (*Connector)(nil)
+	_ driver.Conn             = (*conn)(nil)
+	_ driver.ExecerContext    = (*conn)(nil)
+	_ driver.QueryerContext   = (*conn)(nil)
+	_ driver.Tx               = (*tx)(nil)
+	_ driver.Stmt             = (*stmt)(nil)
 	_ driver.StmtExecContext  = (*stmt)(nil)
 	_ driver.StmtQueryContext = (*stmt)(nil)
-	_ driver.Rows           = (*rows)(nil)
-	_ driver.Result         = (*result)(nil)
+	_ driver.Rows             = (*rows)(nil)
+	_ driver.Result           = (*result)(nil)
 )
 
 // timeFormat is the canonical timestamp format for binding time.Time values.
@@ -128,6 +132,83 @@ func MemoryHighwater(reset bool) int64 {
 	}
 	return int64(C.sqlite3_memory_highwater(r))
 }
+
+// ---------------------------------------------------------------------------
+// Connector
+// ---------------------------------------------------------------------------
+
+// Connector implements driver.Connector for SQLite. It applies initialization
+// PRAGMAs to every new connection created by the pool, ensuring all pooled
+// connections have consistent settings (cache_size, mmap_size, foreign_keys,
+// etc.) regardless of when they are created.
+//
+// Use with sql.OpenDB:
+//
+//	c := driver.NewConnector("file:/path/to/db")
+//	c.SetPragma("cache_size", -16000)
+//	c.SetPragma("journal_mode", "WAL")
+//	db := sql.OpenDB(c)
+type Connector struct {
+	dsn     string
+	mu      sync.RWMutex
+	pragmas map[string]string // PRAGMA name → full statement
+	drv     *Driver
+}
+
+// NewConnector creates a Connector for the given DSN. PRAGMAs are applied to
+// every new connection via SetPragma before Connect returns it to the pool.
+func NewConnector(dsn string) *Connector {
+	return &Connector{
+		dsn:     dsn,
+		pragmas: make(map[string]string),
+		drv:     &Driver{},
+	}
+}
+
+// SetPragma registers a PRAGMA to be applied to every new connection. If the
+// PRAGMA was already set, it is replaced. Thread-safe — can be called while
+// the pool is active. Existing connections are NOT affected; use DB.SetPragma
+// in the sqlite package to update both the connector and existing connections.
+func (c *Connector) SetPragma(name string, value any) {
+	c.mu.Lock()
+	c.pragmas[name] = fmt.Sprintf("PRAGMA %s = %v", name, value)
+	c.mu.Unlock()
+}
+
+// Connect opens a new SQLite connection and applies all registered PRAGMAs.
+// Called by database/sql whenever the pool needs a new connection.
+func (c *Connector) Connect(_ context.Context) (driver.Conn, error) {
+	dc, err := c.drv.Open(c.dsn)
+	if err != nil {
+		return nil, err
+	}
+
+	cn := dc.(*conn)
+
+	// Apply init PRAGMAs in sorted order for deterministic execution.
+	c.mu.RLock()
+	keys := make([]string, 0, len(c.pragmas))
+	for k := range c.pragmas {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	stmts := make([]string, len(keys))
+	for i, k := range keys {
+		stmts[i] = c.pragmas[k]
+	}
+	c.mu.RUnlock()
+
+	for _, p := range stmts {
+		if err := cn.exec(p); err != nil {
+			cn.Close()
+			return nil, fmt.Errorf("sqlite3: init pragma: %w", err)
+		}
+	}
+	return cn, nil
+}
+
+// Driver returns the underlying Driver.
+func (c *Connector) Driver() driver.Driver { return c.drv }
 
 // ---------------------------------------------------------------------------
 // conn
