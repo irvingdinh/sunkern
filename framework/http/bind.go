@@ -2,6 +2,7 @@ package http
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	httpstd "net/http"
 	"reflect"
@@ -18,6 +19,9 @@ func Bind(r *httpstd.Request, dst any) error {
 	}
 	dec := json.NewDecoder(r.Body)
 	if err := dec.Decode(dst); err != nil {
+		if isMaxBytesError(err) {
+			return ErrPayloadTooLarge
+		}
 		return ErrBadRequest.WithMessage("Invalid request body: " + err.Error())
 	}
 	return Validate(dst)
@@ -55,6 +59,13 @@ func BindQuery(r *httpstd.Request, dst any) error {
 		}
 	}
 	return Validate(dst)
+}
+
+// isMaxBytesError reports whether err (or any wrapped error) is caused
+// by http.MaxBytesReader exceeding its limit.
+func isMaxBytesError(err error) bool {
+	var mbe *httpstd.MaxBytesError
+	return errors.As(err, &mbe)
 }
 
 func setFieldFromString(fv reflect.Value, s string) error {

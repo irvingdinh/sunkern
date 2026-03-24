@@ -225,6 +225,9 @@ func parseMultipart(r *httpstd.Request) error {
 		return nil
 	}
 	if err := r.ParseMultipartForm(DefaultMaxMemory); err != nil {
+		if isMaxBytesError(err) {
+			return ErrPayloadTooLarge
+		}
 		return ErrBadRequest.WithMessage("Invalid multipart form data")
 	}
 	return nil

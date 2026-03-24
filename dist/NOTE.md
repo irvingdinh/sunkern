@@ -8,7 +8,7 @@
 
 ## Current State
 
-**Last session**: 2026-03-24 — Session 9 (framework/http file upload handling)
+**Last session**: 2026-03-24 — Session 10 (framework/http/middleware auth + JWT + MaxBytes)
 **Working tree**: clean
 **Branch**: with-experiment
 
@@ -20,8 +20,8 @@
 | `framework/container` | **Growing** | Session 4 | Override/OverrideSupply, named hooks, all framework hooks named |
 | `framework/config` | **Growing** | Session 7 | Added Has, All, Keys, Sub, DataDir, EnvName, SetDefaults; Load creates data dir; improved panic messages |
 | `framework/log` | **Growing** | Session 8 | Separate console/file levels (ConsoleLevel, FileLevel types), log file management (ListFiles, CleanOldFiles, OpenFile), JSONL entry parsing + querying (Entry, Query with level/search/user_id/request_id filter + pagination) |
-| `framework/http` | **Maturing** | Session 9 | Revisited: file upload handling (FormFile, FormFiles, BindForm with `form` tag, SaveFile, ValidateFile, DetectFileType), ErrPayloadTooLarge/ErrUnsupportedMediaType sentinels, resolveFieldName includes `form` tag |
-| `framework/http/middleware` | **Growing** | Session 3 | RequestID, RequestLogger, Recover (panic recovery), CORS (functional options), RateLimit (token bucket) |
+| `framework/http` | **Maturing** | Session 10 | Revisited: Bind/BindForm now detect http.MaxBytesError and return 413 instead of 400. Previous: file upload handling (FormFile, FormFiles, BindForm, SaveFile, ValidateFile, DetectFileType), all sentinels |
+| `framework/http/middleware` | **Maturing** | Session 10 | Revisited: JWT (HMAC-SHA256 sign/verify, Claims, context helpers), Auth (Bearer token extraction + verification + user_id logging), RequireRole (role-based 403), MaxBytes (body size limiter). Plus existing: RequestID, RequestLogger, Recover, CORS, RateLimit |
 | `framework/db` | **Maturing** | Session 5 | Revisited: deterministic column order, generalized pointer handling, SetNull, ModelSlice batch insert, NullBoolColumn/NullFloatColumn, cursor pagination (After + HasMore) |
 | `framework/sqlite` | Initial | Session 7 | Dual pool works; removed redundant data dir creation (config.Load handles it now); uses config.DataDir() |
 | `framework/sqlite/driver` | Initial | — | CGo binding works |
@@ -41,7 +41,7 @@
 - [skill] Skill docs (sunkern-go-best-practices) show old `server.Mux().HandleFunc(...)` pattern — permission denied when trying to update. Blocked in Sessions 1-5. Need Irving to grant .claude/skills/ write permission. (2026-03-24)
 - [db] Insert().Model() auto-fill only works for BaseModel fields (id, created_at, updated_at). Custom fields with zero-value defaults still need manual handling. Acceptable trade-off. (Session 2)
 - [http] Go's multipart.Writer.CreateFormFile always sets Content-Type to application/octet-stream. Real clients (curl, browsers) set it from filename. Framework documents this — prefer DetectFileType for user-facing uploads. (Session 9)
-- [http] ParseMultipartForm reads the entire request body before ValidateFile can reject oversized files. Consider adding MaxBytesReader middleware for early rejection in a future session. (Session 9)
+- ~~[http] ParseMultipartForm reads the entire request body before ValidateFile can reject oversized files~~ — RESOLVED in Session 10 (MaxBytes middleware + Bind/BindForm detect MaxBytesError → 413)
 
 ## Performance Baselines
 
@@ -128,6 +128,17 @@ Session 9 (http upload, file locker app with BindForm + SaveFile + ValidateFile,
 - [memory] 787 MB RSS peak after 2000 × 11 MiB rejection test (Go hadn't returned memory to OS yet; normal upload load used ~50 MB)
 - [race] No data races detected with -race flag on concurrent upload + read
 
+Session 10 (middleware auth, notes app with JWT auth + role-based access, 11k notes):
+- [auth/POST login] 47,940 req/s, p99 2.9ms — JWT SignToken (HMAC-SHA256)
+- [auth/GET list] 5,215 req/s, p99 24.7ms — JWT verify + paginated list on 11k rows
+- [auth/POST create] 28,875 req/s, p99 7.5ms — JWT verify + JSON bind + INSERT
+- [auth/401 reject] 65,934 req/s, p99 2.5ms — Auth middleware short-circuit (no token)
+- [auth/403 reject] 57,258 req/s, p99 2.6ms — JWT verify + RequireRole short-circuit
+- [auth/GET admin] 3,628 req/s, p99 41.6ms — JWT verify + role check + COUNT on 11k rows
+- [memory] 56 MB RSS after 50k+ writes and 60k+ load test requests
+- [race] No data races detected with -race flag on all framework tests
+- [jwt overhead] ~0.5ms per verify (compare login 48k to 401 reject 66k — crypto is cheap)
+
 ## Design Decisions
 
 <!-- Key decisions and rationale so future sessions don't reverse them. Format:
@@ -179,12 +190,21 @@ Session 9 (http upload, file locker app with BindForm + SaveFile + ValidateFile,
 - [http] DefaultMaxMemory = 32 MiB — consistent with Go stdlib default. Files under this stay in memory, larger ones spill to temp files on disk. (Session 9)
 - [http] Field name resolution updated: json > query > form > lowercased Go name. Ensures validation errors use the correct binding-context name. (Session 9)
 
+- [middleware] JWT lives in middleware package (not http or a new package) — middleware can't import parent http (circular dep), and JWT is primarily consumed by middleware + service handlers. SignToken/VerifyToken/ClaimsFromCtx all in one package. No new top-level packages per GUIDELINE. (Session 10)
+- [middleware] JWT uses HMAC-SHA256 only — simplest algorithm, sufficient for standalone apps. Pre-computed base64url header constant avoids per-sign allocation. (Session 10)
+- [middleware] Claims struct uses time.Time (ergonomic) but marshals as Unix timestamps (JWT standard). Extra map[string]any for custom claims — reserved keys (sub, role, exp, iat) cannot be overridden via Extra. (Session 10)
+- [middleware] Auth middleware extracts Bearer token from Authorization header, verifies JWT, stores Claims in context (ClaimsFromCtx), and sets user_id for structured logging (sunkernlog.WithUserID). Two responsibilities in one middleware — justified because user_id in logs is always wanted when auth is present. (Session 10)
+- [middleware] RequireRole uses map[string]struct{} for O(1) role lookup, pre-built at init time. Returns 401 if no claims (auth middleware not present), 403 if role doesn't match. (Session 10)
+- [middleware] MaxBytes wraps r.Body with http.MaxBytesReader. The actual error surfaces when Bind/BindForm reads the body — they detect *http.MaxBytesError via errors.As and return ErrPayloadTooLarge (413) instead of ErrBadRequest (400). This addresses Session 9 friction about late rejection of oversized uploads. (Session 10)
+- [middleware] Auth/RequireRole error responses use inline JSON (same pattern as recover.go, ratelimit.go) to avoid circular import with parent http package. Error codes match the sentinel names: "unauthorized", "forbidden". (Session 10)
+- [middleware] Exported JWT error types (ErrTokenMalformed, ErrTokenExpired, ErrTokenInvalid, ErrSecretEmpty) allow service-layer code to distinguish failure modes — e.g., showing "Token expired" vs generic "Invalid token". (Session 10)
+
 ## Next Priorities
 
 <!-- What the last session thinks should come next, in order -->
 
 1. **Revisit `framework/http`** — SSE support for real-time events (event bus → SSE endpoint pattern from IDEA.md Section 9)
-2. **Revisit `framework/http/middleware`** — auth middleware (JWT validation, role-based), request timeout middleware, MaxBytesReader body size limiter
+2. **Revisit `framework/http/middleware`** — request timeout middleware (context deadline for slow handlers), password hashing (bcrypt via stdlib crypto), API token middleware (separate from JWT — long-lived, revocable)
 3. **`framework/db` advanced** — RETURNING clause (eliminate update-then-fetch pattern), subqueries in WHERE, CASE expressions
 4. **Revisit `framework/app` / `framework/container`** — now Growing, revisit after other packages evolve
 5. **Revisit `framework/config`** — consider config validation (type constraints, allowed values)
