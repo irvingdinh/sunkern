@@ -40,6 +40,7 @@ func NewServer() (Server, error) {
 	})
 
 	var handler httpstd.Handler = mux
+	handler = middleware.Recover(handler)
 	handler = middleware.RequestLogger(handler)
 	handler = middleware.RequestID(handler)
 
@@ -70,11 +71,15 @@ func NewServer() (Server, error) {
 		},
 	})
 
-	return &serverImpl{mux: mux}, nil
+	return &serverImpl{
+		mux:  mux,
+		opts: &optionsRegistry{registered: make(map[string]struct{})},
+	}, nil
 }
 
 type serverImpl struct {
-	mux *httpstd.ServeMux
+	mux  *httpstd.ServeMux
+	opts *optionsRegistry
 }
 
 func (s *serverImpl) Mux() *httpstd.ServeMux { return s.mux }
@@ -83,5 +88,6 @@ func (s *serverImpl) Group(prefix string) *RouteGroup {
 	return &RouteGroup{
 		prefix: prefix,
 		mux:    s.mux,
+		opts:   s.opts,
 	}
 }
