@@ -92,14 +92,48 @@ func TestLoadWithCustomLevel(t *testing.T) {
 	Load()
 	defer Close()
 
-	// Console level should be ERROR. File always captures everything.
-	// We verify the LevelVar in the container reflects the config.
-	lv, err := container.Make[*slog.LevelVar]()
+	// File level should be ERROR.
+	fl, err := container.Make[*FileLevel]()
 	if err != nil {
-		t.Fatalf("resolve LevelVar: %v", err)
+		t.Fatalf("resolve FileLevel: %v", err)
 	}
-	if lv.Level() != slog.LevelError {
-		t.Errorf("console level = %v, want ERROR", lv.Level())
+	if fl.Level() != slog.LevelError {
+		t.Errorf("file level = %v, want ERROR", fl.Level())
+	}
+
+	// Console defaults to same as file when not set explicitly.
+	cl, err := container.Make[*ConsoleLevel]()
+	if err != nil {
+		t.Fatalf("resolve ConsoleLevel: %v", err)
+	}
+	if cl.Level() != slog.LevelError {
+		t.Errorf("console level = %v, want ERROR (inherited from log.level)", cl.Level())
+	}
+}
+
+func TestLoadSeparateConsoleLevelOverride(t *testing.T) {
+	setup(t)
+	t.Setenv("LOG_LEVEL", "DEBUG")
+	t.Setenv("LOG_CONSOLE_LEVEL", "WARN")
+	config.Load()
+
+	Load()
+	defer Close()
+
+	fl, err := container.Make[*FileLevel]()
+	if err != nil {
+		t.Fatalf("resolve FileLevel: %v", err)
+	}
+	if fl.Level() != slog.LevelDebug {
+		t.Errorf("file level = %v, want DEBUG", fl.Level())
+	}
+
+	cl, err := container.Make[*ConsoleLevel]()
+	if err != nil {
+		t.Fatalf("resolve ConsoleLevel: %v", err)
+	}
+	if cl.Level() != slog.LevelWarn {
+		t.Errorf("console level = %v, want WARN", cl.Level())
 	}
 }
 
@@ -109,20 +143,20 @@ func TestLevelVarInContainer(t *testing.T) {
 	Load()
 	defer Close()
 
-	lv, err := container.Make[*slog.LevelVar]()
+	cl, err := container.Make[*ConsoleLevel]()
 	if err != nil {
-		t.Fatalf("resolve LevelVar: %v", err)
+		t.Fatalf("resolve ConsoleLevel: %v", err)
 	}
 
 	// Default is INFO.
-	if lv.Level() != slog.LevelInfo {
-		t.Errorf("initial level = %v, want INFO", lv.Level())
+	if cl.Level() != slog.LevelInfo {
+		t.Errorf("initial level = %v, want INFO", cl.Level())
 	}
 
 	// Dynamic change.
-	lv.Set(slog.LevelError)
-	if lv.Level() != slog.LevelError {
-		t.Errorf("changed level = %v, want ERROR", lv.Level())
+	cl.Set(slog.LevelError)
+	if cl.Level() != slog.LevelError {
+		t.Errorf("changed level = %v, want ERROR", cl.Level())
 	}
 }
 
@@ -134,6 +168,19 @@ func TestLoadPanicsOnInvalidLogLevel(t *testing.T) {
 	defer func() {
 		if recover() == nil {
 			t.Fatal("expected panic for invalid LOG_LEVEL")
+		}
+	}()
+	Load()
+}
+
+func TestLoadPanicsOnInvalidConsoleLevel(t *testing.T) {
+	setup(t)
+	t.Setenv("LOG_CONSOLE_LEVEL", "not-a-level")
+	config.Load()
+
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic for invalid LOG_CONSOLE_LEVEL")
 		}
 	}()
 	Load()
@@ -379,10 +426,6 @@ func TestResetDiscardsOutput(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// parseLevel
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // prettyWriter
 // ---------------------------------------------------------------------------
 
@@ -475,5 +518,330 @@ func TestParseLevelVariants(t *testing.T) {
 				t.Errorf("got %v, want %v", lv.Level(), tc.want)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ListFiles / CleanOldFiles / OpenFile
+// ---------------------------------------------------------------------------
+
+func TestListFilesEmpty(t *testing.T) {
+	setup(t)
+	Load()
+	defer Close()
+
+	// No logs written yet, but the directory exists. ListFiles should return
+	// only the file created by Load (today's file was opened lazily, so it
+	// may not exist until something is logged).
+	files, err := ListFiles()
+	if err != nil {
+		t.Fatalf("ListFiles: %v", err)
+	}
+	// Might be 0 or 1 depending on whether Load triggered a write.
+	_ = files
+}
+
+func TestListFilesSorted(t *testing.T) {
+	setup(t)
+
+	logsDir := filepath.Join(config.DataDir(), "logs")
+	os.MkdirAll(logsDir, 0o755)
+
+	// Create files out of order.
+	for _, date := range []string{"2025_03_10", "2025_03_15", "2025_03_12"} {
+		os.WriteFile(filepath.Join(logsDir, date+".log"), []byte("data\n"), 0o644)
+	}
+
+	files, err := ListFiles()
+	if err != nil {
+		t.Fatalf("ListFiles: %v", err)
+	}
+	if len(files) != 3 {
+		t.Fatalf("expected 3 files, got %d", len(files))
+	}
+
+	// Newest first.
+	if files[0].Date != "2025_03_15" || files[1].Date != "2025_03_12" || files[2].Date != "2025_03_10" {
+		t.Errorf("wrong order: %v, %v, %v", files[0].Date, files[1].Date, files[2].Date)
+	}
+
+	// Size should be > 0.
+	for _, f := range files {
+		if f.Size == 0 {
+			t.Errorf("file %s has zero size", f.Date)
+		}
+	}
+}
+
+func TestListFilesIgnoresNonLogFiles(t *testing.T) {
+	setup(t)
+
+	logsDir := filepath.Join(config.DataDir(), "logs")
+	os.MkdirAll(logsDir, 0o755)
+
+	os.WriteFile(filepath.Join(logsDir, "2025_03_10.log"), []byte("data\n"), 0o644)
+	os.WriteFile(filepath.Join(logsDir, "readme.txt"), []byte("not a log\n"), 0o644)
+	os.Mkdir(filepath.Join(logsDir, "subdir"), 0o755)
+
+	files, err := ListFiles()
+	if err != nil {
+		t.Fatalf("ListFiles: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("expected 1 file, got %d", len(files))
+	}
+}
+
+func TestCleanOldFiles(t *testing.T) {
+	setup(t)
+
+	logsDir := filepath.Join(config.DataDir(), "logs")
+	os.MkdirAll(logsDir, 0o755)
+
+	today := time.Now().Format("2006_01_02")
+	old := time.Now().AddDate(0, 0, -10).Format("2006_01_02")
+	borderline := time.Now().AddDate(0, 0, -7).Format("2006_01_02")
+
+	for _, date := range []string{today, old, borderline} {
+		os.WriteFile(filepath.Join(logsDir, date+".log"), []byte("data\n"), 0o644)
+	}
+
+	removed, err := CleanOldFiles(7)
+	if err != nil {
+		t.Fatalf("CleanOldFiles: %v", err)
+	}
+
+	// old (10 days ago) should be removed. borderline (exactly 7 days) has
+	// date == cutoff, and since the comparison is strictly less-than, it
+	// survives. today stays.
+	if removed != 1 {
+		t.Errorf("expected 1 removed, got %d", removed)
+	}
+
+	files, _ := ListFiles()
+	if len(files) != 2 {
+		t.Fatalf("expected 2 remaining files, got %d", len(files))
+	}
+}
+
+func TestCleanOldFilesInvalidRetention(t *testing.T) {
+	setup(t)
+
+	_, err := CleanOldFiles(0)
+	if err == nil {
+		t.Fatal("expected error for retentionDays=0")
+	}
+}
+
+func TestOpenFile(t *testing.T) {
+	setup(t)
+
+	logsDir := filepath.Join(config.DataDir(), "logs")
+	os.MkdirAll(logsDir, 0o755)
+	os.WriteFile(filepath.Join(logsDir, "2025_03_15.log"), []byte("hello world\n"), 0o644)
+
+	rc, err := OpenFile("2025_03_15")
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	defer rc.Close()
+
+	buf := make([]byte, 64)
+	n, _ := rc.Read(buf)
+	if string(buf[:n]) != "hello world\n" {
+		t.Errorf("unexpected content: %q", string(buf[:n]))
+	}
+}
+
+func TestOpenFileNotFound(t *testing.T) {
+	setup(t)
+
+	_, err := OpenFile("1999_01_01")
+	if err == nil {
+		t.Fatal("expected error for non-existent file")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Entry parsing
+// ---------------------------------------------------------------------------
+
+func TestParseEntry(t *testing.T) {
+	line := []byte(`{"time":"2025-03-15T10:30:00Z","level":"INFO","msg":"request handled","source":{"function":"main.handler","file":"main.go","line":42},"request_id":"req-123","user_id":"user-7","latency_ms":15,"status":200}`)
+
+	entry, err := parseEntry(line)
+	if err != nil {
+		t.Fatalf("parseEntry: %v", err)
+	}
+
+	if entry.Level != "INFO" {
+		t.Errorf("level = %q, want INFO", entry.Level)
+	}
+	if entry.Message != "request handled" {
+		t.Errorf("message = %q, want 'request handled'", entry.Message)
+	}
+	if entry.RequestID != "req-123" {
+		t.Errorf("request_id = %q, want req-123", entry.RequestID)
+	}
+	if entry.UserID != "user-7" {
+		t.Errorf("user_id = %q, want user-7", entry.UserID)
+	}
+	if entry.Source == nil {
+		t.Fatal("source is nil")
+	}
+	if entry.Source.Function != "main.handler" {
+		t.Errorf("source.function = %q", entry.Source.Function)
+	}
+	if entry.Source.Line != 42 {
+		t.Errorf("source.line = %d, want 42", entry.Source.Line)
+	}
+
+	// Extra fields.
+	if entry.Extra == nil {
+		t.Fatal("extra is nil")
+	}
+	if v, ok := entry.Extra["status"].(float64); !ok || v != 200 {
+		t.Errorf("extra[status] = %v", entry.Extra["status"])
+	}
+	if v, ok := entry.Extra["latency_ms"].(float64); !ok || v != 15 {
+		t.Errorf("extra[latency_ms] = %v", entry.Extra["latency_ms"])
+	}
+}
+
+func TestParseEntryMalformed(t *testing.T) {
+	_, err := parseEntry([]byte("not json"))
+	if err == nil {
+		t.Fatal("expected error for malformed JSON")
+	}
+}
+
+func TestEntryMarshalJSON(t *testing.T) {
+	e := Entry{
+		Time:      time.Date(2025, 3, 15, 10, 0, 0, 0, time.UTC),
+		Level:     "INFO",
+		Message:   "test",
+		RequestID: "req-1",
+		Extra:     map[string]any{"custom": "value"},
+	}
+
+	b, err := e.MarshalJSON()
+	if err != nil {
+		t.Fatalf("MarshalJSON: %v", err)
+	}
+
+	var m map[string]any
+	json.Unmarshal(b, &m)
+
+	if m["level"] != "INFO" {
+		t.Errorf("level = %v", m["level"])
+	}
+	if m["msg"] != "test" {
+		t.Errorf("msg = %v", m["msg"])
+	}
+	if m["request_id"] != "req-1" {
+		t.Errorf("request_id = %v", m["request_id"])
+	}
+	if m["custom"] != "value" {
+		t.Errorf("custom = %v", m["custom"])
+	}
+	// source should be absent.
+	if _, ok := m["source"]; ok {
+		t.Error("source should be omitted when nil")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Query
+// ---------------------------------------------------------------------------
+
+func TestQuery(t *testing.T) {
+	setup(t)
+
+	logsDir := filepath.Join(config.DataDir(), "logs")
+	os.MkdirAll(logsDir, 0o755)
+
+	// Write synthetic JSONL entries.
+	var lines []string
+	for i := 0; i < 50; i++ {
+		level := "INFO"
+		if i%5 == 0 {
+			level = "ERROR"
+		}
+		line := fmt.Sprintf(`{"time":"2025-03-15T10:%02d:00Z","level":"%s","msg":"event %d","request_id":"req-%d"}`, i, level, i, i%10)
+		lines = append(lines, line)
+	}
+	os.WriteFile(filepath.Join(logsDir, "2025_03_15.log"), []byte(strings.Join(lines, "\n")+"\n"), 0o644)
+
+	// All entries.
+	entries, total, err := Query("2025_03_15", QueryOptions{})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if total != 50 {
+		t.Errorf("total = %d, want 50", total)
+	}
+	if len(entries) != 50 {
+		t.Errorf("entries = %d, want 50", len(entries))
+	}
+
+	// Level filter.
+	entries, total, _ = Query("2025_03_15", QueryOptions{Level: "ERROR"})
+	if total != 10 {
+		t.Errorf("ERROR total = %d, want 10", total)
+	}
+	if len(entries) != 10 {
+		t.Errorf("ERROR entries = %d, want 10", len(entries))
+	}
+
+	// Search.
+	entries, total, _ = Query("2025_03_15", QueryOptions{Search: "event 42"})
+	if total != 1 {
+		t.Errorf("search total = %d, want 1", total)
+	}
+
+	// RequestID filter.
+	entries, total, _ = Query("2025_03_15", QueryOptions{RequestID: "req-0"})
+	if total != 5 {
+		t.Errorf("request_id total = %d, want 5", total)
+	}
+
+	// Pagination.
+	entries, total, _ = Query("2025_03_15", QueryOptions{Limit: 5, Offset: 10})
+	if total != 50 {
+		t.Errorf("paginated total = %d, want 50", total)
+	}
+	if len(entries) != 5 {
+		t.Errorf("paginated entries = %d, want 5", len(entries))
+	}
+	if entries[0].Message != "event 10" {
+		t.Errorf("first entry = %q, want 'event 10'", entries[0].Message)
+	}
+}
+
+func TestQueryNonExistentDate(t *testing.T) {
+	setup(t)
+
+	_, _, err := Query("1999_01_01", QueryOptions{})
+	if err == nil {
+		t.Fatal("expected error for non-existent date")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// levelRank
+// ---------------------------------------------------------------------------
+
+func TestLevelRank(t *testing.T) {
+	if levelRank("DEBUG") >= levelRank("INFO") {
+		t.Error("DEBUG should rank below INFO")
+	}
+	if levelRank("INFO") >= levelRank("WARN") {
+		t.Error("INFO should rank below WARN")
+	}
+	if levelRank("WARN") >= levelRank("ERROR") {
+		t.Error("WARN should rank below ERROR")
+	}
+	if levelRank("unknown") >= levelRank("DEBUG") {
+		t.Error("unknown should rank below DEBUG")
 	}
 }

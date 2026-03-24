@@ -14,6 +14,16 @@ import (
 	"sunkern.local/framework/container"
 )
 
+// ConsoleLevel wraps [slog.LevelVar] for the console (stdout) output sink.
+// Resolve it from the container to inspect or change the console log level at
+// runtime without restarting the application.
+type ConsoleLevel struct{ slog.LevelVar }
+
+// FileLevel wraps [slog.LevelVar] for the file (JSONL) output sink. Resolve
+// it from the container to inspect or change the file log level at runtime
+// without restarting the application.
+type FileLevel struct{ slog.LevelVar }
+
 type state struct {
 	mu     sync.Mutex
 	writer *dailyFileWriter
@@ -22,21 +32,38 @@ type state struct {
 var global state
 
 // Load creates the dual-output structured logger and sets it as the slog
-// default, after [config.Load] has run. It reads "log.level" from config for
-// the handler level (default "INFO"). Both console and file produce JSON with
-// identical structure; console output is pretty-printed (2-space indent) for
-// readability, file output is compact JSONL for machine consumption. On
-// failure it panics (same spirit as config.Load). Call Close to flush and
-// close the file writer during shutdown.
+// default. It must be called after [config.Load].
+//
+// Two independent log levels control output verbosity:
+//
+//   - "log.level" (env LOG_LEVEL) — minimum level for the file sink
+//     (default "INFO"). File output is compact JSONL for machine consumption.
+//   - "log.console.level" (env LOG_CONSOLE_LEVEL) — minimum level for the
+//     console sink. Defaults to the value of "log.level" when not set
+//     explicitly. Console output is pretty-printed JSON for readability.
+//
+// Both sinks include source location and produce identical JSON structure;
+// only formatting and level filtering differ. On invalid config the function
+// panics (same spirit as [config.Load]).
+//
+// The two levels are supplied to the container as [*ConsoleLevel] and
+// [*FileLevel] for runtime adjustment. A shutdown hook is registered to
+// flush and close the file writer during graceful shutdown.
 func Load() {
-	levelStr := config.GetOr[string]("log.level", "INFO")
-	var consoleLevel slog.LevelVar
-	if err := parseLevel(&consoleLevel, levelStr); err != nil {
+	fileLevelStr := config.GetOr[string]("log.level", "INFO")
+	var fileLevel FileLevel
+	if err := parseLevel(&fileLevel.LevelVar, fileLevelStr); err != nil {
+		panic(fmt.Sprintf("log: %v", err))
+	}
+
+	consoleLevelStr := config.GetOr[string]("log.console.level", fileLevelStr)
+	var consoleLevel ConsoleLevel
+	if err := parseLevel(&consoleLevel.LevelVar, consoleLevelStr); err != nil {
 		panic(fmt.Sprintf("log: %v", err))
 	}
 
 	consoleHandler := slog.NewJSONHandler(&prettyWriter{out: os.Stdout}, &slog.HandlerOptions{
-		Level:     &consoleLevel,
+		Level:     &consoleLevel.LevelVar,
 		AddSource: true,
 	})
 
@@ -50,7 +77,7 @@ func Load() {
 	global.mu.Unlock()
 
 	fileHandler := slog.NewJSONHandler(global.writer, &slog.HandlerOptions{
-		Level:     &consoleLevel,
+		Level:     &fileLevel.LevelVar,
 		AddSource: true,
 	})
 
@@ -58,7 +85,8 @@ func Load() {
 	root := newContextHandler(merged)
 	slog.SetDefault(slog.New(root))
 
-	container.Supply[*slog.LevelVar](&consoleLevel)
+	container.Supply[*ConsoleLevel](&consoleLevel)
+	container.Supply[*FileLevel](&fileLevel)
 
 	container.AppendHook(container.Hook{
 		Name: "log",

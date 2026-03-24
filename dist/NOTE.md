@@ -8,7 +8,7 @@
 
 ## Current State
 
-**Last session**: 2026-03-24 — Session 7 (framework/config maturation)
+**Last session**: 2026-03-24 — Session 8 (framework/log maturation)
 **Working tree**: clean
 **Branch**: with-experiment
 
@@ -19,7 +19,7 @@
 | `framework/app` | **Growing** | Session 4 | ModuleGroup boot rollback fix, lifecycle logging, module name tracking |
 | `framework/container` | **Growing** | Session 4 | Override/OverrideSupply, named hooks, all framework hooks named |
 | `framework/config` | **Growing** | Session 7 | Added Has, All, Keys, Sub, DataDir, EnvName, SetDefaults; Load creates data dir; improved panic messages |
-| `framework/log` | Initial | — | Dual output works; now uses config.DataDir() |
+| `framework/log` | **Growing** | Session 8 | Separate console/file levels (ConsoleLevel, FileLevel types), log file management (ListFiles, CleanOldFiles, OpenFile), JSONL entry parsing + querying (Entry, Query with level/search/user_id/request_id filter + pagination) |
 | `framework/http` | **Maturing** | Session 6 | Revisited: struct-tag validation (required, min/max, email, url, oneof), Validator interface, FieldError details in APIError, auto-validates in Bind/BindQuery |
 | `framework/http/middleware` | **Growing** | Session 3 | RequestID, RequestLogger, Recover (panic recovery), CORS (functional options), RateLimit (token bucket) |
 | `framework/db` | **Maturing** | Session 5 | Revisited: deterministic column order, generalized pointer handling, SetNull, ModelSlice batch insert, NullBoolColumn/NullFloatColumn, cursor pagination (After + HasMore) |
@@ -104,6 +104,19 @@ Session 7 (config, feature-flag app with config introspection, 100 DB rows):
 - [memory] 30 MB RSS after 160k+ requests
 - [race] No data races detected with -race flag on concurrent config access
 
+Session 8 (log, event generator with log viewer, 11k log entries):
+- [log/POST create] 27,595 req/s, p99 8.3ms — event INSERT + slog.InfoContext with request_id
+- [log/POST burst] 30,241 req/s, p99 — 200 events with mixed log levels (DEBUG/INFO/WARN/ERROR) and user_ids
+- [log/GET files] 57,640 req/s, p99 2.8ms — ListFiles() directory scan
+- [log/GET levels] 66,475 req/s, p99 2.4ms — container.MustMake + LevelVar.Level()
+- [log/GET query-all] 106 req/s, p99 239ms — Query 11k JSONL entries, return 20 (IO-bound full file scan)
+- [log/GET query-error] 99 req/s, p99 259ms — Query 11k entries filtered to ERROR level
+- [log/GET query-search] 85 req/s, p99 300ms — Query 11k entries with text search
+- [log/GET query-user] 82 req/s, p99 305ms — Query 11k entries filtered by user_id
+- [log/single query] 41ms single request latency for 11k entries (3.9 MB JSONL file)
+- [memory] 70 MB RSS after 6200+ writes + 11k log entries + concurrent query load
+- [race] No data races detected with -race flag on all log package tests
+
 ## Design Decisions
 
 <!-- Key decisions and rationale so future sessions don't reverse them. Format:
@@ -141,17 +154,23 @@ Session 7 (config, feature-flag app with config introspection, 100 DB rows):
 - [config] All() and Keys() only enumerate keys from defaults + config file, then check env overrides. Keys that exist solely as env vars (never registered via SetDefault or config.json) are not discoverable — this is intentional; it avoids scanning the entire environment. (Session 7)
 - [config] Sub() returns a flat map with prefix stripped — not a nested config instance. Simple and sufficient for passing config sections to subsystems. Returns nil (not empty map) when no keys match. (Session 7)
 - [config] Panic messages in Get() now include the env var name as a hint — `config: key "jwt.secret" not found (set JWT_SECRET env var or add to config.json)`. Coercion failures include the raw value for debugging. (Session 7)
+- [log] Separate console and file levels: `log.level` controls file (default INFO), `log.console.level` controls console (defaults to log.level when not set). Backward compatible — setting only LOG_LEVEL still works for both sinks. (Session 8)
+- [log] ConsoleLevel and FileLevel are exported named types wrapping slog.LevelVar. Supplied to container as *ConsoleLevel and *FileLevel. Embedding promotes Set()/Level() methods — callers use cl.Set(slog.LevelWarn) directly. (Session 8)
+- [log] ListFiles returns newest-first — date strings sort lexicographically. CleanOldFiles uses strict less-than on cutoff date, so retentionDays=7 keeps today + last 7 days (8 files total). (Session 8)
+- [log] Entry parsing uses two-pass: unmarshal into map[string]any, extract known fields (time, level, msg, source, request_id, user_id), put rest in Extra. Custom MarshalJSON re-merges for flat JSON output matching original JSONL structure. (Session 8)
+- [log] Query scans the entire file sequentially — IO-bound at ~100 req/s for 11k entries (4MB). Acceptable for admin viewer. Future optimization: mmap, line indexing, or in-memory cache if needed. (Session 8)
+- [log] QueryOptions.Level is a string (not slog.Level) — empty string means "all levels". Avoids the zero-value problem where slog.LevelInfo=0 would accidentally filter out DEBUG. levelRank() maps strings to ordered ints for comparison. (Session 8)
 
 ## Next Priorities
 
 <!-- What the last session thinks should come next, in order -->
 
-1. **`framework/log`** — still at Initial maturity, needs playground stress-testing and API review (config is now Growing)
-2. **Revisit `framework/http`** — file upload handling (multipart/form-data), SSE support for real-time events
-3. **`framework/db` advanced** — RETURNING clause (eliminate update-then-fetch pattern), subqueries in WHERE, CASE expressions
-4. **Revisit `framework/http/middleware`** — auth middleware (JWT validation, role-based), request timeout middleware
-5. **Revisit `framework/app` / `framework/container`** — now Growing, revisit after other packages evolve
-6. **Revisit `framework/config`** — revisit after log matures, consider config validation (type constraints, allowed values)
+1. **Revisit `framework/http`** — file upload handling (multipart/form-data), SSE support for real-time events
+2. **`framework/db` advanced** — RETURNING clause (eliminate update-then-fetch pattern), subqueries in WHERE, CASE expressions
+3. **Revisit `framework/http/middleware`** — auth middleware (JWT validation, role-based), request timeout middleware
+4. **Revisit `framework/app` / `framework/container`** — now Growing, revisit after other packages evolve
+5. **Revisit `framework/config`** — revisit after log matures, consider config validation (type constraints, allowed values)
+6. **Revisit `framework/log`** — now Growing; consider Query performance optimization (mmap/indexing), log sampling for high-traffic paths, configurable file permissions
 7. **Revisit `framework/db`** — revisit after http/config/log mature, fresh perspective on API ergonomics
 8. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
 
