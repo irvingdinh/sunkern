@@ -169,6 +169,12 @@ func (a *App) run() error {
 	container.Supply[sunkernhttp.Server](srv)
 	slog.Debug("framework service initialized", "service", "http", "took", time.Since(t))
 
+	// Validate all registered config rules. This runs after framework
+	// services (which register their own defaults and rules) and after
+	// module Register (which registers service-level defaults and rules).
+	// Catches misconfigurations before any module's Boot phase.
+	config.Validate()
+
 	// Phase 3: Boot all modules. Modules resolve services from the container
 	// and wire routes, event handlers, cron jobs, etc.
 	if err := a.boot(); err != nil {

@@ -12,15 +12,22 @@ import (
 	"sync"
 )
 
+// Rule validates a resolved config value. It receives the key name, the
+// resolved value (or nil if missing), and whether the key exists in any
+// layer. Return a non-nil error to indicate a validation failure.
+type Rule func(key string, value any, exists bool) error
+
 type state struct {
 	mu       sync.RWMutex
-	values   map[string]any // from JSON file (flattened)
-	defaults map[string]any // from SetDefault calls
+	values   map[string]any    // from JSON file (flattened)
+	defaults map[string]any    // from SetDefault calls
+	rules    map[string][]Rule // from AddRule calls
 }
 
 var global = state{
 	values:   make(map[string]any),
 	defaults: make(map[string]any),
+	rules:    make(map[string][]Rule),
 }
 
 // Load resolves the data directory, creates it if needed, loads
@@ -73,6 +80,7 @@ func Load() {
 	global.mu.Lock()
 	global.values = flat
 	global.defaults = defaults
+	global.rules = make(map[string][]Rule)
 	global.mu.Unlock()
 }
 

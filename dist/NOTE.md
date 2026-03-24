@@ -8,7 +8,7 @@
 
 ## Current State
 
-**Last session**: 2026-03-24 — Session 15 (framework/http/middleware revisited — timeout, password hashing, API tokens)
+**Last session**: 2026-03-24 — Session 16 (framework/config revisited — config validation rules)
 **Working tree**: clean
 **Branch**: with-experiment
 
@@ -18,7 +18,7 @@
 |---------|----------|--------------|-------|
 | `framework/app` | **Maturing** | Session 13 | Revisited: *App supplied to container (modules access Ready/ShuttingDown without explicit passing), boot/shutdown timing for modules and framework services, startup summary log (boot_time, module count, service count, hook count), shutdown timing. Previous: ModuleGroup boot rollback fix, lifecycle logging, module name tracking |
 | `framework/container` | **Maturing** | Session 13 | Revisited: introspection APIs (Keys, Inspect, Len), ServiceInfo/ServiceStatus types, Hooks() accessor. Previous: Override/OverrideSupply, named hooks, all framework hooks named |
-| `framework/config` | **Growing** | Session 7 | Added Has, All, Keys, Sub, DataDir, EnvName, SetDefaults; Load creates data dir; improved panic messages |
+| `framework/config` | **Maturing** | Session 16 | Revisited: config validation (AddRule, Validate, 10 built-in rules: Required, NotEmpty, Positive, NonNegative, OneOf, Min, Max, Range, MinLen, MaxLen). Rule type is a function — composable, zero boilerplate. Validate() integrated into app lifecycle after framework init, before module Boot. Previous (Session 7): Has, All, Keys, Sub, DataDir, EnvName, SetDefaults; Load creates data dir; improved panic messages |
 | `framework/log` | **Growing** | Session 8 | Separate console/file levels (ConsoleLevel, FileLevel types), log file management (ListFiles, CleanOldFiles, OpenFile), JSONL entry parsing + querying (Entry, Query with level/search/user_id/request_id filter + pagination) |
 | `framework/http` | **Maturing** | Session 14 | Revisited: SSE support (NewEventStream, SSEWriter with Send/SendJSON/Heartbeat/Retry/Done, LastEventID, write deadline extension via ResponseController, ErrStreamingNotSupported sentinel). Previous (Session 10): Bind/BindForm MaxBytesError → 413. Previous: file upload handling, all sentinels |
 | `framework/http/middleware` | **Maturing** | Session 15 | Revisited: Timeout (context deadline per route), PBKDF2-SHA256 password hashing (HashPassword/CheckPassword, 600k iterations, PHC format, stdlib-only), APIToken middleware (opaque bearer tokens with DB lookup via TokenLookup callback), GenerateToken (32-byte random hex). Previous (Session 10): JWT (HMAC-SHA256 sign/verify, Claims, context helpers), Auth (Bearer token + user_id logging), RequireRole (role-based 403), MaxBytes (body size limiter). Plus existing: RequestID, RequestLogger, Recover, CORS, RateLimit |
@@ -190,6 +190,14 @@ Session 15 (middleware auth, secure notes with password hashing + API tokens + t
 - [race] No data races detected with -race flag on concurrent JWT + API token + login + writes
 - [apitoken overhead] ~16% vs JWT for reads (~19% for writes) — DB lookup per request, acceptable trade-off
 
+Session 16 (config validation, feature flag app with validated config, 500 flags):
+- [config/GET introspection] 59,598 req/s, p99 2.6ms — config.Sub + config.Has + config.Keys + config.GetOr
+- [flags/GET list] 19,156 req/s, p99 6.7ms — paginated list on 500 rows
+- [flags/GET single] 53,553 req/s, p99 2.9ms — single read by ID
+- [memory] 27 MB RSS after 500+ writes and 40k+ load test requests
+- [race] No data races detected with -race flag on concurrent config reads + CRUD
+- [validation] Invalid config caught at boot: multi-error panic with key + env var name + violation per rule
+
 ## Design Decisions
 
 <!-- Key decisions and rationale so future sessions don't reverse them. Format:
@@ -293,16 +301,24 @@ Session 15 (middleware auth, secure notes with password hashing + API tokens + t
 - [middleware] GenerateToken produces 32 random bytes (64 hex chars) — ~256 bits of entropy. Service should store SHA-256(token) in DB, not the plaintext. Token is shown to user once on creation. (Session 15)
 - [middleware] extractBearerToken is case-insensitive on "Bearer " prefix per RFC 6750. Auth middleware still uses case-sensitive check (legacy). Minor inconsistency, not worth changing tested code. (Session 15)
 
+- [config] Rule type is `func(key string, value any, exists bool) error` — function type, not interface. Composable (combine Required + OneOf), zero boilerplate for custom rules (just write a function). Same spirit as http.HandlerFunc. (Session 16)
+- [config] Validate() snapshots rules under RLock, releases, then calls resolve() per key (which acquires its own RLock). Avoids potential deadlock if a writer waits between two RLock acquisitions on the same goroutine. (Session 16)
+- [config] Validate() panics (not returns error) — consistent with config.Load(), Ensure(), and Get[T]. Config validation failures are always fatal — the app should not start with invalid config. Panic message lists ALL violations sorted alphabetically, each with key + env var name + error. (Session 16)
+- [config] Rules skip validation when key doesn't exist (return nil) — compose with Required to enforce both existence and constraints. This mirrors HTTP validation: zero-value fields skip non-required rules (Session 6 precedent). (Session 16)
+- [config] AddRule accumulates rules (append, not replace) — multiple AddRule calls for the same key all checked. Modules can independently add constraints to shared keys. (Session 16)
+- [config] Framework services (log, sqlite, http) do NOT register validation rules — they consume config before Validate() runs in the lifecycle. Framework packages handle their own validation (log panics on bad levels, sqlite uses GetOr fallbacks). Config validation is primarily for service modules whose Boot phase runs AFTER Validate(). (Session 16)
+- [config] Validate() placed in app lifecycle after framework init, before module Boot: config.Load() → modules Register() → framework init → config.Validate() → modules Boot(). This means service modules register defaults+rules in Register(), Validate() catches issues, then Boot() reads validated config safely. (Session 16)
+
 ## Next Priorities
 
 <!-- What the last session thinks should come next, in order -->
 
-1. **Revisit `framework/http`** — consider: SSE broker/hub pattern as a higher-level abstraction (manages multiple connections, fan-out from event source, stats), once event bus exists
-2. **Revisit `framework/config`** — consider config validation (type constraints, allowed values)
-3. **Revisit `framework/log`** — consider Query performance optimization (mmap/indexing), log sampling for high-traffic paths
-4. **Revisit `framework/db`** — JOINs with RETURNING (currently untested), raw RETURNING with db.Raw columns, COALESCE/IFNULL expressions, window functions
-5. **Revisit `framework/sqlite`** — consider: periodic auto-optimize (cron integration when cron package exists), connection pool health endpoint, PRAGMA runtime reconfiguration
-7. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
+1. **Revisit `framework/log`** — Query performance optimization (mmap/indexing for large files), log sampling for high-traffic paths. Lowest maturity "Growing" package remaining
+2. **Revisit `framework/http`** — SSE broker/hub pattern as a higher-level abstraction (manages multiple connections, fan-out from event source, stats), once event bus exists
+3. **Revisit `framework/db`** — JOINs with RETURNING (currently untested), raw RETURNING with db.Raw columns, COALESCE/IFNULL expressions, window functions
+4. **Revisit `framework/sqlite`** — periodic auto-optimize (cron integration when cron package exists), connection pool health endpoint, PRAGMA runtime reconfiguration
+5. **Revisit `framework/app`** — consider: app lifecycle hooks for plugins (pre-boot, post-boot callbacks), health check endpoint integration
+6. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
 
 ## In-Progress Work
 
