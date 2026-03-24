@@ -246,9 +246,10 @@ func (b *SelectBuilder) buildCount() (string, []any) {
 // Generic free functions (type-safe scan)
 // ---------------------------------------------------------------------------
 
-// QueryAll executes the select query and scans all rows into []T.
-func QueryAll[T any](ctx context.Context, q Querier, sb *SelectBuilder) ([]T, error) {
-	sql, args := sb.Build()
+// QueryAll executes the query and scans all rows into []T. Accepts any Query
+// implementation (*SelectBuilder, *SetBuilder).
+func QueryAll[T any](ctx context.Context, q Querier, query Query) ([]T, error) {
+	sql, args := query.Build()
 	rows, err := q.QueryContext(ctx, sql, args...)
 	if err != nil {
 		return nil, fmt.Errorf("db: query: %w", err)
@@ -256,10 +257,11 @@ func QueryAll[T any](ctx context.Context, q Querier, sb *SelectBuilder) ([]T, er
 	return scanAll[T](rows)
 }
 
-// QueryOne executes the select query and scans a single row into T.
+// QueryOne executes the query and scans a single row into T. Accepts any
+// Query implementation (*SelectBuilder, *SetBuilder).
 // Returns ErrNotFound if no rows match.
-func QueryOne[T any](ctx context.Context, q Querier, sb *SelectBuilder) (T, error) {
-	sql, args := sb.Build()
+func QueryOne[T any](ctx context.Context, q Querier, query Query) (T, error) {
+	sql, args := query.Build()
 	rows, err := q.QueryContext(ctx, sql, args...)
 	if err != nil {
 		var zero T
@@ -269,13 +271,14 @@ func QueryOne[T any](ctx context.Context, q Querier, sb *SelectBuilder) (T, erro
 }
 
 // QueryVal executes the query and scans a single column from the first row
-// into T. Use for scalar results (e.g., MAX, single-column selects).
+// into T. Accepts any Query implementation (*SelectBuilder, *SetBuilder).
+// Use for scalar results (e.g., MAX, single-column selects).
 // Returns ErrNotFound if no rows match.
 //
 //	maxAge, err := db.QueryVal[int64](ctx, readDB,
 //	    db.Select(&Users.TableInfo).Columns(db.Max(Users.Age, "")))
-func QueryVal[T any](ctx context.Context, q Querier, sb *SelectBuilder) (T, error) {
-	sqlStr, args := sb.Build()
+func QueryVal[T any](ctx context.Context, q Querier, query Query) (T, error) {
+	sqlStr, args := query.Build()
 	rows, err := q.QueryContext(ctx, sqlStr, args...)
 	if err != nil {
 		var zero T

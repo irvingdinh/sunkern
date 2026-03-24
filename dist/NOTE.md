@@ -8,7 +8,7 @@
 
 ## Current State
 
-**Last session**: 2026-03-25 — Session 22 (framework/db revisited — window functions: OVER, PARTITION BY, ORDER BY, ROWS/RANGE/GROUPS frames, ROW_NUMBER/RANK/DENSE_RANK/NTILE/LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTH_VALUE, GROUP_CONCAT/GROUP_CONCAT DISTINCT)
+**Last session**: 2026-03-25 — Session 23 (framework/db revisited — UNION/UNION ALL/INTERSECT/EXCEPT set operations, aggregate FILTER clause, Query interface for generic query functions)
 **Working tree**: clean
 **Branch**: with-experiment
 
@@ -22,7 +22,7 @@
 | `framework/log` | **Maturing** | Session 17 | Revisited: buffered file writer (64KB bufio.Writer + 200ms periodic flush goroutine — ~145k log writes/sec), Flush() export, Query improvements (Order desc/asc, After/Before time range, CountOnly mode). Previous (Session 8): Separate console/file levels, log file management, JSONL entry parsing + querying |
 | `framework/http` | **Maturing** | Session 14 | Revisited: SSE support (NewEventStream, SSEWriter with Send/SendJSON/Heartbeat/Retry/Done, LastEventID, write deadline extension via ResponseController, ErrStreamingNotSupported sentinel). Previous (Session 10): Bind/BindForm MaxBytesError → 413. Previous: file upload handling, all sentinels |
 | `framework/http/middleware` | **Maturing** | Session 15 | Revisited: Timeout (context deadline per route), PBKDF2-SHA256 password hashing (HashPassword/CheckPassword, 600k iterations, PHC format, stdlib-only), APIToken middleware (opaque bearer tokens with DB lookup via TokenLookup callback), GenerateToken (32-byte random hex). Previous (Session 10): JWT (HMAC-SHA256 sign/verify, Claims, context helpers), Auth (Bearer token + user_id logging), RequireRole (role-based 403), MaxBytes (body size limiter). Plus existing: RequestID, RequestLogger, Recover, CORS, RateLimit |
-| `framework/db` | **Maturing** | Session 22 | Revisited: window functions — WindowDef builder (PartitionBy, OrderBy, Rows/Range/Groups frames), Over(expr, win) wrapper, 11 window functions (RowNumber, Rank, DenseRank, NTile, Lag, Lead, LagDefault, LeadDefault, FirstValue, LastValue, NthValue), GroupConcat(col, sep), GroupConcatDistinct(col). Frame bounds: UnboundedPreceding, Preceding(n), CurrentRow, Following(n), UnboundedFollowing. Previous (Session 21): JOIN ergonomics — As, CrossJoin, Coalesce/IfNull/Val, ColEq family, Asc/Desc. Previous (Session 12): RETURNING, subqueries, CASE. Previous (Session 5): nullable types, cursor pagination |
+| `framework/db` | **Maturing** | Session 23 | Revisited: Query interface (backward-compatible — QueryAll/QueryOne/QueryVal accept both SelectBuilder and SetBuilder), SetBuilder for UNION/UNION ALL/INTERSECT/EXCEPT with OrderBy/Limit/Offset, aggregate FILTER clause (Filter(agg, where) → FILTER (WHERE condition), composes with As/Over). Previous (Session 22): window functions, GROUP_CONCAT. Previous (Session 21): JOIN ergonomics. Previous (Session 12): RETURNING, subqueries, CASE. Previous (Session 5): nullable types, cursor pagination |
 | `framework/sqlite` | **Maturing** | Session 18 | Revisited: background maintenance goroutine (periodic PRAGMA optimize + WAL auto-checkpoint when WAL exceeds threshold), Health(ctx) for readiness checks, 2 new config keys (db.optimize_interval, db.wal_checkpoint_threshold). Maintenance lifecycle managed by container hooks (OnStart/OnStop). Previous (Session 11): Stats, Checkpoint, Optimize, IntegrityCheck, Backup. Configurable PRAGMAs. |
 | `framework/sqlite/driver` | **Maturing** | Session 20 | Revisited: structured Error type with primary+extended result codes (Code/ExtendedCode/Message), context cancellation via sqlite3_interrupt (ExecContext/QueryContext on conn+stmt), MemoryUsed/MemoryHighwater exported functions, time.Time bind with ms precision + UTC, extended result codes enabled per connection, nil guards on Close, compile-time interface assertions. Previous (Session 11): blob binding safety fix (CBytes+C.free pattern). |
 | `framework/sqlite/migrate` | **Maturing** | Session 19 | Revisited: SHA-256 checksums (drift detection via Dirty field), execution_ms tracking, UpTo/DownTo/Version/Redo methods, MigrationStatus enriched with HasDown/StmtCount/Checksum/Dirty/ExecutionMs + JSON tags, backward-compatible schema upgrade (ALTER TABLE ADD COLUMN), Checksum() exported, applyUp/applyDown split, *Engine supplied to container. Previous (Session 11): migration timing, Pending(), error context with statement index. |
@@ -265,6 +265,17 @@ Session 22 (db revisit, employee analytics with window functions — 200 employe
 - [memory] 56 MB RSS after 80k+ load test requests, 166 MB peak under sustained concurrent load
 - [race] No data races detected with -race flag on concurrent requests across all 8 window+GROUP_CONCAT endpoints
 
+Session 23 (db revisit, sales analytics with set operations + FILTER — 20 products, 2000 orders, 1500 archived orders):
+- [db/UNION ALL] 6,705 req/s, p99 27.2ms — combined 3500 rows from 2 tables, ORDER BY total DESC, LIMIT 50
+- [db/UNION] 10,937 req/s, p99 15.9ms — deduplicated product IDs across both tables
+- [db/EXCEPT] 11,849 req/s, p99 13.1ms — current-only product IDs (8 results)
+- [db/INTERSECT] 13,508 req/s, p99 12.6ms — shared product IDs (12 results)
+- [db/FILTER aggregate] 19,007 req/s, p99 7.8ms — 8 conditional aggregates (SUM/COUNT × 4 statuses) on 2000 rows
+- [db/FILTER+GROUP BY] 15,083 req/s, p99 10.9ms — region breakdown with 5 FILTER aggregates, GROUP BY region (4 rows)
+- [db/UNION ALL+FILTER] 20,452 req/s, p99 7.9ms — UNION ALL of 2 pre-aggregated queries with FILTER
+- [memory] 40 MB RSS after 35k+ load test requests
+- [race] No data races detected with -race flag on concurrent requests across all 7 endpoints
+
 ## Design Decisions
 
 <!-- Key decisions and rationale so future sessions don't reverse them. Format:
@@ -423,18 +434,25 @@ Session 22 (db revisit, employee analytics with window functions — 200 employe
 - [db] GroupConcat uses parameterized separator (? placeholder) to prevent SQL injection. GroupConcatDistinct takes no separator — SQLite requires DISTINCT aggregates to have exactly one argument, so GROUP_CONCAT(DISTINCT col, sep) is a syntax error. This is a known SQLite limitation. (Session 22)
 - [db] Window function SQL generation uses separate internal types (windowFuncExpr, windowOffsetExpr, windowOffsetDefaultExpr, windowValueExpr, windowNthExpr) rather than one mega-struct. Each type has exactly the fields it needs — no nil checks or mode flags. More types, simpler code per type. (Session 22)
 
+- [db] Query interface — `type Query interface { Build() (string, []any) }` in db.go. Both *SelectBuilder and *SetBuilder satisfy it. QueryAll/QueryOne/QueryVal changed from `*SelectBuilder` to `Query` — backward compatible because *SelectBuilder already has Build(). Count/Exists remain *SelectBuilder-only (they use buildCount() which is SELECT-specific). (Session 23)
+- [db] SetBuilder combines multiple Query implementations (not just *SelectBuilder) via the Query interface. This enables nested set operations: `db.Union(db.Intersect(a, b), db.Except(c, d))`. Each sub-query's Build() is called inline, args are concatenated in order. (Session 23)
+- [db] Set operation constructors (Union, UnionAll, Intersect, Except) accept variadic `...Query` — works with 2+ queries. EXCEPT typically takes 2, but SQLite supports chaining. OrderBy/Limit/Offset on SetBuilder apply to the combined result set. Column references in ORDER BY must use aliases or positional notation (db.Raw("column_name") or db.Raw("1")) since table-qualified names don't work on combined results. (Session 23)
+- [db] Filter(agg, where) wraps any Expr with FILTER (WHERE condition). It's a simple wrapper — no special knowledge of aggregates. This means it composes with any expression, though it only makes semantic sense on aggregates. Consistent with the established pattern: package-level function returning Expr, no modification to existing types. (Session 23)
+- [db] Filter composes with Over for conditional window aggregates: `db.Over(db.Filter(db.Sum(col, ""), pred), win)`. SQLite executes FILTER before OVER — the filter restricts which rows contribute to the aggregate within each window partition. (Session 23)
+
 ## Next Priorities
 
 <!-- What the last session thinks should come next, in order -->
 
-1. **Revisit `framework/db`** — raw RETURNING with db.Raw columns, aggregate FILTER clause (WHERE inside aggregate), UNION/INTERSECT/EXCEPT set operations
-2. **Revisit `framework/http`** — SSE broker/hub pattern as a higher-level abstraction (manages multiple connections, fan-out from event source, stats), once event bus exists
-3. **Revisit `framework/app`** — consider: app lifecycle hooks for plugins (pre-boot, post-boot callbacks), health check endpoint integration (now that sqlite.Health exists)
-4. **Revisit `framework/log`** — further: log sampling handler for high-traffic paths, mmap-based query for very large files (deferred — current linear scan is acceptable for admin viewer with daily rotation)
-5. **Revisit `framework/sqlite`** — consider: PRAGMA runtime reconfiguration (cache_size, mmap_size changes without restart), table-level size stats for admin dashboard
-6. **Revisit `framework/sqlite/migrate`** — now "Maturing". Consider: migration versioning validation (detect gaps, detect orphaned DB records), checksum mismatch warnings in Up() log output, batch status queries
-7. **Revisit `framework/sqlite/driver`** — now "Maturing". Consider: sqlite3_busy_handler (callback-based backoff), sqlite3_wal_hook (WAL monitoring), sqlite3_trace_v2 (statement tracing for debug), blob I/O for large objects
-8. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
+1. **Revisit `framework/db`** — raw RETURNING with db.Raw columns, Common Table Expressions (WITH/WITH RECURSIVE)
+2. **Revisit `framework/app`** — lifecycle hooks for plugins (pre-boot, post-boot callbacks), health check endpoint integration (now that sqlite.Health exists). Last touched Session 13 (9 sessions ago)
+3. **Revisit `framework/container`** — also last touched Session 13. Fresh eyes on the API after all the evolution since
+4. **Revisit `framework/http`** — SSE broker/hub pattern as a higher-level abstraction (manages multiple connections, fan-out from event source, stats), once event bus exists
+5. **Revisit `framework/log`** — log sampling handler for high-traffic paths, mmap-based query for very large files (deferred — current linear scan is acceptable for admin viewer with daily rotation)
+6. **Revisit `framework/sqlite`** — PRAGMA runtime reconfiguration (cache_size, mmap_size changes without restart), table-level size stats for admin dashboard
+7. **Revisit `framework/sqlite/migrate`** — migration versioning validation (detect gaps, detect orphaned DB records), checksum mismatch warnings in Up() log output, batch status queries
+8. **Revisit `framework/sqlite/driver`** — sqlite3_busy_handler (callback-based backoff), sqlite3_wal_hook (WAL monitoring), sqlite3_trace_v2 (statement tracing for debug), blob I/O for large objects
+9. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
 
 ## In-Progress Work
 

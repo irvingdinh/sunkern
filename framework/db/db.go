@@ -32,3 +32,10 @@ type Querier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
+
+// Query represents anything that can produce a SQL SELECT query string and
+// arguments. Both *SelectBuilder and *SetBuilder satisfy this interface, so
+// the generic query functions (QueryAll, QueryOne, QueryVal) accept either.
+type Query interface {
+	Build() (string, []any)
+}

@@ -55,6 +55,42 @@ func Max(col Expr, alias string) Expr {
 }
 
 // ---------------------------------------------------------------------------
+// FILTER — aggregate filter clause (SQLite 3.30+)
+// ---------------------------------------------------------------------------
+
+type filterExpr struct {
+	agg   Expr
+	where Expr
+}
+
+func (e filterExpr) WriteSQL(buf *strings.Builder, args *[]any) {
+	e.agg.WriteSQL(buf, args)
+	buf.WriteString(" FILTER (WHERE ")
+	e.where.WriteSQL(buf, args)
+	buf.WriteString(")")
+}
+
+// Filter wraps an aggregate expression with FILTER (WHERE condition).
+// SQLite 3.30+ supports this for aggregate functions, providing conditional
+// aggregation without CASE expressions. Composes naturally with As() for
+// aliasing and Over() for window aggregates.
+//
+//	// Count only active users:
+//	db.As(db.Filter(db.CountAll(""), Users.Active.Eq(true)), "active_count")
+//
+//	// Sum revenue for completed orders only:
+//	db.As(db.Filter(db.Sum(Orders.Amount, ""), Orders.Status.Eq("completed")), "revenue")
+//
+//	// Conditional window aggregate:
+//	db.As(db.Over(
+//	    db.Filter(db.Sum(Sales.Amount, ""), Sales.Region.Eq("US")),
+//	    db.Window().PartitionBy(Sales.Year),
+//	), "us_revenue_by_year")
+func Filter(agg Expr, where Expr) Expr {
+	return filterExpr{agg: agg, where: where}
+}
+
+// ---------------------------------------------------------------------------
 // GROUP_CONCAT — SQLite string aggregation
 // ---------------------------------------------------------------------------
 
