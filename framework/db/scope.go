@@ -92,6 +92,30 @@ func HasMore[T any](results []T, pageSize int) ([]T, bool) {
 	return results, false
 }
 
+// FindByID looks up a single row by its "id" column and scans it into T.
+// Optional scopes are applied to the query (e.g., NotDeleted).
+// Returns ErrNotFound if no row matches.
+//
+//	user, err := db.FindByID[User](ctx, readDB, &Users.TableInfo, id)
+//	user, err := db.FindByID[User](ctx, readDB, &Users.TableInfo, id, db.NotDeleted(Users.DeletedAt))
+func FindByID[T any](ctx context.Context, q Querier, table *TableInfo, id string, scopes ...Scope) (T, error) {
+	sb := Select(table).
+		Where(newComp(newSyntheticColumn(table.name, "id"), "=", id)).
+		Limit(1)
+	for _, s := range scopes {
+		sb = s(sb)
+	}
+	return QueryOne[T](ctx, q, sb)
+}
+
+// DeleteByID permanently deletes a single row by ID. For soft-delete, use
+// SoftDeleteByID instead.
+func DeleteByID(ctx context.Context, q Querier, table *TableInfo, id string) (sql.Result, error) {
+	return Delete(table).
+		Where(newComp(newSyntheticColumn(table.name, "id"), "=", id)).
+		Exec(ctx, q)
+}
+
 // SoftDeleteByID is a convenience that soft-deletes a single row by ID.
 func SoftDeleteByID(ctx context.Context, q Querier, table *TableInfo, id string) (sql.Result, error) {
 	return SoftDelete(table).

@@ -55,12 +55,7 @@ func (c *usersController) list(w http.ResponseWriter, r *http.Request) {
 func (c *usersController) get(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	q := db.Select(&Users.TableInfo).
-		Where(Users.ID.Eq(id)).
-		Apply(db.NotDeleted(Users.DeletedAt)).
-		Limit(1)
-
-	user, err := db.QueryOne[User](r.Context(), c.readDB, q)
+	user, err := db.FindByID[User](r.Context(), c.readDB, &Users.TableInfo, id, db.NotDeleted(Users.DeletedAt))
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			sunkernhttp.Error(w, sunkernhttp.ErrNotFound)
@@ -148,8 +143,7 @@ func (c *usersController) update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Fetch and return the updated user.
-	q := db.Select(&Users.TableInfo).Where(Users.ID.Eq(id)).Limit(1)
-	user, err := db.QueryOne[User](r.Context(), c.readDB, q)
+	user, err := db.FindByID[User](r.Context(), c.readDB, &Users.TableInfo, id)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "users: get after update", "error", err)
 		sunkernhttp.Error(w, err)
@@ -195,8 +189,7 @@ func (c *usersController) restore(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Fetch and return the restored user.
-	q := db.Select(&Users.TableInfo).Where(Users.ID.Eq(id)).Limit(1)
-	user, err := db.QueryOne[User](r.Context(), c.readDB, q)
+	user, err := db.FindByID[User](r.Context(), c.readDB, &Users.TableInfo, id)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "users: get after restore", "error", err)
 		sunkernhttp.Error(w, err)

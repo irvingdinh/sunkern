@@ -218,6 +218,48 @@ func writeJoins(buf *strings.Builder, args *[]any, joins []joinClause) {
 	}
 }
 
+// buildExists generates a SELECT EXISTS(SELECT 1 FROM ... WHERE ... LIMIT 1)
+// query. Stops at the first matching row, avoiding a full count scan.
+func (b *SelectBuilder) buildExists() (string, []any) {
+	var buf strings.Builder
+	var args []any
+
+	// WITH clause (outside the EXISTS wrapper for correct scoping)
+	writeCTEs(&buf, &args, b.ctes)
+
+	buf.WriteString("SELECT EXISTS(SELECT 1")
+	if b.table != nil {
+		buf.WriteString(" FROM ")
+		b.table.WriteSQL(&buf, &args)
+	}
+
+	writeJoins(&buf, &args, b.joins)
+
+	if len(b.where) > 0 {
+		buf.WriteString(" WHERE ")
+		writeExprs(&buf, &args, b.where)
+	}
+
+	if len(b.groupBy) > 0 {
+		buf.WriteString(" GROUP BY ")
+		for i, col := range b.groupBy {
+			if i > 0 {
+				buf.WriteString(", ")
+			}
+			col.WriteSQL(&buf, &args)
+		}
+	}
+
+	if len(b.having) > 0 {
+		buf.WriteString(" HAVING ")
+		writeExprs(&buf, &args, b.having)
+	}
+
+	buf.WriteString(" LIMIT 1)")
+
+	return buf.String(), args
+}
+
 // buildCount generates a SELECT COUNT(*) query reusing FROM/WHERE/JOIN.
 func (b *SelectBuilder) buildCount() (string, []any) {
 	var buf strings.Builder
@@ -332,11 +374,23 @@ func Count(ctx context.Context, q Querier, sb *SelectBuilder) (int64, error) {
 	return count, nil
 }
 
-// Exists returns true if at least one row matches the query.
+// Exists returns true if at least one row matches the query. It uses
+// SELECT EXISTS(SELECT 1 ... LIMIT 1) which stops at the first matching
+// row — more efficient than COUNT(*) for large tables.
 func Exists(ctx context.Context, q Querier, sb *SelectBuilder) (bool, error) {
-	count, err := Count(ctx, q, sb)
+	sql, args := sb.buildExists()
+	rows, err := q.QueryContext(ctx, sql, args...)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("db: exists: %w", err)
 	}
-	return count > 0, nil
+	defer rows.Close()
+
+	if !rows.Next() {
+		return false, fmt.Errorf("db: exists: no rows returned")
+	}
+	var exists bool
+	if err := rows.Scan(&exists); err != nil {
+		return false, fmt.Errorf("db: exists scan: %w", err)
+	}
+	return exists, nil
 }
