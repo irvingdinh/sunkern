@@ -7,25 +7,28 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// dualHandler
+// mergedHandler
 // ---------------------------------------------------------------------------
 
-// dualHandler wraps two slog.Handler children (console + file) and delegates
-// to both.
-type dualHandler struct {
+// mergedHandler wraps two slog.Handler children (console + file) and delegates
+// to both. Per-sink level filtering is applied in Handle via each child’s
+// Enabled check.
+type mergedHandler struct {
 	console slog.Handler
 	file    slog.Handler
 }
 
-func newDualHandler(console, file slog.Handler) *dualHandler {
-	return &dualHandler{console: console, file: file}
+func newMergedHandler(console, file slog.Handler) *mergedHandler {
+	return &mergedHandler{console: console, file: file}
 }
 
-func (h *dualHandler) Enabled(ctx context.Context, level slog.Level) bool {
-	return h.console.Enabled(ctx, level) || h.file.Enabled(ctx, level)
+// Enabled always returns true so the slog.Logger does not short-circuit
+// before Handle; each child still filters by level in Handle.
+func (*mergedHandler) Enabled(context.Context, slog.Level) bool {
+	return true
 }
 
-func (h *dualHandler) Handle(ctx context.Context, r slog.Record) error {
+func (h *mergedHandler) Handle(ctx context.Context, r slog.Record) error {
 	var errs []error
 	if h.console.Enabled(ctx, r.Level) {
 		if err := h.console.Handle(ctx, r); err != nil {
@@ -40,15 +43,15 @@ func (h *dualHandler) Handle(ctx context.Context, r slog.Record) error {
 	return errors.Join(errs...)
 }
 
-func (h *dualHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return &dualHandler{
+func (h *mergedHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &mergedHandler{
 		console: h.console.WithAttrs(attrs),
 		file:    h.file.WithAttrs(attrs),
 	}
 }
 
-func (h *dualHandler) WithGroup(name string) slog.Handler {
-	return &dualHandler{
+func (h *mergedHandler) WithGroup(name string) slog.Handler {
+	return &mergedHandler{
 		console: h.console.WithGroup(name),
 		file:    h.file.WithGroup(name),
 	}

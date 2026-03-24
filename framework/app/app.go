@@ -115,9 +115,7 @@ func (a *App) run() error {
 	// exists solely for tests that need a clean container between cases.
 	config.Load()
 
-	if err := sunkernlog.Init(); err != nil {
-		return fmt.Errorf("init log: %w", err)
-	}
+	sunkernlog.Load()
 
 	// Phase 1: Register all modules. Every module's Register() runs before
 	// any module's Boot(). Only container.Provide / config.SetDefault calls

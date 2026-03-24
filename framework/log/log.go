@@ -8,44 +8,74 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"sunkern.local/framework/config"
 	"sunkern.local/framework/container"
 )
 
-// writer is the package-level file writer, set by Init and closed by Close.
-var writer *dailyFileWriter
+type state struct {
+	mu     sync.Mutex
+	writer *dailyFileWriter
+}
 
-// Init creates the dual-output structured logger and sets it as the slog
-// default. It reads "log.level" from config for the console handler level
-// (default "INFO") and writes file logs to {data_dir}/logs/. Call Close to
-// flush and close the file writer during shutdown.
-func Init() error {
+var global state
+
+// Load creates the dual-output structured logger and sets it as the slog
+// default, after [config.Load] has run. It reads "log.level" from config for
+// the handler level (default "INFO") and "log.format" for the console output
+// format ("json" default, or "text" for human-readable dev output). File logs
+// are always JSON. On failure it panics (same spirit as config.Load). Call
+// Close to flush and close the file writer during shutdown.
+func Load() {
 	levelStr := config.GetOr[string]("log.level", "INFO")
 	var consoleLevel slog.LevelVar
 	if err := parseLevel(&consoleLevel, levelStr); err != nil {
-		return err
+		panic(fmt.Sprintf("log: %v", err))
 	}
 
-	consoleHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: &consoleLevel,
-	})
+	formatStr := strings.ToLower(strings.TrimSpace(config.GetOr[string]("log.format", "json")))
+
+	var consoleHandler slog.Handler
+	switch formatStr {
+	case "json":
+		consoleHandler = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+			Level: &consoleLevel,
+		})
+	case "text":
+		consoleHandler = slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+			Level: &consoleLevel,
+			ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+				if len(groups) == 0 && a.Key == slog.TimeKey {
+					if t, ok := a.Value.Any().(time.Time); ok {
+						a.Value = slog.StringValue(t.Format("15:04:05.000"))
+					}
+				}
+				return a
+			},
+		})
+	default:
+		panic(fmt.Sprintf("log: unknown format %q (expected \"json\" or \"text\")", formatStr))
+	}
 
 	dataDir := config.Get[string]("data_dir")
 	logsDir := filepath.Join(dataDir, "logs")
 	if err := os.MkdirAll(logsDir, 0o755); err != nil {
-		return fmt.Errorf("log: creating logs directory: %w", err)
+		panic(fmt.Sprintf("log: creating logs directory: %v", err))
 	}
 
-	writer = newDailyFileWriter(logsDir)
+	global.mu.Lock()
+	global.writer = newDailyFileWriter(logsDir)
+	global.mu.Unlock()
 
-	fileHandler := slog.NewJSONHandler(writer, &slog.HandlerOptions{
-		Level:     slog.LevelDebug,
+	fileHandler := slog.NewJSONHandler(global.writer, &slog.HandlerOptions{
+		Level:     &consoleLevel,
 		AddSource: true,
 	})
 
-	dual := newDualHandler(consoleHandler, fileHandler)
-	root := newContextHandler(dual)
+	merged := newMergedHandler(consoleHandler, fileHandler)
+	root := newContextHandler(merged)
 	slog.SetDefault(slog.New(root))
 
 	container.Supply[*slog.LevelVar](&consoleLevel)
@@ -55,16 +85,16 @@ func Init() error {
 			return Close()
 		},
 	})
-
-	return nil
 }
 
 // Close flushes and closes the file writer. Safe to call multiple times.
 // Normally called via the container shutdown hook; exported for early-abort
 // cleanup in the boot sequence.
 func Close() error {
-	if writer != nil {
-		return writer.Close()
+	global.mu.Lock()
+	defer global.mu.Unlock()
+	if global.writer != nil {
+		return global.writer.Close()
 	}
 	return nil
 }
@@ -72,8 +102,12 @@ func Close() error {
 // Reset closes the file writer and sets the slog default to a discard
 // handler. Intended for tests to get clean state between test cases.
 func Reset() {
-	_ = Close()
-	writer = nil
+	global.mu.Lock()
+	if global.writer != nil {
+		_ = global.writer.Close()
+		global.writer = nil
+	}
+	global.mu.Unlock()
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
@@ -93,7 +127,7 @@ func parseLevel(lv *slog.LevelVar, s string) error {
 	case "ERROR":
 		lv.Set(slog.LevelError)
 	default:
-		return fmt.Errorf("log: unknown level %q", s)
+		return fmt.Errorf("unknown level %q", s)
 	}
 	return nil
 }

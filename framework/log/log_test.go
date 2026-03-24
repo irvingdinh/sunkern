@@ -40,15 +40,13 @@ func nonEmptyLines(s string) []string {
 }
 
 // ---------------------------------------------------------------------------
-// Init
+// Load
 // ---------------------------------------------------------------------------
 
-func TestInitCreatesLogDirectory(t *testing.T) {
+func TestLoadCreatesLogDirectory(t *testing.T) {
 	setup(t)
 
-	if err := Init(); err != nil {
-		t.Fatalf("Init: %v", err)
-	}
+	Load()
 	defer Close()
 
 	logsDir := filepath.Join(config.Get[string]("data_dir"), "logs")
@@ -61,12 +59,10 @@ func TestInitCreatesLogDirectory(t *testing.T) {
 	}
 }
 
-func TestInitSetsDefaultLogger(t *testing.T) {
+func TestLoadSetsDefaultLogger(t *testing.T) {
 	setup(t)
 
-	if err := Init(); err != nil {
-		t.Fatalf("Init: %v", err)
-	}
+	Load()
 	defer Close()
 
 	// Logging should write to the file. Verify a file exists in DATA_DIR/logs.
@@ -88,14 +84,12 @@ func TestInitSetsDefaultLogger(t *testing.T) {
 	}
 }
 
-func TestInitWithCustomLevel(t *testing.T) {
+func TestLoadWithCustomLevel(t *testing.T) {
 	setup(t)
 	t.Setenv("LOG_LEVEL", "ERROR")
 	config.Load() // reload to pick up env
 
-	if err := Init(); err != nil {
-		t.Fatalf("Init: %v", err)
-	}
+	Load()
 	defer Close()
 
 	// Console level should be ERROR. File always captures everything.
@@ -112,9 +106,7 @@ func TestInitWithCustomLevel(t *testing.T) {
 func TestLevelVarInContainer(t *testing.T) {
 	setup(t)
 
-	if err := Init(); err != nil {
-		t.Fatalf("Init: %v", err)
-	}
+	Load()
 	defer Close()
 
 	lv, err := container.Make[*slog.LevelVar]()
@@ -134,39 +126,92 @@ func TestLevelVarInContainer(t *testing.T) {
 	}
 }
 
+func TestLoadPanicsOnInvalidLogLevel(t *testing.T) {
+	setup(t)
+	t.Setenv("LOG_LEVEL", "not-a-level")
+	config.Load()
+
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic for invalid LOG_LEVEL")
+		}
+	}()
+	Load()
+}
+
+func TestLoadWithTextFormat(t *testing.T) {
+	setup(t)
+	t.Setenv("LOG_FORMAT", "text")
+	config.Load()
+
+	Load()
+	defer Close()
+
+	// File handler should still produce valid JSON regardless of console format.
+	slog.Info("text format test")
+
+	logsDir := filepath.Join(config.Get[string]("data_dir"), "logs")
+	entries, _ := filepath.Glob(filepath.Join(logsDir, "*.log"))
+	if len(entries) == 0 {
+		t.Fatal("expected at least one log file")
+	}
+
+	data, err := os.ReadFile(entries[0])
+	if err != nil {
+		t.Fatalf("reading log file: %v", err)
+	}
+
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("file output is not valid JSON: %v", err)
+	}
+}
+
+func TestLoadPanicsOnInvalidFormat(t *testing.T) {
+	setup(t)
+	t.Setenv("LOG_FORMAT", "yaml")
+	config.Load()
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic for invalid LOG_FORMAT")
+		}
+		if msg, ok := r.(string); ok && !strings.Contains(msg, "unknown format") {
+			t.Fatalf("unexpected panic message: %s", msg)
+		}
+	}()
+	Load()
+}
+
 // ---------------------------------------------------------------------------
-// DualHandler
+// MergedHandler
 // ---------------------------------------------------------------------------
 
-func TestDualHandlerLevelFiltering(t *testing.T) {
+func TestMergedHandlerLevelFiltering(t *testing.T) {
 	var consoleBuf, fileBuf bytes.Buffer
 
-	consoleH := slog.NewJSONHandler(&consoleBuf, &slog.HandlerOptions{Level: slog.LevelInfo})
-	fileH := slog.NewJSONHandler(&fileBuf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	consoleH := slog.NewJSONHandler(&consoleBuf, &slog.HandlerOptions{Level: slog.LevelWarn})
+	fileH := slog.NewJSONHandler(&fileBuf, &slog.HandlerOptions{Level: slog.LevelInfo})
 
-	dual := newDualHandler(consoleH, fileH)
-	logger := slog.New(dual)
+	merged := newMergedHandler(consoleH, fileH)
+	logger := slog.New(merged)
 
 	logger.Debug("debug msg")
 	logger.Info("info msg")
 	logger.Warn("warn msg")
 	logger.Error("error msg")
 
-	// Console (INFO+) should have info, warn, error but NOT debug.
+	// Console (WARN+) should have warn and error only.
 	consoleLines := nonEmptyLines(consoleBuf.String())
-	if len(consoleLines) != 3 {
-		t.Fatalf("console: expected 3 lines, got %d: %v", len(consoleLines), consoleLines)
-	}
-	for _, line := range consoleLines {
-		if strings.Contains(line, `"level":"DEBUG"`) {
-			t.Fatal("console should not contain DEBUG")
-		}
+	if len(consoleLines) != 2 {
+		t.Fatalf("console: expected 2 lines, got %d: %v", len(consoleLines), consoleLines)
 	}
 
-	// File (DEBUG+) should have all 4.
+	// File (INFO+) should have info, warn, error.
 	fileLines := nonEmptyLines(fileBuf.String())
-	if len(fileLines) != 4 {
-		t.Fatalf("file: expected 4 lines, got %d: %v", len(fileLines), fileLines)
+	if len(fileLines) != 3 {
+		t.Fatalf("file: expected 3 lines, got %d: %v", len(fileLines), fileLines)
 	}
 }
 
@@ -317,14 +362,12 @@ func TestCloseIdempotent(t *testing.T) {
 func TestResetDiscardsOutput(t *testing.T) {
 	setup(t)
 
-	if err := Init(); err != nil {
-		t.Fatalf("Init: %v", err)
-	}
+	Load()
 
 	Reset()
 
 	// After Reset, logging should go nowhere. Verify no new log files are
-	// created (the old ones from Init may exist, but no new data).
+	// created (the old ones from Load may exist, but no new data).
 	tmpDir := t.TempDir()
 	t.Setenv("DATA_DIR", tmpDir)
 

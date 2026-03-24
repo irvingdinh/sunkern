@@ -8,8 +8,13 @@ import (
 	"time"
 )
 
-// dailyFileWriter implements io.WriteCloser and rotates log files daily.
-// Each day's logs go to a separate file named YYYY_MM_DD.log.
+// dailyFileWriter is the file sink behind the JSON file handler: a
+// thread-safe io.WriteCloser that appends bytes to one JSONL file per calendar
+// day (YYYY_MM_DD.log) under a fixed directory. It is created when [Load] runs;
+// write errors (including rotation failures) propagate to slog.
+//
+// Rotation happens on the first write after the date changes; the mutex
+// serializes writes and protects the current file handle and date string.
 type dailyFileWriter struct {
 	mu    sync.Mutex
 	dir   string
@@ -25,6 +30,8 @@ func newDailyFileWriter(dir string) *dailyFileWriter {
 	}
 }
 
+// Write appends p to today's log file, rotating to a new file when the
+// calendar day changes (under mu).
 func (w *dailyFileWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -38,6 +45,7 @@ func (w *dailyFileWriter) Write(p []byte) (int, error) {
 	return w.file.Write(p)
 }
 
+// rotate closes the previous file (if any) and opens path for append in dir.
 func (w *dailyFileWriter) rotate(date string) error {
 	if w.file != nil {
 		_ = w.file.Close()
