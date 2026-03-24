@@ -8,7 +8,7 @@
 
 ## Current State
 
-**Last session**: 2026-03-24 — Session 10 (framework/http/middleware auth + JWT + MaxBytes)
+**Last session**: 2026-03-24 — Session 11 (framework/sqlite mature — ops API, configurable PRAGMAs, driver fix)
 **Working tree**: clean
 **Branch**: with-experiment
 
@@ -23,9 +23,9 @@
 | `framework/http` | **Maturing** | Session 10 | Revisited: Bind/BindForm now detect http.MaxBytesError and return 413 instead of 400. Previous: file upload handling (FormFile, FormFiles, BindForm, SaveFile, ValidateFile, DetectFileType), all sentinels |
 | `framework/http/middleware` | **Maturing** | Session 10 | Revisited: JWT (HMAC-SHA256 sign/verify, Claims, context helpers), Auth (Bearer token extraction + verification + user_id logging), RequireRole (role-based 403), MaxBytes (body size limiter). Plus existing: RequestID, RequestLogger, Recover, CORS, RateLimit |
 | `framework/db` | **Maturing** | Session 5 | Revisited: deterministic column order, generalized pointer handling, SetNull, ModelSlice batch insert, NullBoolColumn/NullFloatColumn, cursor pagination (After + HasMore) |
-| `framework/sqlite` | Initial | Session 7 | Dual pool works; removed redundant data dir creation (config.Load handles it now); uses config.DataDir() |
-| `framework/sqlite/driver` | Initial | — | CGo binding works |
-| `framework/sqlite/migrate` | Initial | — | SQL migration engine works |
+| `framework/sqlite` | **Growing** | Session 11 | Revisited: Stats (file/WAL size, page counts, pool stats), Checkpoint (WAL truncate), Optimize (PRAGMA optimize), IntegrityCheck (quick_check), Backup (VACUUM INTO). Configurable PRAGMAs via config (busy_timeout, cache_size, mmap_size, wal_autocheckpoint, journal_size_limit). PRAGMA mmap_size added (256MB default). Optimize-on-shutdown. Enhanced startup logging with PRAGMA values. |
+| `framework/sqlite/driver` | **Growing** | Session 11 | Fixed blob binding: replaced nil (SQLITE_STATIC) with C.CBytes+C.free — matching string binding pattern. Prevents potential GC-related unsoundness. |
+| `framework/sqlite/migrate` | **Growing** | Session 11 | Migration timing in Up/Down log messages. Added Pending(ctx) for dry-run/admin display. Improved error context: "statement 2/5: ..." with SQL dump. |
 
 ## Friction Log
 
@@ -139,6 +139,16 @@ Session 10 (middleware auth, notes app with JWT auth + role-based access, 11k no
 - [race] No data races detected with -race flag on all framework tests
 - [jwt overhead] ~0.5ms per verify (compare login 48k to 401 reject 66k — crypto is cheap)
 
+Session 11 (sqlite ops, bookmark manager with 25k rows):
+- [sqlite/GET stats] 55,751 req/s, p99 3.0ms — PRAGMA queries + os.Stat + pool stats
+- [sqlite/GET integrity] 878 req/s, p99 5.5ms — PRAGMA quick_check (full DB scan, admin-only)
+- [sqlite/POST checkpoint] sub-ms — WAL checkpoint with TRUNCATE mode
+- [sqlite/POST optimize] sub-ms — PRAGMA optimize
+- [sqlite/POST backup] p99 20ms — VACUUM INTO for 25k rows
+- [sqlite/GET list] 11,182 req/s, p99 7.8ms — paginated on 25k rows
+- [sqlite/POST create] 26,533 req/s, p99 8.3ms — JSON bind + INSERT
+- [memory] 65 MB RSS after 25k+ writes and 60k+ load test requests
+
 ## Design Decisions
 
 <!-- Key decisions and rationale so future sessions don't reverse them. Format:
@@ -199,6 +209,16 @@ Session 10 (middleware auth, notes app with JWT auth + role-based access, 11k no
 - [middleware] Auth/RequireRole error responses use inline JSON (same pattern as recover.go, ratelimit.go) to avoid circular import with parent http package. Error codes match the sentinel names: "unauthorized", "forbidden". (Session 10)
 - [middleware] Exported JWT error types (ErrTokenMalformed, ErrTokenExpired, ErrTokenInvalid, ErrSecretEmpty) allow service-layer code to distinguish failure modes — e.g., showing "Token expired" vs generic "Invalid token". (Session 10)
 
+- [sqlite] Stats() uses the read pool for PRAGMA queries to avoid blocking writes. File sizes via os.Stat are non-fatal (file might be briefly locked during checkpoint). Table/index counts exclude sqlite_* internal tables and _migrations. (Session 11)
+- [sqlite] Checkpoint uses TRUNCATE mode (not PASSIVE) — moves all frames AND truncates the WAL file to zero bytes. More aggressive but gives a clean state. Returns busy error if concurrent readers prevent full checkpoint. (Session 11)
+- [sqlite] Backup uses VACUUM INTO (not sqlite3_backup API) — produces a defragmented, self-contained copy. Runs on the write pool for consistent snapshot. Destination must not exist to prevent accidental overwrite. Partial files cleaned up on failure. (Session 11)
+- [sqlite] PRAGMA mmap_size=256MB added as a default — enables memory-mapped I/O for reads. Doesn't allocate 256MB upfront; it's the maximum mapping size. Safe on 64-bit systems (all target deployments). Configurable via DB_MMAP_SIZE env var. (Session 11)
+- [sqlite] Optimize() called automatically in the shutdown hook before Close(). SQLite docs recommend this — analyzes tables with stale statistics so the query planner has fresh data on next startup. Fire-and-forget (error ignored). (Session 11)
+- [sqlite] Config defaults registered via SetDefault in Load() for discoverability — config.Keys() and config.All() will include db.* keys. GetOr used with same defaults as fallback for the actual PRAGMA values. (Session 11)
+- [sqlite/driver] Blob binding changed from SQLITE_STATIC (nil destructor) to C.CBytes+C.free — matches the existing string binding pattern. SQLITE_STATIC tells SQLite the pointer is permanent, but Go GC can move/collect the backing array. C.CBytes copies to C heap where SQLite safely owns the memory. (Session 11)
+- [migrate] Pending() mirrors Status() but returns only unapplied migrations — useful for admin "N pending migrations" display or dry-run before deployment. (Session 11)
+- [migrate] Error messages now include statement index "statement 2/5: ..." — helps identify which SQL statement within a migration failed, especially useful for multi-statement migrations. (Session 11)
+
 ## Next Priorities
 
 <!-- What the last session thinks should come next, in order -->
@@ -210,7 +230,8 @@ Session 10 (middleware auth, notes app with JWT auth + role-based access, 11k no
 5. **Revisit `framework/config`** — consider config validation (type constraints, allowed values)
 6. **Revisit `framework/log`** — consider Query performance optimization (mmap/indexing), log sampling for high-traffic paths
 7. **Revisit `framework/db`** — fresh perspective on API ergonomics after http fully matures
-8. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
+8. **Revisit `framework/sqlite`** — consider: periodic auto-optimize (cron integration when cron package exists), connection pool health endpoint, PRAGMA runtime reconfiguration
+9. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
 
 ## In-Progress Work
 
