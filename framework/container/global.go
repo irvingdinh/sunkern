@@ -1,5 +1,10 @@
 package container
 
+import (
+	"fmt"
+	"runtime"
+)
+
 // global is the package-level singleton container. All exported generic
 // functions operate on this instance. Call Reset to clear state between
 // tests — the same pattern as config.Load.
@@ -9,14 +14,14 @@ var global = New()
 // called at most once, on the first Make or MustMake for T. Panics if T
 // is already registered.
 func Provide[T any](provider func() (T, error)) {
-	provideToContainer[T](global, provider)
+	provideToContainer[T](global, provider, captureCallerOf())
 }
 
 // Supply registers a pre-built value for type T. The value is available
 // immediately — no provider is called on resolution. Panics if T is
 // already registered.
 func Supply[T any](value T) {
-	supplyToContainer[T](global, value)
+	supplyToContainer[T](global, value, captureCallerOf())
 }
 
 // Make resolves type T from the global container. On first call the
@@ -38,13 +43,13 @@ func MustMake[T any]() T {
 // If T is not registered, it is registered as new. Intended for testing and
 // environment switching.
 func Override[T any](provider func() (T, error)) {
-	overrideToContainer[T](global, provider)
+	overrideToContainer[T](global, provider, captureCallerOf())
 }
 
 // OverrideSupply replaces the registration for type T with a pre-built
 // value. Same semantics as Override but without a lazy provider.
 func OverrideSupply[T any](value T) {
-	overrideSupplyToContainer[T](global, value)
+	overrideSupplyToContainer[T](global, value, captureCallerOf())
 }
 
 // Has reports whether type T is registered.
@@ -86,4 +91,26 @@ func Reset() {
 // functions instead.
 func Global() *Container {
 	return global
+}
+
+// captureCallerOf returns the file:line of the function that called the
+// function that called captureCallerOf. In the typical chain:
+//
+//	external.go:15 → container.Supply(v) → captureCallerOf()
+//
+// it returns "external.go:15".
+func captureCallerOf() string {
+	// skip: 0=captureCallerOf, 1=facade (Provide/Supply/etc), 2=external caller
+	_, file, line, ok := runtime.Caller(2)
+	if !ok {
+		return "unknown"
+	}
+	// Shorten to filename only for readability.
+	for i := len(file) - 1; i >= 0; i-- {
+		if file[i] == '/' {
+			file = file[i+1:]
+			break
+		}
+	}
+	return fmt.Sprintf("%s:%d", file, line)
 }

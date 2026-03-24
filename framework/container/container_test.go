@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -149,6 +150,17 @@ func TestDuplicateSupplyPanics(t *testing.T) {
 	})
 }
 
+func TestDuplicatePanicIncludesCaller(t *testing.T) {
+	resetContainer(t)
+
+	type Svc struct{}
+	Supply(&Svc{})
+
+	mustPanic(t, "container_test.go:", func() {
+		Supply(&Svc{})
+	})
+}
+
 func TestMakeError(t *testing.T) {
 	resetContainer(t)
 
@@ -255,11 +267,15 @@ func TestStartHooksOrder(t *testing.T) {
 		})
 	}
 
-	if err := global.StartHooks(context.Background()); err != nil {
+	reports, err := global.StartHooks(context.Background())
+	if err != nil {
 		t.Fatalf("StartHooks failed: %v", err)
 	}
 	if len(order) != 3 || order[0] != 0 || order[1] != 1 || order[2] != 2 {
 		t.Errorf("start order = %v, want [0 1 2]", order)
+	}
+	if len(reports) != 3 {
+		t.Errorf("reports count = %d, want 3", len(reports))
 	}
 }
 
@@ -277,11 +293,15 @@ func TestStopHooksReverse(t *testing.T) {
 		})
 	}
 
-	if err := global.StopHooks(context.Background()); err != nil {
+	reports, err := global.StopHooks(context.Background())
+	if err != nil {
 		t.Fatalf("StopHooks failed: %v", err)
 	}
 	if len(order) != 3 || order[0] != 2 || order[1] != 1 || order[2] != 0 {
 		t.Errorf("stop order = %v, want [2 1 0]", order)
+	}
+	if len(reports) != 3 {
+		t.Errorf("reports count = %d, want 3", len(reports))
 	}
 }
 
@@ -307,7 +327,7 @@ func TestStartHookRollback(t *testing.T) {
 		})
 	}
 
-	err := global.StartHooks(context.Background())
+	reports, err := global.StartHooks(context.Background())
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -318,6 +338,14 @@ func TestStartHookRollback(t *testing.T) {
 	}
 	if len(stopped) != 2 || stopped[0] != 1 || stopped[1] != 0 {
 		t.Errorf("stopped = %v, want [1 0]", stopped)
+	}
+
+	// Reports cover 3 hooks: 0 (ok), 1 (ok), 2 (failed).
+	if len(reports) != 3 {
+		t.Errorf("reports count = %d, want 3", len(reports))
+	}
+	if len(reports) == 3 && reports[2].Err == "" {
+		t.Error("expected error in last report")
 	}
 }
 
@@ -339,7 +367,7 @@ func TestStopHooksBestEffort(t *testing.T) {
 		})
 	}
 
-	err := global.StopHooks(context.Background())
+	_, err := global.StopHooks(context.Background())
 	if err == nil {
 		t.Fatal("expected error from stop hooks")
 	}
@@ -360,11 +388,20 @@ func TestHooksNilCallbacksSkipped(t *testing.T) {
 
 	AppendHook(Hook{OnStart: nil, OnStop: nil})
 
-	if err := global.StartHooks(context.Background()); err != nil {
+	reports, err := global.StartHooks(context.Background())
+	if err != nil {
 		t.Fatalf("StartHooks with nil callbacks: %v", err)
 	}
-	if err := global.StopHooks(context.Background()); err != nil {
+	if len(reports) != 0 {
+		t.Errorf("expected 0 reports for nil callbacks, got %d", len(reports))
+	}
+
+	reports, err = global.StopHooks(context.Background())
+	if err != nil {
 		t.Fatalf("StopHooks with nil callbacks: %v", err)
+	}
+	if len(reports) != 0 {
+		t.Errorf("expected 0 reports for nil callbacks, got %d", len(reports))
 	}
 }
 
@@ -476,7 +513,7 @@ func TestNamedHookErrorMessage(t *testing.T) {
 		},
 	})
 
-	err := global.StartHooks(context.Background())
+	_, err := global.StartHooks(context.Background())
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -495,7 +532,7 @@ func TestNamedHookStopErrorMessage(t *testing.T) {
 		},
 	})
 
-	err := global.StopHooks(context.Background())
+	_, err := global.StopHooks(context.Background())
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -607,6 +644,9 @@ func TestInspectPending(t *testing.T) {
 	if infos[0].Status != ServicePending {
 		t.Errorf("Status = %v, want Pending", infos[0].Status)
 	}
+	if infos[0].Kind != "provided" {
+		t.Errorf("Kind = %q, want %q", infos[0].Kind, "provided")
+	}
 	if infos[0].Error != nil {
 		t.Errorf("Error = %v, want nil", infos[0].Error)
 	}
@@ -644,6 +684,9 @@ func TestInspectFailed(t *testing.T) {
 	}
 	if infos[0].Error == nil || !strings.Contains(infos[0].Error.Error(), "broken") {
 		t.Errorf("Error = %v, want 'broken'", infos[0].Error)
+	}
+	if infos[0].ErrorText != "broken" {
+		t.Errorf("ErrorText = %q, want %q", infos[0].ErrorText, "broken")
 	}
 }
 
@@ -735,5 +778,253 @@ func TestInspectSupplied(t *testing.T) {
 	}
 	if infos[0].Status != ServiceBuilt {
 		t.Errorf("Supplied service status = %v, want Built", infos[0].Status)
+	}
+	if infos[0].Kind != "supplied" {
+		t.Errorf("Kind = %q, want %q", infos[0].Kind, "supplied")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ServiceInfo: Kind, Caller, JSON
+// ---------------------------------------------------------------------------
+
+func TestInspectCaller(t *testing.T) {
+	resetContainer(t)
+
+	type Svc struct{}
+	Provide(func() (*Svc, error) { return &Svc{}, nil })
+
+	infos := Inspect()
+	if len(infos) != 1 {
+		t.Fatalf("Inspect count = %d, want 1", len(infos))
+	}
+	// Caller should contain "container_test.go:" since we registered from this file.
+	if !strings.Contains(infos[0].Caller, "container_test.go:") {
+		t.Errorf("Caller = %q, want to contain %q", infos[0].Caller, "container_test.go:")
+	}
+}
+
+func TestInspectKindProvided(t *testing.T) {
+	resetContainer(t)
+
+	type Svc struct{}
+	Provide(func() (*Svc, error) { return &Svc{}, nil })
+
+	infos := Inspect()
+	if len(infos) != 1 {
+		t.Fatalf("Inspect count = %d, want 1", len(infos))
+	}
+	if infos[0].Kind != "provided" {
+		t.Errorf("Kind = %q, want %q", infos[0].Kind, "provided")
+	}
+}
+
+func TestInspectKindSupplied(t *testing.T) {
+	resetContainer(t)
+
+	Supply(42)
+
+	infos := Inspect()
+	if len(infos) != 1 {
+		t.Fatalf("Inspect count = %d, want 1", len(infos))
+	}
+	if infos[0].Kind != "supplied" {
+		t.Errorf("Kind = %q, want %q", infos[0].Kind, "supplied")
+	}
+}
+
+func TestOverrideUpdatesCaller(t *testing.T) {
+	resetContainer(t)
+
+	type Svc struct{}
+	Provide(func() (*Svc, error) { return &Svc{}, nil })
+
+	infos1 := Inspect()
+	caller1 := infos1[0].Caller
+
+	Override(func() (*Svc, error) { return &Svc{}, nil })
+
+	infos2 := Inspect()
+	caller2 := infos2[0].Caller
+
+	// Both should reference this test file, but potentially different lines.
+	if !strings.Contains(caller1, "container_test.go:") {
+		t.Errorf("caller1 = %q, want container_test.go", caller1)
+	}
+	if !strings.Contains(caller2, "container_test.go:") {
+		t.Errorf("caller2 = %q, want container_test.go", caller2)
+	}
+}
+
+func TestOverrideUpdatesKind(t *testing.T) {
+	resetContainer(t)
+
+	type Svc struct{ V int }
+	Provide(func() (*Svc, error) { return &Svc{V: 1}, nil })
+
+	infos := Inspect()
+	if infos[0].Kind != "provided" {
+		t.Errorf("Kind = %q, want %q", infos[0].Kind, "provided")
+	}
+
+	OverrideSupply(&Svc{V: 2})
+
+	infos = Inspect()
+	if infos[0].Kind != "supplied" {
+		t.Errorf("Kind after OverrideSupply = %q, want %q", infos[0].Kind, "supplied")
+	}
+}
+
+func TestServiceStatusMarshalJSON(t *testing.T) {
+	cases := []struct {
+		s    ServiceStatus
+		want string
+	}{
+		{ServicePending, `"pending"`},
+		{ServiceBuilt, `"built"`},
+		{ServiceFailed, `"failed"`},
+	}
+	for _, c := range cases {
+		got, err := json.Marshal(c.s)
+		if err != nil {
+			t.Fatalf("Marshal(%v) error: %v", c.s, err)
+		}
+		if string(got) != c.want {
+			t.Errorf("Marshal(%v) = %s, want %s", c.s, got, c.want)
+		}
+	}
+}
+
+func TestServiceInfoJSON(t *testing.T) {
+	resetContainer(t)
+
+	type Broken struct{}
+	Provide(func() (*Broken, error) { return nil, errors.New("oops") })
+	_, _ = Make[*Broken]()
+
+	infos := Inspect()
+	if len(infos) != 1 {
+		t.Fatalf("Inspect count = %d, want 1", len(infos))
+	}
+
+	data, err := json.Marshal(infos[0])
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("Unmarshal error: %v", err)
+	}
+
+	if m["status"] != "failed" {
+		t.Errorf("JSON status = %v, want %q", m["status"], "failed")
+	}
+	if m["kind"] != "provided" {
+		t.Errorf("JSON kind = %v, want %q", m["kind"], "provided")
+	}
+	if m["error"] != "oops" {
+		t.Errorf("JSON error = %v, want %q", m["error"], "oops")
+	}
+	if _, ok := m["caller"]; !ok {
+		t.Error("JSON missing caller field")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// HookReport
+// ---------------------------------------------------------------------------
+
+func TestHookReportTiming(t *testing.T) {
+	resetContainer(t)
+
+	AppendHook(Hook{
+		Name: "fast",
+		OnStart: func(_ context.Context) error {
+			return nil
+		},
+	})
+
+	reports, err := global.StartHooks(context.Background())
+	if err != nil {
+		t.Fatalf("StartHooks error: %v", err)
+	}
+	if len(reports) != 1 {
+		t.Fatalf("reports count = %d, want 1", len(reports))
+	}
+	if reports[0].Name != "fast" {
+		t.Errorf("report name = %q, want %q", reports[0].Name, "fast")
+	}
+	if reports[0].DurationMs < 0 {
+		t.Errorf("DurationMs = %d, want >= 0", reports[0].DurationMs)
+	}
+	if reports[0].Err != "" {
+		t.Errorf("report err = %q, want empty", reports[0].Err)
+	}
+}
+
+func TestHookReportJSON(t *testing.T) {
+	report := HookReport{
+		Name:       "sqlite",
+		DurationMs: 42,
+	}
+	data, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("Unmarshal error: %v", err)
+	}
+
+	if m["name"] != "sqlite" {
+		t.Errorf("JSON name = %v, want %q", m["name"], "sqlite")
+	}
+	if m["duration_ms"] != float64(42) {
+		t.Errorf("JSON duration_ms = %v, want 42", m["duration_ms"])
+	}
+	// error field should be omitted (empty)
+	if _, ok := m["error"]; ok {
+		t.Error("JSON should omit empty error field")
+	}
+}
+
+func TestStopHookReportsIncludeErrors(t *testing.T) {
+	resetContainer(t)
+
+	AppendHook(Hook{
+		Name: "ok-hook",
+		OnStop: func(_ context.Context) error {
+			return nil
+		},
+	})
+	AppendHook(Hook{
+		Name: "fail-hook",
+		OnStop: func(_ context.Context) error {
+			return fmt.Errorf("cleanup failed")
+		},
+	})
+
+	reports, err := global.StopHooks(context.Background())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if len(reports) != 2 {
+		t.Fatalf("reports count = %d, want 2", len(reports))
+	}
+
+	// Reports are in reverse order (fail-hook first, then ok-hook).
+	if reports[0].Name != "fail-hook" {
+		t.Errorf("first report name = %q, want %q", reports[0].Name, "fail-hook")
+	}
+	if reports[0].Err == "" {
+		t.Error("expected error in fail-hook report")
+	}
+	if reports[1].Name != "ok-hook" {
+		t.Errorf("second report name = %q, want %q", reports[1].Name, "ok-hook")
+	}
+	if reports[1].Err != "" {
+		t.Errorf("ok-hook should have no error, got %q", reports[1].Err)
 	}
 }

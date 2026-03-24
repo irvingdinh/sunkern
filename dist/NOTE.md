@@ -8,7 +8,7 @@
 
 ## Current State
 
-**Last session**: 2026-03-25 — Session 25 (framework/app revisited — health check system, ReadyCh, Env/Version, sqlite health auto-registered)
+**Last session**: 2026-03-25 — Session 26 (framework/container revisited — introspection enrichment, hook reports, caller tracking)
 **Working tree**: clean
 **Branch**: with-experiment
 
@@ -17,7 +17,7 @@
 | Package | Maturity | Last Touched | Notes |
 |---------|----------|--------------|-------|
 | `framework/app` | **Maturing** | Session 25 | Revisited: health check system (HealthChecker/CheckFunc/HealthReport, concurrent CheckHealth, AddHealthCheck), ReadyCh() symmetric with ShuttingDown(), Env()/Version() with config integration, sqlite health auto-registered, startup log includes env/health_checks/version. Previous (Session 13): *App supplied to container, boot/shutdown timing, startup summary. Previous: ModuleGroup boot rollback fix, lifecycle logging |
-| `framework/container` | **Maturing** | Session 13 | Revisited: introspection APIs (Keys, Inspect, Len), ServiceInfo/ServiceStatus types, Hooks() accessor. Previous: Override/OverrideSupply, named hooks, all framework hooks named |
+| `framework/container` | **Maturing** | Session 26 | Revisited: ServiceInfo enriched with JSON tags, Kind (supplied/provided), Caller (file:line), ErrorText; ServiceStatus.MarshalJSON; HookReport with per-hook timing from StartHooks/StopHooks; caller tracking in Provide/Supply/Override (runtime.Caller); duplicate-registration panics show both original+duplicate call sites; app.go logs hook start/stop at Debug level. Previous (Session 13): introspection APIs (Keys, Inspect, Len), ServiceInfo/ServiceStatus types, Hooks() accessor. Previous: Override/OverrideSupply, named hooks, all framework hooks named |
 | `framework/config` | **Maturing** | Session 16 | Revisited: config validation (AddRule, Validate, 10 built-in rules: Required, NotEmpty, Positive, NonNegative, OneOf, Min, Max, Range, MinLen, MaxLen). Rule type is a function — composable, zero boilerplate. Validate() integrated into app lifecycle after framework init, before module Boot. Previous (Session 7): Has, All, Keys, Sub, DataDir, EnvName, SetDefaults; Load creates data dir; improved panic messages |
 | `framework/log` | **Maturing** | Session 17 | Revisited: buffered file writer (64KB bufio.Writer + 200ms periodic flush goroutine — ~145k log writes/sec), Flush() export, Query improvements (Order desc/asc, After/Before time range, CountOnly mode). Previous (Session 8): Separate console/file levels, log file management, JSONL entry parsing + querying |
 | `framework/http` | **Maturing** | Session 14 | Revisited: SSE support (NewEventStream, SSEWriter with Send/SendJSON/Heartbeat/Retry/Done, LastEventID, write deadline extension via ResponseController, ErrStreamingNotSupported sentinel). Previous (Session 10): Bind/BindForm MaxBytesError → 413. Previous: file upload handling, all sentinels |
@@ -298,6 +298,16 @@ Session 25 (app revisit, health monitor with heartbeat worker, custom health che
 - [race] No data races detected with -race flag on concurrent health + CRUD + heartbeat writer
 - [ReadyCh] Heartbeat worker confirmed: started only after ReadyCh closed, stopped cleanly on ShuttingDown
 
+Session 26 (container revisit, service registry dashboard with introspection endpoints, 101 tasks):
+- [container/GET services] 66,854 req/s, p99 2.4ms — Inspect() with 8 services, new Kind+Caller+ErrorText+JSON tags
+- [container/GET inspect-all] 60,420 req/s, p99 2.5ms — Inspect() + Keys() + Health() + Hooks() combined
+- [container/GET health] 69,889 req/s, p99 2.5ms — concurrent CheckHealth (sqlite + fake-cache)
+- [tasks/GET list] 20,670 req/s, p99 33.2ms — paginated list on 101 rows
+- [tasks/POST create] 32,867 req/s, p99 2.5ms — JSON bind + INSERT
+- [memory] 46 MB RSS after 200k+ requests, stable (no leak)
+- [introspection comparison] Session 13: 59k req/s for Inspect(5 services). Session 26: 67k req/s for Inspect(8 services) + Kind+Caller fields — no regression despite richer ServiceInfo
+- [JSON serialization] ServiceStatus MarshalJSON verified at init: "built"/"pending"/"failed" strings, omitempty for empty error
+
 ## Design Decisions
 
 <!-- Key decisions and rationale so future sessions don't reverse them. Format:
@@ -476,14 +486,22 @@ Session 25 (app revisit, health monitor with heartbeat worker, custom health che
 - [app] Sqlite health check auto-registered in run() right after sunkerndb.Load() — uses CheckFunc adapter wrapping sunkerndb.Global().Health. Framework manages its own health checks; modules add custom ones. (Session 25)
 - [app] Startup log uses variadic []any for attrs to conditionally include "version" only when set. Avoids empty version field in JSON output for apps that don't set it. env, health_checks always included. (Session 25)
 
+- [container] ServiceInfo enriched with Kind ("supplied"/"provided") and Caller ("file.go:42"). Kind is derived from the registration method: Provide/Override → "provided", Supply/OverrideSupply → "supplied". Stored on the internal service struct, not computed at query time — Inspect() just copies values. (Session 26)
+- [container] Caller captured via runtime.Caller(2) in captureCallerOf(), called from each facade function (Provide/Supply/Override/OverrideSupply). Skip=2: 0=captureCallerOf, 1=facade, 2=external caller. Filename shortened to basename only (last "/" segment) for readability. (Session 26)
+- [container] Duplicate-registration panics now include both locations: "duplicate provider for *Svc (registered at app.go:181, duplicate at module.go:15)". The original caller is stored on the service struct; the new caller is captured fresh. This is the #1 debugging aid — instantly tells you where the conflict is. (Session 26)
+- [container] HookReport is a value type with Name, DurationMs, Err (string). StartHooks/StopHooks signatures changed from `error` to `([]HookReport, error)`. Only app.go calls these — easy migration. Reports cover only executed hooks (nil callbacks skipped). Rollback reports from StartHooks failure are discarded — only start-phase reports returned. (Session 26)
+- [container] ServiceStatus.MarshalJSON added so JSON output uses "pending"/"built"/"failed" strings instead of integer 0/1/2. No UnmarshalJSON — ServiceInfo is output-only (admin API). ServiceInfo.ErrorText is the string representation of Error for JSON; Error field has `json:"-"` tag. (Session 26)
+- [container] hookLabel changed to return unquoted names; error messages use %q for consistent quoting. Output: `starting hook "database": connection refused` (same as before for named hooks). Positional fallback: `starting hook "2": ...` (now quoted, was unquoted). Minor cosmetic improvement. (Session 26)
+- [container] App.go now logs hook start/stop at Debug level with per-hook name and timing. This provides startup/shutdown observability without polluting normal (Info) output. Example: `hook started hook=http took_ms=0`. (Session 26)
+
 ## Next Priorities
 
 <!-- What the last session thinks should come next, in order -->
 
-1. **Revisit `framework/container`** — last touched Session 13 (12 sessions ago — most stale). Fresh eyes on the API after all the evolution since
-2. **Revisit `framework/db`** — raw RETURNING with db.Raw columns. CTE done. Consider: INSERT...SELECT builder, upsert improvements
-3. **Revisit `framework/http`** — SSE broker/hub pattern as a higher-level abstraction (manages multiple connections, fan-out from event source, stats), once event bus exists
-4. **Revisit `framework/app`** — lifecycle hooks for plugins (pre-boot, post-boot callbacks), module dependency declaration, boot order optimization. Health check system done
+1. **Revisit `framework/db`** — raw RETURNING with db.Raw columns. CTE done. Consider: INSERT...SELECT builder, upsert improvements
+2. **Revisit `framework/http`** — SSE broker/hub pattern as a higher-level abstraction (manages multiple connections, fan-out from event source, stats), once event bus exists
+3. **Revisit `framework/app`** — lifecycle hooks for plugins (pre-boot, post-boot callbacks), module dependency declaration, boot order optimization. Health check system done
+4. **Revisit `framework/config`** — last touched Session 16 (10 sessions ago). Config watching (detect file changes), environment-specific config files, config dump endpoint for admin
 5. **Revisit `framework/log`** — log sampling handler for high-traffic paths, mmap-based query for very large files (deferred — current linear scan is acceptable for admin viewer with daily rotation)
 6. **Revisit `framework/sqlite`** — PRAGMA runtime reconfiguration (cache_size, mmap_size changes without restart), table-level size stats for admin dashboard
 7. **Revisit `framework/sqlite/migrate`** — migration versioning validation (detect gaps, detect orphaned DB records), checksum mismatch warnings in Up() log output, batch status queries

@@ -233,9 +233,13 @@ func (a *App) run() error {
 
 	// Phase 4: Start lifecycle hooks.
 	ctx := context.Background()
-	if err := container.Global().StartHooks(ctx); err != nil {
+	hookReports, err := container.Global().StartHooks(ctx)
+	if err != nil {
 		_ = a.shutdownModules(context.Background())
 		return fmt.Errorf("start hooks: %w", err)
+	}
+	for _, r := range hookReports {
+		slog.Debug("hook started", "hook", r.Name, "took_ms", r.DurationMs)
 	}
 
 	a.ready.Store(true)
@@ -267,8 +271,16 @@ func (a *App) run() error {
 	defer cancel()
 
 	var errs []error
-	if err := container.Global().StopHooks(shutdownCtx); err != nil {
-		errs = append(errs, err)
+	stopReports, stopErr := container.Global().StopHooks(shutdownCtx)
+	if stopErr != nil {
+		errs = append(errs, stopErr)
+	}
+	for _, r := range stopReports {
+		attrs := []any{"hook", r.Name, "took_ms", r.DurationMs}
+		if r.Err != "" {
+			attrs = append(attrs, "error", r.Err)
+		}
+		slog.Debug("hook stopped", attrs...)
 	}
 	if err := a.shutdownModules(shutdownCtx); err != nil {
 		errs = append(errs, err)

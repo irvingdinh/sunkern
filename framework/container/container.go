@@ -6,6 +6,12 @@ import (
 	"sync"
 )
 
+// Registration kind constants.
+const (
+	kindProvided = "provided" // lazy singleton with factory function
+	kindSupplied = "supplied" // pre-built value, available immediately
+)
+
 // service holds a lazily-initialized singleton. The provider is called at
 // most once; subsequent resolutions return the cached instance. If the
 // provider fails, the error is cached and returned on all future calls —
@@ -15,6 +21,8 @@ type service struct {
 	instance any
 	err      error // cached provider error (nil on success)
 	built    bool
+	kind     string // kindProvided or kindSupplied
+	caller   string // "file.go:42" — registration call site
 	mu       sync.Mutex // protects lazy init (per-service, not global)
 }
 
