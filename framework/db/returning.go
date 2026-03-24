@@ -60,13 +60,19 @@ func ReturningAll[T any](ctx context.Context, q Querier, b returnable) ([]T, err
 	return scanAll[T](rows)
 }
 
-// writeReturning appends " RETURNING col1, col2, ..." to the buffer.
-func writeReturning(buf *strings.Builder, cols []column) {
+// writeReturning appends " RETURNING expr1, expr2, ..." to the buffer.
+// Column types use unqualified names (just "col", not "table"."col") per
+// SQLite RETURNING convention. Other expressions use WriteSQL as-is.
+func writeReturning(buf *strings.Builder, args *[]any, exprs []Expr) {
 	buf.WriteString(" RETURNING ")
-	for i, col := range cols {
+	for i, expr := range exprs {
 		if i > 0 {
 			buf.WriteString(", ")
 		}
-		buf.WriteString(quoteIdent(col.columnName()))
+		if col, ok := expr.(column); ok {
+			buf.WriteString(quoteIdent(col.columnName()))
+		} else {
+			expr.WriteSQL(buf, args)
+		}
 	}
 }

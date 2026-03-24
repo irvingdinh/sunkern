@@ -15,7 +15,7 @@ type UpdateBuilder struct {
 	table     *TableInfo
 	sets      []setClause
 	where     []Expr
-	returning []column
+	returning []Expr
 	ctes      []*CTEDef
 }
 
@@ -204,20 +204,27 @@ func (b *UpdateBuilder) Build() (string, []any, error) {
 
 	// RETURNING
 	if len(b.returning) > 0 {
-		writeReturning(&buf, b.returning)
+		writeReturning(&buf, &args, b.returning)
 	}
 
 	return buf.String(), args, nil
 }
 
-// Returning sets the columns to return from the UPDATE. Use with the
-// package-level Returning or ReturningAll functions to scan the results.
+// Returning sets the columns or expressions to return from the UPDATE. Use
+// with the package-level Returning or ReturningAll functions to scan results.
 //
 //	q := db.Update(&Users.TableInfo).Set(Users.Name, "New").
 //	    Where(Users.ID.Eq(id)).Returning(Users.ID, Users.Name, Users.UpdatedAt)
 //	updated, err := db.Returning[User](ctx, writeDB, q)
-func (b *UpdateBuilder) Returning(cols ...column) *UpdateBuilder {
-	b.returning = cols
+func (b *UpdateBuilder) Returning(exprs ...Expr) *UpdateBuilder {
+	b.returning = exprs
+	return b
+}
+
+// ReturningStar adds RETURNING * to the UPDATE, returning all columns of
+// each updated row.
+func (b *UpdateBuilder) ReturningStar() *UpdateBuilder {
+	b.returning = []Expr{Raw("*")}
 	return b
 }
 

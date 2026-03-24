@@ -12,7 +12,7 @@ import (
 type DeleteBuilder struct {
 	table     *TableInfo
 	where     []Expr
-	returning []column
+	returning []Expr
 	ctes      []*CTEDef
 }
 
@@ -54,20 +54,27 @@ func (b *DeleteBuilder) Build() (string, []any, error) {
 
 	// RETURNING
 	if len(b.returning) > 0 {
-		writeReturning(&buf, b.returning)
+		writeReturning(&buf, &args, b.returning)
 	}
 
 	return buf.String(), args, nil
 }
 
-// Returning sets the columns to return from the DELETE. Use with the
-// package-level Returning or ReturningAll functions to scan the results.
+// Returning sets the columns or expressions to return from the DELETE. Use
+// with the package-level Returning or ReturningAll functions to scan results.
 //
 //	q := db.Delete(&Users.TableInfo).Where(Users.ID.Eq(id)).
 //	    Returning(Users.ID, Users.Email)
 //	deleted, err := db.Returning[User](ctx, writeDB, q)
-func (b *DeleteBuilder) Returning(cols ...column) *DeleteBuilder {
-	b.returning = cols
+func (b *DeleteBuilder) Returning(exprs ...Expr) *DeleteBuilder {
+	b.returning = exprs
+	return b
+}
+
+// ReturningStar adds RETURNING * to the DELETE, returning all columns of
+// each deleted row.
+func (b *DeleteBuilder) ReturningStar() *DeleteBuilder {
+	b.returning = []Expr{Raw("*")}
 	return b
 }
 
