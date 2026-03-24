@@ -10,7 +10,13 @@ You MUST complete ALL of the following steps at the start of every conversation,
 2. **Read `Makefile`** — use the workflows defined here. Do not invent commands.
 3. **Load the `go-best-practices` skill** — always, regardless of the task.
 4. **Explore the repository** — walk the actual file tree and read key files to understand the current state of the implementation. Documents and design notes can be outdated or aspirational. The code is the source of truth. Do not assume something exists because IDEA.md says it will — verify by reading the code.
-5. **Start the service and test with `curl`** — after making any changes, you MUST start the service and use `curl` to verify the changes work against the real running application. No exceptions. When planning work, always include this verification step in the plan.
+
+## Testing and verification
+
+These rules apply whenever you implement, change, or test anything. Always include these steps in your plan.
+
+- **Use an isolated data directory.** Multiple Sunkern-based projects may run on this machine simultaneously. NEVER use the default `~/.standalone`. Instead, create a temporary directory (e.g. `DATA_DIR=/tmp/sunkern_data_<random>`) at the start of each session and use it for all runs. This prevents data collisions between concurrent projects.
+- **Start the service and test with `curl`.** After making any changes, you MUST start the service and use `curl` to verify the changes work against the real running application. No exceptions.
 
 ## Reference materials
 

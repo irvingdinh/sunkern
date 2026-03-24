@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"sync"
@@ -15,6 +15,7 @@ import (
 	"sunkern.local/framework/config"
 	"sunkern.local/framework/container"
 	sunkernhttp "sunkern.local/framework/http"
+	sunkernlog "sunkern.local/framework/log"
 )
 
 // App orchestrates the full lifecycle of a Sunkern application. It manages
@@ -90,7 +91,9 @@ func (a *App) ShuttingDown() <-chan struct{} {
 // caller never handles the error.
 func (a *App) Run() {
 	if err := a.run(); err != nil {
-		log.Fatal(err)
+		slog.Error("fatal error", "error", err)
+		sunkernlog.Close()
+		os.Exit(1)
 	}
 }
 
@@ -111,6 +114,10 @@ func (a *App) run() error {
 	// initialized by its package init — no Reset() needed here. Reset()
 	// exists solely for tests that need a clean container between cases.
 	config.Load()
+
+	if err := sunkernlog.Init(); err != nil {
+		return fmt.Errorf("init log: %w", err)
+	}
 
 	// Phase 1: Register all modules. Every module's Register() runs before
 	// any module's Boot(). Only container.Provide / config.SetDefault calls
@@ -141,11 +148,13 @@ func (a *App) run() error {
 	}
 
 	a.ready.Store(true)
+	slog.Info("application started", "log_type", "lifecycle", "addr", config.GetOr[string]("http.addr", sunkernhttp.DefaultAddr))
 
 	// Phase 5: Wait for shutdown signal.
 	a.waitForSignal()
 
 	// Phase 6: Graceful shutdown.
+	slog.Info("shutting down", "log_type", "lifecycle")
 	a.shutdown.once.Do(func() { close(a.shutdown.ch) })
 	a.ready.Store(false)
 

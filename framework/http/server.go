@@ -3,13 +3,17 @@ package http
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"net"
 	httpstd "net/http"
 
 	"sunkern.local/framework/config"
 	"sunkern.local/framework/container"
+	"sunkern.local/framework/http/middleware"
 )
+
+// DefaultAddr is the default HTTP listen address.
+const DefaultAddr = ":19110"
 
 // Server is the framework's HTTP server abstraction.
 type Server interface{}
@@ -18,16 +22,20 @@ type Server interface{}
 // a Server. It reads the listen address from config (key "http.addr",
 // default ":19110"). Intended to be registered via container.Provide.
 func NewServer() (Server, error) {
-	addr := config.GetOr[string]("http.addr", ":19110")
+	addr := config.GetOr[string]("http.addr", DefaultAddr)
 
 	mux := httpstd.NewServeMux()
 	mux.HandleFunc("/", func(w httpstd.ResponseWriter, r *httpstd.Request) {
 		w.WriteHeader(httpstd.StatusOK)
 	})
 
+	var handler httpstd.Handler = mux
+	handler = middleware.RequestLogger(handler)
+	handler = middleware.RequestID(handler)
+
 	srv := &httpstd.Server{
 		Addr:    addr,
-		Handler: mux,
+		Handler: handler,
 	}
 
 	container.AppendHook(container.Hook{
@@ -38,7 +46,8 @@ func NewServer() (Server, error) {
 			}
 			go func() {
 				if err := srv.Serve(ln); err != nil && !errors.Is(err, httpstd.ErrServerClosed) {
-					log.Panic(err.Error())
+					slog.Error("http: serve error", "error", err)
+					panic(err)
 				}
 			}()
 			return nil

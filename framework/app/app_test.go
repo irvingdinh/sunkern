@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"sunkern.local/framework/container"
+	sunkernlog "sunkern.local/framework/log"
 )
 
 // ---------------------------------------------------------------------------
@@ -63,6 +64,7 @@ func newTestApp(t *testing.T) *App {
 	t.Setenv("DATA_DIR", t.TempDir())
 	t.Setenv("HTTP_ADDR", ":0") // random port to avoid conflicts between tests
 	container.Reset()
+	sunkernlog.Reset()
 	a := New()
 	a.signalCtxFunc = func() (context.Context, context.CancelFunc) {
 		ctx, cancel := context.WithCancel(context.Background())
