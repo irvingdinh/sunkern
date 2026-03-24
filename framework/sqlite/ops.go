@@ -7,6 +7,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"sunkern.local/framework/sqlite/driver"
 )
 
 // Stats holds diagnostic information about the SQLite database. All fields
@@ -34,6 +36,12 @@ type Stats struct {
 	WritePool PoolStats `json:"write_pool"`
 	// ReadPool reports the read connection pool status.
 	ReadPool PoolStats `json:"read_pool"`
+	// MemoryUsed is the current SQLite memory allocation in bytes (global,
+	// across all connections in this process).
+	MemoryUsed int64 `json:"memory_used"`
+	// MemoryHighwater is the peak SQLite memory allocation in bytes since
+	// process start.
+	MemoryHighwater int64 `json:"memory_highwater"`
 }
 
 // PoolStats summarizes the state of a database/sql connection pool.
@@ -51,9 +59,11 @@ type PoolStats struct {
 // writes.
 func (db *DB) Stats() (Stats, error) {
 	s := Stats{
-		Path:      db.path,
-		WritePool: poolStatsFrom(db.write.Stats()),
-		ReadPool:  poolStatsFrom(db.read.Stats()),
+		Path:            db.path,
+		WritePool:       poolStatsFrom(db.write.Stats()),
+		ReadPool:        poolStatsFrom(db.read.Stats()),
+		MemoryUsed:      driver.MemoryUsed(),
+		MemoryHighwater: driver.MemoryHighwater(false),
 	}
 
 	// File sizes — errors are non-fatal (file might be briefly locked).

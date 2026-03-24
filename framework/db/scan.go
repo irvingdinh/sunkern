@@ -242,10 +242,14 @@ func setField(field reflect.Value, rawVal any) error {
 		case string:
 			t, err := time.Parse(timeFormat, v)
 			if err != nil {
-				// Try RFC3339 as fallback.
-				t, err = time.Parse(time.RFC3339, v)
+				// Try with milliseconds (driver writes "2006-01-02 15:04:05.000").
+				t, err = time.Parse(timeFormatMs, v)
 				if err != nil {
-					return fmt.Errorf("parse time %q: %w", v, err)
+					// Try RFC3339 as final fallback.
+					t, err = time.Parse(time.RFC3339, v)
+					if err != nil {
+						return fmt.Errorf("parse time %q: %w", v, err)
+					}
 				}
 			}
 			field.Set(reflect.ValueOf(t))

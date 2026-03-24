@@ -13,9 +13,15 @@ import (
 	"errors"
 )
 
-// timeFormat is the canonical SQLite TEXT timestamp format. It matches the
-// CGo driver's time.Time bind format (framework/sqlite/driver/driver.go:255).
+// timeFormat is the canonical SQLite TEXT timestamp format used by the db
+// package for writing timestamps (Model, FormatTime). Existing data and
+// SQLite's datetime('now') DEFAULT produce this format.
 const timeFormat = "2006-01-02 15:04:05"
+
+// timeFormatMs is the timestamp format with millisecond precision. The CGo
+// driver uses this for time.Time bindings (framework/sqlite/driver). The
+// scan layer tries both formats when parsing timestamps.
+const timeFormatMs = "2006-01-02 15:04:05.000"
 
 // ErrNotFound is returned by QueryOne/ScanOne when no rows match the query.
 var ErrNotFound = errors.New("db: not found")

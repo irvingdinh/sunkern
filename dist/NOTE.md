@@ -8,7 +8,7 @@
 
 ## Current State
 
-**Last session**: 2026-03-24 — Session 18 (framework/sqlite revisited — maintenance goroutine, Health())
+**Last session**: 2026-03-25 — Session 20 (framework/sqlite/driver revisited — structured errors, context cancellation, memory stats, time format)
 **Working tree**: clean
 **Branch**: with-experiment
 
@@ -24,8 +24,8 @@
 | `framework/http/middleware` | **Maturing** | Session 15 | Revisited: Timeout (context deadline per route), PBKDF2-SHA256 password hashing (HashPassword/CheckPassword, 600k iterations, PHC format, stdlib-only), APIToken middleware (opaque bearer tokens with DB lookup via TokenLookup callback), GenerateToken (32-byte random hex). Previous (Session 10): JWT (HMAC-SHA256 sign/verify, Claims, context helpers), Auth (Bearer token + user_id logging), RequireRole (role-based 403), MaxBytes (body size limiter). Plus existing: RequestID, RequestLogger, Recover, CORS, RateLimit |
 | `framework/db` | **Maturing** | Session 12 | Revisited: RETURNING clause (INSERT/UPDATE/DELETE), subqueries (IN, NOT IN, EXISTS, NOT EXISTS), CASE expressions (searched + simple). Previous (Session 5): deterministic column order, generalized pointer handling, SetNull, ModelSlice batch insert, NullBoolColumn/NullFloatColumn, cursor pagination (After + HasMore) |
 | `framework/sqlite` | **Maturing** | Session 18 | Revisited: background maintenance goroutine (periodic PRAGMA optimize + WAL auto-checkpoint when WAL exceeds threshold), Health(ctx) for readiness checks, 2 new config keys (db.optimize_interval, db.wal_checkpoint_threshold). Maintenance lifecycle managed by container hooks (OnStart/OnStop). Previous (Session 11): Stats, Checkpoint, Optimize, IntegrityCheck, Backup. Configurable PRAGMAs. |
-| `framework/sqlite/driver` | **Growing** | Session 11 | Fixed blob binding: replaced nil (SQLITE_STATIC) with C.CBytes+C.free — matching string binding pattern. Prevents potential GC-related unsoundness. |
-| `framework/sqlite/migrate` | **Growing** | Session 11 | Migration timing in Up/Down log messages. Added Pending(ctx) for dry-run/admin display. Improved error context: "statement 2/5: ..." with SQL dump. |
+| `framework/sqlite/driver` | **Maturing** | Session 20 | Revisited: structured Error type with primary+extended result codes (Code/ExtendedCode/Message), context cancellation via sqlite3_interrupt (ExecContext/QueryContext on conn+stmt), MemoryUsed/MemoryHighwater exported functions, time.Time bind with ms precision + UTC, extended result codes enabled per connection, nil guards on Close, compile-time interface assertions. Previous (Session 11): blob binding safety fix (CBytes+C.free pattern). |
+| `framework/sqlite/migrate` | **Maturing** | Session 19 | Revisited: SHA-256 checksums (drift detection via Dirty field), execution_ms tracking, UpTo/DownTo/Version/Redo methods, MigrationStatus enriched with HasDown/StmtCount/Checksum/Dirty/ExecutionMs + JSON tags, backward-compatible schema upgrade (ALTER TABLE ADD COLUMN), Checksum() exported, applyUp/applyDown split, *Engine supplied to container. Previous (Session 11): migration timing, Pending(), error context with statement index. |
 
 ## Friction Log
 
@@ -222,6 +222,26 @@ Session 18 (sqlite revisit, bookmark manager with health + DB ops, 5500 rows):
 - [maintenance] 18 optimize ticks during load test (3s interval), 2 auto-checkpoints triggered (50KB WAL threshold)
 - [shutdown] Maintenance goroutine stopped cleanly before DB close
 
+Session 19 (migrate revisit, migration dashboard with 5 migrations):
+- [migrate/GET status] 29,620 req/s, p99 4.2ms — DB query + checksum computation per migration (5 migrations)
+- [migrate/GET version] 36,874 req/s, p99 — single-row MAX query
+- [migrate/GET pending] 37,121 req/s, p99 — lightweight applied-versions check
+- [migrate/mutation cycles] 100 rapid down/up cycles completed cleanly
+- [memory] 25 MB RSS after mutation stress test
+- [race] No data races detected with -race flag on concurrent status reads + down/up/redo writes
+- [dirty detection] Verified: tampered DB checksum → only affected migration shows dirty=True
+- [concurrent redo] Serialized by SQLite write lock; some expected SQL errors, no data races
+
+Session 20 (driver revisit, events app with structured errors + context cancel + memory stats, 5k rows):
+- [driver/GET list] 3,303 req/s, p99 40ms — paginated list on 5k rows (COUNT + SELECT)
+- [driver/GET single] 55,897 req/s, p99 2.8ms — single read by ID
+- [driver/GET stats] 51,001 req/s, p99 3.1ms — Stats() with memory_used + memory_highwater
+- [driver/GET error-codes] 22,711 req/s, p99 3.5ms — INSERT + duplicate INSERT + *Error extraction per request
+- [driver/slow-query cancel] 746 req/s, p99 41ms — 10M-row CTE interrupted at 10ms timeout via sqlite3_interrupt
+- [driver/context-cancel] 50ms timeout correctly interrupts 884ms query; pre-cancelled context returns context.DeadlineExceeded
+- [memory] SQLite memory_used: 22 MB, memory_highwater: 23 MB after 5k+ writes and 30k+ load test requests
+- [race] No data races detected with -race flag on concurrent CRUD + error extraction + context cancellation + stats
+
 ## Design Decisions
 
 <!-- Key decisions and rationale so future sessions don't reverse them. Format:
@@ -347,17 +367,36 @@ Session 18 (sqlite revisit, bookmark manager with health + DB ops, 5500 rows):
 - [sqlite] Maintenance lifecycle: created in Load(), started in container OnStart hook, stopped in OnStop hook (before final Optimize + Close). Same hook name "sqlite" — merged start and stop into one hook. Maintenance goroutine always stops before DB closes. (Session 18)
 - [sqlite] optimize_interval logged in startup Info message alongside other PRAGMA values. Maintenance start logged at Debug level (not cluttering normal operation). Periodic optimize at Debug, periodic checkpoint at Info (checkpoint is a notable event). (Session 18)
 
+- [migrate] Checksum is SHA-256 of parsed Up+Down statements (not raw file content). Truncated to 128-bit (32 hex chars) — sufficient for change detection, not security. Content-based hashing means whitespace/comment-only changes don't trigger false positives. Up and Down sections separated by null byte in the hash input. (Session 19)
+- [migrate] Dirty detection: Status() compares stored checksum vs current file checksum. Empty DB checksum (from pre-tracking era) is NOT considered dirty — graceful upgrade path for existing databases. Only non-empty mismatches are flagged. (Session 19)
+- [migrate] execution_ms uses millisecond granularity (time.Since().Milliseconds()). Sub-ms migrations show 0 — this is correct; the unit matches production migration timing expectations. Microseconds would add false precision for a metric that's only meaningful for slow migrations. (Session 19)
+- [migrate] ensureTable does CREATE TABLE IF NOT EXISTS with the full schema (including new columns), then two ALTER TABLE ADD COLUMN calls that silently fail on duplicates. This handles both fresh installs and upgrades from the old 3-column schema. No version tracking for the _migrations table itself — the upgrade is idempotent. (Session 19)
+- [migrate] applyUp/applyDown split: Up path needs checksum computation + execution timing + INSERT with 4 columns. Down path just executes statements + DELETE. Splitting eliminates the Direction parameter and makes each path self-documenting. The old Direction type is still exported (used by parse.go) but no longer used internally by the engine. (Session 19)
+- [migrate] DownTo(version) keeps the target version applied (exclusive lower bound). DownTo(0) rolls back everything — natural extension since version 0 means "no migrations". UpTo(version) is inclusive upper bound — the target version gets applied. (Session 19)
+- [migrate] Redo() finds the last applied version via Version(), looks it up in collected migrations, then calls applyDown + applyUp. If the migration file was modified between runs, the new content gets applied and a fresh checksum is recorded — correct behavior for the development iteration use case. (Session 19)
+- [migrate] *Engine supplied to container via container.Supply(migrationEngine) in app.go, right after Up() completes. Admin modules resolve via container.MustMake[*migrate.Engine]() to access Status/Pending/Version for dashboard display and Down/Redo for admin-controlled rollbacks. (Session 19)
+- [migrate] MigrationStatus has JSON tags — ready for direct serialization in admin API responses. ExecutionMs and AppliedAt use omitempty so unapplied migrations return clean JSON without zero-value noise. (Session 19)
+
+- [driver] Error type uses primary code (lower 8 bits) and extended code (full int). Primary code enables broad matching (CodeConstraint=19), extended enables specific matching (CodeConstraintUnique=2067). sqlite3_extended_result_codes() enabled per connection so sqlite3_extended_errcode() returns detailed sub-codes. (Session 20)
+- [driver] Context cancellation uses watchCtx pattern: goroutine watches ctx.Done(), calls sqlite3_interrupt(db) on cancellation. sqlite3_interrupt is documented as thread-safe (callable from different thread/goroutine). For ExecContext, goroutine is stopped immediately after step. For QueryContext, goroutine lives until rows.Close() — necessary because rows.Next() calls sqlite3_step() which may take time. (Session 20)
+- [driver] conn.QueryContext creates a prepared statement and returns rows that own the stmt (closeStmt=true). The stmt is finalized when rows are closed. This is the standard pattern for database/sql drivers that implement QueryerContext. (Session 20)
+- [driver] rows.Next() checks for SQLITE_INTERRUPT and returns ctx.Err() if the context was cancelled, or the raw SQLite error otherwise. This ensures database/sql receives the expected context error for proper cancellation handling. (Session 20)
+- [driver] time.Time binding uses UTC + millisecond format ("2006-01-02 15:04:05.000"). UTC eliminates timezone ambiguity in stored data. Milliseconds match the sub-second precision Go code typically uses. db.scan updated with timeFormatMs fallback — parses both old format (no ms) and new format (with ms). db.FormatTime still writes old format for backward compatibility; driver format is for direct time.Time bindings through database/sql. (Session 20)
+- [driver] MemoryUsed() and MemoryHighwater() are global SQLite functions (not per-connection). Exposed in driver package (where CGo lives), consumed by sqlite.Stats(). MemoryHighwater accepts a reset bool — admin dashboard can reset peak tracking. (Session 20)
+- [driver] Compile-time interface assertions added: conn implements ExecerContext + QueryerContext, stmt implements StmtExecContext + StmtQueryContext. Catches interface drift at compile time rather than runtime. (Session 20)
+- [driver] Nil guards added to conn.Close() and stmt.Close() — safe to call multiple times. conn.Close() captures error message before nilling db pointer. (Session 20)
+
 ## Next Priorities
 
 <!-- What the last session thinks should come next, in order -->
 
-1. **Revisit `framework/sqlite/driver`** — still "Growing", review blob/string binding, consider additional SQLite APIs (e.g., sqlite3_busy_handler, sqlite3_wal_hook for proactive monitoring)
-2. **Revisit `framework/sqlite/migrate`** — still "Growing", consider migration rollback UI, admin-visible migration history, dry-run mode
-3. **Revisit `framework/db`** — JOINs with RETURNING (currently untested), raw RETURNING with db.Raw columns, COALESCE/IFNULL expressions, window functions
-4. **Revisit `framework/http`** — SSE broker/hub pattern as a higher-level abstraction (manages multiple connections, fan-out from event source, stats), once event bus exists
-5. **Revisit `framework/app`** — consider: app lifecycle hooks for plugins (pre-boot, post-boot callbacks), health check endpoint integration (now that sqlite.Health exists)
-6. **Revisit `framework/log`** — further: log sampling handler for high-traffic paths, mmap-based query for very large files (deferred — current linear scan is acceptable for admin viewer with daily rotation)
-7. **Revisit `framework/sqlite`** — now "Maturing". Consider: PRAGMA runtime reconfiguration (cache_size, mmap_size changes without restart), table-level size stats for admin dashboard
+1. **Revisit `framework/db`** — JOINs (the biggest API gap for real-world usage), COALESCE/IFNULL expressions, window functions, raw RETURNING with db.Raw columns
+2. **Revisit `framework/http`** — SSE broker/hub pattern as a higher-level abstraction (manages multiple connections, fan-out from event source, stats), once event bus exists
+3. **Revisit `framework/app`** — consider: app lifecycle hooks for plugins (pre-boot, post-boot callbacks), health check endpoint integration (now that sqlite.Health exists)
+4. **Revisit `framework/log`** — further: log sampling handler for high-traffic paths, mmap-based query for very large files (deferred — current linear scan is acceptable for admin viewer with daily rotation)
+5. **Revisit `framework/sqlite`** — consider: PRAGMA runtime reconfiguration (cache_size, mmap_size changes without restart), table-level size stats for admin dashboard
+6. **Revisit `framework/sqlite/migrate`** — now "Maturing". Consider: migration versioning validation (detect gaps, detect orphaned DB records), checksum mismatch warnings in Up() log output, batch status queries
+7. **Revisit `framework/sqlite/driver`** — now "Maturing". Consider: sqlite3_busy_handler (callback-based backoff), sqlite3_wal_hook (WAL monitoring), sqlite3_trace_v2 (statement tracing for debug), blob I/O for large objects
 8. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
 
 ## In-Progress Work
