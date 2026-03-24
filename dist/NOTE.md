@@ -8,7 +8,7 @@
 
 ## Current State
 
-**Last session**: 2026-03-24 — Session 8 (framework/log maturation)
+**Last session**: 2026-03-24 — Session 9 (framework/http file upload handling)
 **Working tree**: clean
 **Branch**: with-experiment
 
@@ -20,7 +20,7 @@
 | `framework/container` | **Growing** | Session 4 | Override/OverrideSupply, named hooks, all framework hooks named |
 | `framework/config` | **Growing** | Session 7 | Added Has, All, Keys, Sub, DataDir, EnvName, SetDefaults; Load creates data dir; improved panic messages |
 | `framework/log` | **Growing** | Session 8 | Separate console/file levels (ConsoleLevel, FileLevel types), log file management (ListFiles, CleanOldFiles, OpenFile), JSONL entry parsing + querying (Entry, Query with level/search/user_id/request_id filter + pagination) |
-| `framework/http` | **Maturing** | Session 6 | Revisited: struct-tag validation (required, min/max, email, url, oneof), Validator interface, FieldError details in APIError, auto-validates in Bind/BindQuery |
+| `framework/http` | **Maturing** | Session 9 | Revisited: file upload handling (FormFile, FormFiles, BindForm with `form` tag, SaveFile, ValidateFile, DetectFileType), ErrPayloadTooLarge/ErrUnsupportedMediaType sentinels, resolveFieldName includes `form` tag |
 | `framework/http/middleware` | **Growing** | Session 3 | RequestID, RequestLogger, Recover (panic recovery), CORS (functional options), RateLimit (token bucket) |
 | `framework/db` | **Maturing** | Session 5 | Revisited: deterministic column order, generalized pointer handling, SetNull, ModelSlice batch insert, NullBoolColumn/NullFloatColumn, cursor pagination (After + HasMore) |
 | `framework/sqlite` | Initial | Session 7 | Dual pool works; removed redundant data dir creation (config.Load handles it now); uses config.DataDir() |
@@ -40,6 +40,8 @@
 - ~~[db] NullStringColumn/NullIntColumn added but not yet stress-tested with real nullable data in playground~~ — RESOLVED in Session 5 (tested all nullable types: *string, *int64, *float64, *bool write/read paths verified with 125k rows)
 - [skill] Skill docs (sunkern-go-best-practices) show old `server.Mux().HandleFunc(...)` pattern — permission denied when trying to update. Blocked in Sessions 1-5. Need Irving to grant .claude/skills/ write permission. (2026-03-24)
 - [db] Insert().Model() auto-fill only works for BaseModel fields (id, created_at, updated_at). Custom fields with zero-value defaults still need manual handling. Acceptable trade-off. (Session 2)
+- [http] Go's multipart.Writer.CreateFormFile always sets Content-Type to application/octet-stream. Real clients (curl, browsers) set it from filename. Framework documents this — prefer DetectFileType for user-facing uploads. (Session 9)
+- [http] ParseMultipartForm reads the entire request body before ValidateFile can reject oversized files. Consider adding MaxBytesReader middleware for early rejection in a future session. (Session 9)
 
 ## Performance Baselines
 
@@ -117,6 +119,15 @@ Session 8 (log, event generator with log viewer, 11k log entries):
 - [memory] 70 MB RSS after 6200+ writes + 11k log entries + concurrent query load
 - [race] No data races detected with -race flag on all log package tests
 
+Session 9 (http upload, file locker app with BindForm + SaveFile + ValidateFile, 5100 files):
+- [upload/POST single] 10,201 req/s, P99 5.9ms — BindForm (title + file), ValidateFile, DetectFileType, SaveFile, DB INSERT
+- [upload/POST reject-413] 433 req/s, P99 34.7ms — 11 MiB body parsed before 413 rejection (IO-bound by body transfer)
+- [upload/GET list] 15,396 req/s, P99 8.6ms — paginated list on 5100 rows
+- [upload/GET download] 49,902 req/s, P99 3.2ms — http.ServeFile for 33-byte PNG
+- [upload/GET single] P99 2.9ms — single file metadata read
+- [memory] 787 MB RSS peak after 2000 × 11 MiB rejection test (Go hadn't returned memory to OS yet; normal upload load used ~50 MB)
+- [race] No data races detected with -race flag on concurrent upload + read
+
 ## Design Decisions
 
 <!-- Key decisions and rationale so future sessions don't reverse them. Format:
@@ -160,18 +171,25 @@ Session 8 (log, event generator with log viewer, 11k log entries):
 - [log] Entry parsing uses two-pass: unmarshal into map[string]any, extract known fields (time, level, msg, source, request_id, user_id), put rest in Extra. Custom MarshalJSON re-merges for flat JSON output matching original JSONL structure. (Session 8)
 - [log] Query scans the entire file sequentially — IO-bound at ~100 req/s for 11k entries (4MB). Acceptable for admin viewer. Future optimization: mmap, line indexing, or in-memory cache if needed. (Session 8)
 - [log] QueryOptions.Level is a string (not slog.Level) — empty string means "all levels". Avoids the zero-value problem where slog.LevelInfo=0 would accidentally filter out DEBUG. levelRank() maps strings to ordered ints for comparison. (Session 8)
+- [http] File upload uses function-based API (FormFile, BindForm, SaveFile) consistent with existing Bind/BindQuery pattern — not method-based like Gin's Context. Keeps http package stateless. (Session 9)
+- [http] BindForm uses `form` struct tag, parallel to `json` (Bind) and `query` (BindQuery). Supports *multipart.FileHeader and []*multipart.FileHeader for file fields alongside scalar text fields. (Session 9)
+- [http] FormFile/FormFiles access r.MultipartForm.File directly instead of calling r.FormFile() — avoids unnecessary file opening. User opens when needed via FileHeader.Open(). (Session 9)
+- [http] ValidateFile checks the Content-Type header (fast, no IO). DetectFileType reads first 512 bytes for real content sniffing. Two separate functions — user chooses security level. (Session 9)
+- [http] SaveFile creates parent directories (0o755) — convenience for the common pattern of generating date-based upload paths. (Session 9)
+- [http] DefaultMaxMemory = 32 MiB — consistent with Go stdlib default. Files under this stay in memory, larger ones spill to temp files on disk. (Session 9)
+- [http] Field name resolution updated: json > query > form > lowercased Go name. Ensures validation errors use the correct binding-context name. (Session 9)
 
 ## Next Priorities
 
 <!-- What the last session thinks should come next, in order -->
 
-1. **Revisit `framework/http`** — file upload handling (multipart/form-data), SSE support for real-time events
-2. **`framework/db` advanced** — RETURNING clause (eliminate update-then-fetch pattern), subqueries in WHERE, CASE expressions
-3. **Revisit `framework/http/middleware`** — auth middleware (JWT validation, role-based), request timeout middleware
+1. **Revisit `framework/http`** — SSE support for real-time events (event bus → SSE endpoint pattern from IDEA.md Section 9)
+2. **Revisit `framework/http/middleware`** — auth middleware (JWT validation, role-based), request timeout middleware, MaxBytesReader body size limiter
+3. **`framework/db` advanced** — RETURNING clause (eliminate update-then-fetch pattern), subqueries in WHERE, CASE expressions
 4. **Revisit `framework/app` / `framework/container`** — now Growing, revisit after other packages evolve
-5. **Revisit `framework/config`** — revisit after log matures, consider config validation (type constraints, allowed values)
-6. **Revisit `framework/log`** — now Growing; consider Query performance optimization (mmap/indexing), log sampling for high-traffic paths, configurable file permissions
-7. **Revisit `framework/db`** — revisit after http/config/log mature, fresh perspective on API ergonomics
+5. **Revisit `framework/config`** — consider config validation (type constraints, allowed values)
+6. **Revisit `framework/log`** — consider Query performance optimization (mmap/indexing), log sampling for high-traffic paths
+7. **Revisit `framework/db`** — fresh perspective on API ergonomics after http fully matures
 8. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
 
 ## In-Progress Work
