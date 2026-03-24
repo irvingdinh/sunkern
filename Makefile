@@ -8,4 +8,4 @@ kill:
 	@-lsof -ti :19110 | xargs kill -9 2>/dev/null; true
 
 run: kill
-	@cd service && go run main.go
+	@cd service && go run .

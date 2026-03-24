@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -16,6 +17,8 @@ import (
 	"sunkern.local/framework/container"
 	sunkernhttp "sunkern.local/framework/http"
 	sunkernlog "sunkern.local/framework/log"
+	sunkerndb "sunkern.local/framework/sqlite"
+	"sunkern.local/framework/sqlite/migrate"
 )
 
 // App orchestrates the full lifecycle of a Sunkern application. It manages
@@ -35,7 +38,8 @@ type App struct {
 	// For testing: override signal context creation.
 	signalCtxFunc func() (context.Context, context.CancelFunc)
 
-	shutdownTimeout time.Duration
+	shutdownTimeout  time.Duration
+	migrationSources []fs.FS
 }
 
 // New creates an application. Options are applied in order.
@@ -57,6 +61,13 @@ type Option func(*App)
 // Default is 30 seconds.
 func WithShutdownTimeout(d time.Duration) Option {
 	return func(a *App) { a.shutdownTimeout = d }
+}
+
+// WithMigrations adds migration sources to the application. Each source is
+// an fs.FS containing *.sql migration files. Framework and service migrations
+// are merged and applied in version order during boot.
+func WithMigrations(sources ...fs.FS) Option {
+	return func(a *App) { a.migrationSources = append(a.migrationSources, sources...) }
 }
 
 // Use adds modules to the application. Modules are registered and booted
@@ -125,7 +136,23 @@ func (a *App) run() error {
 	}
 
 	// Phase 2: Init framework services.
-	// TODO: init DB, cache, event bus, cron, queue, run migrations.
+
+	// Init SQLite.
+	sunkerndb.Load()
+	container.Supply[*sunkerndb.DB](sunkerndb.Global())
+
+	// Run migrations.
+	migrationEngine := migrate.NewEngine(sunkerndb.Global().WriteDB())
+	if err := migrationEngine.Collect(a.migrationSources...); err != nil {
+		return fmt.Errorf("collect migrations: %w", err)
+	}
+	if n, err := migrationEngine.Up(context.Background()); err != nil {
+		return fmt.Errorf("run migrations: %w", err)
+	} else if n > 0 {
+		slog.Info("migrations applied", "count", n)
+	}
+
+	// TODO: init cache, event bus, cron, queue.
 	srv, err := sunkernhttp.NewServer()
 	if err != nil {
 		return fmt.Errorf("init http: %w", err)

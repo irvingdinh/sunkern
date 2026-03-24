@@ -104,15 +104,18 @@ func RequestLogger(next http.Handler) http.Handler {
 			level = slog.LevelWarn
 		}
 
-		slog.LogAttrs(r.Context(), level, "http request",
+		// Nginx-style combined log format as msg:
+		// client_ip - - "METHOD /path HTTP/x.x" status bytes "referer" "user_agent"
+		msg := fmt.Sprintf(`%s - - "%s %s %s" %d %d "%s" "%s"`,
+			r.RemoteAddr,
+			r.Method, r.URL.RequestURI(), r.Proto,
+			rec.status, rec.bytesWritten,
+			r.Referer(), r.UserAgent(),
+		)
+
+		slog.LogAttrs(r.Context(), level, msg,
 			slog.String("log_type", "http_request"),
-			slog.String("method", r.Method),
-			slog.String("path", r.URL.Path),
-			slog.Int("status", rec.status),
 			slog.Float64("latency_ms", float64(elapsed.Nanoseconds())/1e6),
-			slog.String("client_ip", r.RemoteAddr),
-			slog.String("user_agent", r.UserAgent()),
-			slog.Int("response_size", rec.bytesWritten),
 		)
 	})
 }

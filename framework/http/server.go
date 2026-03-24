@@ -15,8 +15,11 @@ import (
 // DefaultAddr is the default HTTP listen address.
 const DefaultAddr = ":19110"
 
-// Server is the framework's HTTP server abstraction.
-type Server interface{}
+// Server is the framework's HTTP server abstraction. Modules call
+// Mux() during Boot to register routes before the listener starts.
+type Server interface {
+	Mux() *httpstd.ServeMux
+}
 
 // NewServer creates an HTTP server, registers lifecycle hooks, and returns
 // a Server. It reads the listen address from config (key "http.addr",
@@ -57,7 +60,11 @@ func NewServer() (Server, error) {
 		},
 	})
 
-	return &serverImpl{}, nil
+	return &serverImpl{mux: mux}, nil
 }
 
-type serverImpl struct{}
+type serverImpl struct {
+	mux *httpstd.ServeMux
+}
+
+func (s *serverImpl) Mux() *httpstd.ServeMux { return s.mux }
