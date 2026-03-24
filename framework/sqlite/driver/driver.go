@@ -249,7 +249,12 @@ func (s *stmt) bind(args []driver.Value) error {
 			if len(v) == 0 {
 				rc = C.sqlite3_bind_zeroblob(s.s, idx, 0)
 			} else {
-				rc = C.sqlite3_bind_blob(s.s, idx, unsafe.Pointer(&v[0]), C.int(len(v)), nil)
+				// Copy to C-managed memory with C.free destructor — same
+				// pattern as string binding. Using nil (SQLITE_STATIC) would
+				// be unsound because the Go GC can collect the backing array
+				// between bind() and the first sqlite3_step() call.
+				p := C.CBytes(v)
+				rc = C.sqlite3_bind_blob(s.s, idx, p, C.int(len(v)), (*[0]byte)(C.free))
 			}
 		case time.Time:
 			formatted := v.Format("2006-01-02 15:04:05")

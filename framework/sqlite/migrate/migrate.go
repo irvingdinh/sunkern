@@ -117,6 +117,7 @@ func (e *Engine) Up(ctx context.Context) (int, error) {
 			continue
 		}
 
+		start := time.Now()
 		if err := e.applyMigration(ctx, m, DirectionUp); err != nil {
 			return count, fmt.Errorf("migration %05d_%s up: %w", m.Version, m.Name, err)
 		}
@@ -125,6 +126,7 @@ func (e *Engine) Up(ctx context.Context) (int, error) {
 			"version", m.Version,
 			"name", m.Name,
 			"direction", "up",
+			"duration", time.Since(start),
 		)
 	}
 
@@ -162,6 +164,7 @@ func (e *Engine) Down(ctx context.Context, count int) (int, error) {
 			return rolled, fmt.Errorf("migration %05d_%s: no Down statements for rollback", m.Version, m.Name)
 		}
 
+		start := time.Now()
 		if err := e.applyMigration(ctx, m, DirectionDown); err != nil {
 			return rolled, fmt.Errorf("migration %05d_%s down: %w", m.Version, m.Name, err)
 		}
@@ -170,6 +173,7 @@ func (e *Engine) Down(ctx context.Context, count int) (int, error) {
 			"version", m.Version,
 			"name", m.Name,
 			"direction", "down",
+			"duration", time.Since(start),
 		)
 	}
 
@@ -217,6 +221,27 @@ func (e *Engine) Status(ctx context.Context) ([]MigrationStatus, error) {
 	}
 
 	return result, nil
+}
+
+// Pending returns migrations that have not yet been applied, in version
+// order. Useful for dry-run reporting or admin dashboard display.
+func (e *Engine) Pending(ctx context.Context) ([]Migration, error) {
+	if err := e.ensureTable(ctx); err != nil {
+		return nil, err
+	}
+
+	applied, err := e.appliedVersions(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var pending []Migration
+	for _, m := range e.migrations {
+		if !applied[m.Version] {
+			pending = append(pending, m)
+		}
+	}
+	return pending, nil
 }
 
 // Migrations returns the collected migrations for inspection.
@@ -272,9 +297,9 @@ func (e *Engine) applyMigration(ctx context.Context, m Migration, dir Direction)
 		stmts = m.Down
 	}
 
-	for _, stmt := range stmts {
+	for i, stmt := range stmts {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("exec: %w\nstatement: %s", err, stmt)
+			return fmt.Errorf("statement %d/%d: %w\nSQL: %s", i+1, len(stmts), err, stmt)
 		}
 	}
 
