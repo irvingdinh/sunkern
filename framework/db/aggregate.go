@@ -53,3 +53,52 @@ func Min(col Expr, alias string) Expr {
 func Max(col Expr, alias string) Expr {
 	return aggregateExpr{fn: "MAX", inner: col, alias: alias}
 }
+
+// ---------------------------------------------------------------------------
+// GROUP_CONCAT — SQLite string aggregation
+// ---------------------------------------------------------------------------
+
+type groupConcatExpr struct {
+	inner     Expr
+	separator string // empty means default (comma)
+	distinct  bool
+}
+
+func (e groupConcatExpr) WriteSQL(buf *strings.Builder, args *[]any) {
+	buf.WriteString("GROUP_CONCAT(")
+	if e.distinct {
+		// SQLite requires DISTINCT aggregates to have exactly one argument.
+		// Separator cannot be combined with DISTINCT — always uses comma.
+		buf.WriteString("DISTINCT ")
+		e.inner.WriteSQL(buf, args)
+	} else {
+		e.inner.WriteSQL(buf, args)
+		if e.separator != "" {
+			buf.WriteString(", ?")
+			*args = append(*args, e.separator)
+		}
+	}
+	buf.WriteString(")")
+}
+
+// GroupConcat returns GROUP_CONCAT(col, separator). Concatenates all non-NULL
+// values of col into a single string, separated by separator. Pass an empty
+// separator to use SQLite's default (comma).
+//
+//	// Comma-separated tag names per post:
+//	db.As(db.GroupConcat(Tags.Name, ","), "tag_names")
+//
+//	// Pipe-separated:
+//	db.As(db.GroupConcat(Tags.Name, " | "), "tag_list")
+func GroupConcat(col Expr, separator string) Expr {
+	return groupConcatExpr{inner: col, separator: separator}
+}
+
+// GroupConcatDistinct returns GROUP_CONCAT(DISTINCT col). Eliminates duplicate
+// values before concatenation. SQLite requires DISTINCT aggregates to have
+// exactly one argument, so the separator is always comma (SQLite default).
+//
+//	db.As(db.GroupConcatDistinct(Tags.Name), "unique_tags")
+func GroupConcatDistinct(col Expr) Expr {
+	return groupConcatExpr{inner: col, distinct: true}
+}

@@ -8,7 +8,7 @@
 
 ## Current State
 
-**Last session**: 2026-03-25 — Session 21 (framework/db revisited — JOIN ergonomics: As aliasing, CrossJoin, Coalesce/IfNull/Val, ColEq family, Asc/Desc package-level)
+**Last session**: 2026-03-25 — Session 22 (framework/db revisited — window functions: OVER, PARTITION BY, ORDER BY, ROWS/RANGE/GROUPS frames, ROW_NUMBER/RANK/DENSE_RANK/NTILE/LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTH_VALUE, GROUP_CONCAT/GROUP_CONCAT DISTINCT)
 **Working tree**: clean
 **Branch**: with-experiment
 
@@ -22,7 +22,7 @@
 | `framework/log` | **Maturing** | Session 17 | Revisited: buffered file writer (64KB bufio.Writer + 200ms periodic flush goroutine — ~145k log writes/sec), Flush() export, Query improvements (Order desc/asc, After/Before time range, CountOnly mode). Previous (Session 8): Separate console/file levels, log file management, JSONL entry parsing + querying |
 | `framework/http` | **Maturing** | Session 14 | Revisited: SSE support (NewEventStream, SSEWriter with Send/SendJSON/Heartbeat/Retry/Done, LastEventID, write deadline extension via ResponseController, ErrStreamingNotSupported sentinel). Previous (Session 10): Bind/BindForm MaxBytesError → 413. Previous: file upload handling, all sentinels |
 | `framework/http/middleware` | **Maturing** | Session 15 | Revisited: Timeout (context deadline per route), PBKDF2-SHA256 password hashing (HashPassword/CheckPassword, 600k iterations, PHC format, stdlib-only), APIToken middleware (opaque bearer tokens with DB lookup via TokenLookup callback), GenerateToken (32-byte random hex). Previous (Session 10): JWT (HMAC-SHA256 sign/verify, Claims, context helpers), Auth (Bearer token + user_id logging), RequireRole (role-based 403), MaxBytes (body size limiter). Plus existing: RequestID, RequestLogger, Recover, CORS, RateLimit |
-| `framework/db` | **Maturing** | Session 21 | Revisited: JOIN ergonomics — As(expr, alias) for column aliasing in JOINs, CrossJoin(table), Coalesce(exprs...), IfNull(expr, fallback), Val(v) for parameterized literals, ColEq/ColNe/ColGt/ColLt/ColGte/ColLte for cross-type column comparisons in JOIN ON, Asc(expr)/Desc(expr) package-level ORDER BY from arbitrary expressions. writeJoins() helper extracted for DRY. Previous (Session 12): RETURNING clause, subqueries, CASE expressions. Previous (Session 5): deterministic column order, generalized pointer handling, SetNull, ModelSlice batch insert, NullBoolColumn/NullFloatColumn, cursor pagination (After + HasMore) |
+| `framework/db` | **Maturing** | Session 22 | Revisited: window functions — WindowDef builder (PartitionBy, OrderBy, Rows/Range/Groups frames), Over(expr, win) wrapper, 11 window functions (RowNumber, Rank, DenseRank, NTile, Lag, Lead, LagDefault, LeadDefault, FirstValue, LastValue, NthValue), GroupConcat(col, sep), GroupConcatDistinct(col). Frame bounds: UnboundedPreceding, Preceding(n), CurrentRow, Following(n), UnboundedFollowing. Previous (Session 21): JOIN ergonomics — As, CrossJoin, Coalesce/IfNull/Val, ColEq family, Asc/Desc. Previous (Session 12): RETURNING, subqueries, CASE. Previous (Session 5): nullable types, cursor pagination |
 | `framework/sqlite` | **Maturing** | Session 18 | Revisited: background maintenance goroutine (periodic PRAGMA optimize + WAL auto-checkpoint when WAL exceeds threshold), Health(ctx) for readiness checks, 2 new config keys (db.optimize_interval, db.wal_checkpoint_threshold). Maintenance lifecycle managed by container hooks (OnStart/OnStop). Previous (Session 11): Stats, Checkpoint, Optimize, IntegrityCheck, Backup. Configurable PRAGMAs. |
 | `framework/sqlite/driver` | **Maturing** | Session 20 | Revisited: structured Error type with primary+extended result codes (Code/ExtendedCode/Message), context cancellation via sqlite3_interrupt (ExecContext/QueryContext on conn+stmt), MemoryUsed/MemoryHighwater exported functions, time.Time bind with ms precision + UTC, extended result codes enabled per connection, nil guards on Close, compile-time interface assertions. Previous (Session 11): blob binding safety fix (CBytes+C.free pattern). |
 | `framework/sqlite/migrate` | **Maturing** | Session 19 | Revisited: SHA-256 checksums (drift detection via Dirty field), execution_ms tracking, UpTo/DownTo/Version/Redo methods, MigrationStatus enriched with HasDown/StmtCount/Checksum/Dirty/ExecutionMs + JSON tags, backward-compatible schema upgrade (ALTER TABLE ADD COLUMN), Checksum() exported, applyUp/applyDown split, *Engine supplied to container. Previous (Session 11): migration timing, Pending(), error context with statement index. |
@@ -253,6 +253,18 @@ Session 21 (db revisit, blog app with JOINs — 500 posts, 2000 comments, 10 use
 - [memory] 38 MB RSS after 70k+ load test requests across all endpoints
 - [race] No data races detected with -race flag on concurrent requests across all 7 JOIN endpoints
 
+Session 22 (db revisit, employee analytics with window functions — 200 employees, 5000 sales, 8 departments):
+- [db/ROW_NUMBER+RANK+DENSE_RANK] 10,154 req/s, p99 17.5ms — 3 window functions + JOIN, PARTITION BY dept, ORDER BY salary
+- [db/SUM OVER+ROWS frame] 432 req/s, p99 441ms — running total with ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW on 5k sales (IO-bound: large window scan)
+- [db/LAG+LEAD+LAGDEFAULT] 939 req/s, p99 202ms — 3 offset window functions per row on 5k sales
+- [db/NTILE] 13,045 req/s, p99 13.8ms — NTILE(4) quartile assignment + JOIN
+- [db/FIRST_VALUE+LAST_VALUE+NTH_VALUE] 3,503 req/s, p99 55.4ms — 3 value functions with ROWS UNBOUNDED PRECEDING TO UNBOUNDED FOLLOWING
+- [db/GROUP_CONCAT+LEFT JOIN] 1,214 req/s, p99 158ms — GROUP_CONCAT + GROUP_CONCAT(DISTINCT) with LEFT JOIN + GROUP BY on 200 employees
+- [db/dept-summary] 13,796 req/s, p99 12.8ms — GROUP_CONCAT + COUNT + AVG + RANK window, GROUP BY dept (8 rows)
+- [db/frames AVG+SUM+MAX] 13,660 req/s, p99 13.0ms — 3 frame types (Preceding(1)/Following(1), Preceding(2)/Following(2), UnboundedPreceding/CurrentRow) on 50 rows
+- [memory] 56 MB RSS after 80k+ load test requests, 166 MB peak under sustained concurrent load
+- [race] No data races detected with -race flag on concurrent requests across all 8 window+GROUP_CONCAT endpoints
+
 ## Design Decisions
 
 <!-- Key decisions and rationale so future sessions don't reverse them. Format:
@@ -404,11 +416,18 @@ Session 21 (db revisit, blog app with JOINs — 500 posts, 2000 comments, 10 use
 - [db] CrossJoin(table) has no ON clause. writeJoins() helper extracted from Build() and buildCount() to handle both ON and no-ON cases without duplication. (Session 21)
 - [db] JOIN scan pattern: when JOINing tables with overlapping column names (e.g., both have "id"), users MUST use As() to alias and a flat scan-target struct with unique db tags. This is explicit-is-better-than-implicit — no magic prefix stripping or nested struct scanning for JOINs. (Session 21)
 
+- [db] Window functions use package-level functions + WindowDef builder pattern. Over(expr, win) wraps any existing aggregate Expr — no need to modify aggregateExpr or add methods to it. Window-only functions (RowNumber, Rank, etc.) take *WindowDef directly. This follows the established pattern: package-level functions returning Expr, composable with As() for aliasing. (Session 22)
+- [db] WindowDef is a struct with exported methods (PartitionBy, OrderBy, Rows/Range/Groups) — builder pattern, not functional options. All parts are optional: OVER() with empty window is valid SQL. WriteSQL renders the window spec including parentheses. (Session 22)
+- [db] Frame bounds use a frameBound value type with package-level constructors: UnboundedPreceding (var), CurrentRow (var), UnboundedFollowing (var), Preceding(n) (func), Following(n) (func). Vars for parameterless bounds, funcs for N-valued bounds — zero-ambiguity API. (Session 22)
+- [db] Lag/Lead have two variants: Lag(expr, offset, win) returns NULL for missing rows; LagDefault(expr, offset, defaultVal, win) uses a fallback Expr. Separate functions instead of optional parameter — Go doesn't have optional args, and the defaultVal is an Expr (not a simple value), so it's better as a distinct function. (Session 22)
+- [db] GroupConcat uses parameterized separator (? placeholder) to prevent SQL injection. GroupConcatDistinct takes no separator — SQLite requires DISTINCT aggregates to have exactly one argument, so GROUP_CONCAT(DISTINCT col, sep) is a syntax error. This is a known SQLite limitation. (Session 22)
+- [db] Window function SQL generation uses separate internal types (windowFuncExpr, windowOffsetExpr, windowOffsetDefaultExpr, windowValueExpr, windowNthExpr) rather than one mega-struct. Each type has exactly the fields it needs — no nil checks or mode flags. More types, simpler code per type. (Session 22)
+
 ## Next Priorities
 
 <!-- What the last session thinks should come next, in order -->
 
-1. **Revisit `framework/db`** — window functions (ROW_NUMBER, RANK, DENSE_RANK), GROUP_CONCAT, raw RETURNING with db.Raw columns
+1. **Revisit `framework/db`** — raw RETURNING with db.Raw columns, aggregate FILTER clause (WHERE inside aggregate), UNION/INTERSECT/EXCEPT set operations
 2. **Revisit `framework/http`** — SSE broker/hub pattern as a higher-level abstraction (manages multiple connections, fan-out from event source, stats), once event bus exists
 3. **Revisit `framework/app`** — consider: app lifecycle hooks for plugins (pre-boot, post-boot callbacks), health check endpoint integration (now that sqlite.Health exists)
 4. **Revisit `framework/log`** — further: log sampling handler for high-traffic paths, mmap-based query for very large files (deferred — current linear scan is acceptable for admin viewer with daily rotation)
