@@ -8,7 +8,7 @@
 
 ## Current State
 
-**Last session**: 2026-03-25 — Session 31 (framework/log revisited — sampling handler, context-aware Query, Enabled optimization, config defaults)
+**Last session**: 2026-03-25 — Session 32 (framework/sqlite + driver revisited — Connector per-connection PRAGMAs, runtime introspection, table stats)
 **Working tree**: clean
 **Branch**: with-experiment
 
@@ -23,8 +23,8 @@
 | `framework/http` | **Maturing** | Session 28 | Revisited: PaginationParams (embeddable, Paginate() returns page/perPage/offset with defaults 20/100), BindQuery/BindForm embedded struct recursion (enables shared param types), Created() response helper (201 shorthand), configurable server timeouts (http.read_timeout/write_timeout/idle_timeout via config), middleware writeErrorJSON consolidation (DRY'd 4 files into shared helper). Previous (Session 14): SSE support. Previous (Session 10): Bind/BindForm MaxBytesError → 413. Previous: file upload handling, all sentinels |
 | `framework/http/middleware` | **Maturing** | Session 28 | Revisited: writeErrorJSON shared helper (extracted from auth, apitoken, recover, ratelimit — DRY'd 4 inline JSON blocks into error.go). Previous (Session 15): Timeout, PBKDF2-SHA256 password hashing, APIToken middleware, GenerateToken. Previous (Session 10): JWT, Auth, RequireRole, MaxBytes. Plus existing: RequestID, RequestLogger, Recover, CORS, RateLimit |
 | `framework/db` | **Maturing** | Session 27 | Revisited: INSERT...SELECT (FromSelect on InsertBuilder), DoUpdateAll (auto SET excluded for non-target/non-immutable columns), ConflictBuilder.Where (partial unique index), ConflictWhere (conditional DO UPDATE WHERE), Excluded() helper (reference incoming values in WHERE), Returning accepts ...Expr (backward compatible, columns use unqualified names, Expr uses WriteSQL), ReturningStar() on all mutation builders. Previous (Session 24): CTEs, With() on all builders. Previous (Session 23): set operations, FILTER, Query interface. Previous (Session 22): window functions, GROUP_CONCAT. Previous (Session 21): JOIN ergonomics. Previous (Session 12): RETURNING, subqueries, CASE. Previous (Session 5): nullable types, cursor pagination |
-| `framework/sqlite` | **Maturing** | Session 18 | Revisited: background maintenance goroutine (periodic PRAGMA optimize + WAL auto-checkpoint when WAL exceeds threshold), Health(ctx) for readiness checks, 2 new config keys (db.optimize_interval, db.wal_checkpoint_threshold). Maintenance lifecycle managed by container hooks (OnStart/OnStop). Previous (Session 11): Stats, Checkpoint, Optimize, IntegrityCheck, Backup. Configurable PRAGMAs. |
-| `framework/sqlite/driver` | **Maturing** | Session 20 | Revisited: structured Error type with primary+extended result codes (Code/ExtendedCode/Message), context cancellation via sqlite3_interrupt (ExecContext/QueryContext on conn+stmt), MemoryUsed/MemoryHighwater exported functions, time.Time bind with ms precision + UTC, extended result codes enabled per connection, nil guards on Close, compile-time interface assertions. Previous (Session 11): blob binding safety fix (CBytes+C.free pattern). |
+| `framework/sqlite` | **Maturing** | Session 32 | Revisited: driver.Connector for per-connection PRAGMA init (fixes latent bug — all pool connections now get PRAGMAs), sql.OpenDB replaces sql.Open, GetPragma/SetPragma/Pragmas for runtime introspection, TableStats() via dbstat vtable (per-table rows/pages/size), Stats enriched with CurrentPragmas field, CheckpointResult JSON tags. Previous (Session 18): maintenance goroutine, Health(ctx), optimize_interval/wal_checkpoint_threshold. Previous (Session 11): Stats, Checkpoint, Optimize, IntegrityCheck, Backup. |
+| `framework/sqlite/driver` | **Maturing** | Session 32 | Revisited: Connector type (driver.Connector interface) applies init PRAGMAs to every new connection via Connect(), SetPragma updates connector thread-safely, SQLITE_ENABLE_DBSTAT_VTAB compile flag, compile-time assertion for Connector. Previous (Session 20): structured Error type, context cancellation via sqlite3_interrupt, MemoryUsed/MemoryHighwater, time.Time bind with ms+UTC, nil guards. Previous (Session 11): blob binding safety fix. |
 | `framework/sqlite/migrate` | **Maturing** | Session 19 | Revisited: SHA-256 checksums (drift detection via Dirty field), execution_ms tracking, UpTo/DownTo/Version/Redo methods, MigrationStatus enriched with HasDown/StmtCount/Checksum/Dirty/ExecutionMs + JSON tags, backward-compatible schema upgrade (ALTER TABLE ADD COLUMN), Checksum() exported, applyUp/applyDown split, *Engine supplied to container. Previous (Session 11): migration timing, Pending(), error context with statement index. |
 
 ## Friction Log
@@ -370,6 +370,20 @@ Session 31 (log revisit, event generator with sampling + log query + config intr
 - [memory] 311 MB RSS after 60k messages + 2.5k events + sustained load test (includes 7.6MB JSONL scan allocations)
 - [race] No data races detected with -race flag on concurrent write flood + query + generate + config reads
 
+Session 32 (sqlite+driver revisit, DB admin app with 3 tables — 500 products, 1500 orders, 1000 reviews):
+- [sqlite/GET stats] 36,625 req/s, p99 4.4ms — Stats() with CurrentPragmas field (9 PRAGMA reads), no regression from Session 18
+- [sqlite/GET table-stats] 3,175 req/s, p99 56.7ms — dbstat JOIN sqlite_master + 3 COUNT(*) on 3 tables
+- [sqlite/GET pragmas] 45,342 req/s, p99 3.1ms — Pragmas() map (9 reads: 7 read-pool + 2 write-pool)
+- [sqlite/GET pragma] 61,249 req/s, p99 2.6ms — single GetPragma read
+- [sqlite/POST set-pragma] 7,803 req/s, p99 2.0ms — SetPragma updates 2 connectors + applies to 10+1 connections
+- [sqlite/GET health] 59,762 req/s, p99 2.5ms — no regression from Session 18
+- [sqlite/POST checkpoint] 13,871 req/s, p99 0.2ms — sequential, write pool
+- [sqlite/GET products] 69,064 req/s, p99 2.6ms — paginated list on 500 rows with connector-initialized connections
+- [connector] All 10 read connections verified: cache_size=-16000, mmap_size=268435456, foreign_keys=1, busy_timeout=5000 (all_match=true)
+- [set-pragma verify] After SetPragma(cache_size, -32000): all 10 connections updated (verified via verify-connector)
+- [memory] 34 MB RSS after sustained load
+- [race] No data races detected with -race flag on concurrent Stats+TableStats+Pragmas+SetPragma+CRUD
+
 ## Design Decisions
 
 <!-- Key decisions and rationale so future sessions don't reverse them. Format:
@@ -596,18 +610,26 @@ Session 31 (log revisit, event generator with sampling + log query + config intr
 - [log] Config defaults registered in Load() (not init()) — consistent with sqlite and http packages. init() runs before config.Load() in app lifecycle, so keys registered there would be lost if config.Load() resets state. Load()-time registration ensures defaults are visible after the config system is initialized. (Session 31)
 - [log] samplingHandler.counters is *[2]atomic.Int64 (pointer, not value) — WithAttrs/WithGroup share the same counter pointer so the sampling rate is global across all derived loggers. Copying atomic.Int64 by value would violate sync/atomic contract (must not copy after first use). Shared counters mean slog.With("module", "auth").Debug() and slog.Debug() both contribute to the same DEBUG counter — the 1-in-N rate applies to the total call volume, not per-logger. (Session 31)
 
+- [driver] Connector type implements driver.Connector — sql.OpenDB(connector) replaces sql.Open("sqlite3", dsn). Every new connection from the pool goes through Connect(), which applies all registered PRAGMAs. This is the correct fix for per-connection PRAGMAs in Go's connection pool model (previously only 1 of N read connections got PRAGMAs). (Session 32)
+- [driver] Connector.pragmas is a map[string]string (PRAGMA name → full statement). SetPragma updates the map under write lock. Connect() snapshots + sorts keys under read lock for deterministic execution. Sorting is cosmetic (PRAGMA order doesn't matter for SQLite) but helps debugging. (Session 32)
+- [driver] SQLITE_ENABLE_DBSTAT_VTAB added to CGo CFLAGS — enables the `dbstat` virtual table for per-table storage introspection. Standard compile flag, safe for production, enables TableStats() to report page-level size metrics per table. (Session 32)
+- [sqlite] sql.OpenDB(connector) used for both write and read pools. Shared PRAGMAs (busy_timeout, journal_mode=WAL, synchronous=NORMAL, cache_size, foreign_keys=ON, temp_store=MEMORY, mmap_size) registered on both connectors. Write-only PRAGMAs (journal_size_limit, wal_autocheckpoint) only on write connector. Eliminates the old applyPragmas() function that used Exec on pool (which only hit 1 connection). (Session 32)
+- [sqlite] SetPragma updates both connectors (for future connections) AND applies to existing connections. Write pool: single Exec (1 connection). Read pool: grab up to maxConns via db.Conn with 1-second timeout, exec PRAGMA on each, release. In-flight connections get the PRAGMA when recycled via connector. Trade-off: millisecond-level inconsistency for in-use connections is acceptable for admin dashboard use case. (Session 32)
+- [sqlite] Pragmas() reads 7 PRAGMAs from read pool + 2 from write pool. Read/write split because wal_autocheckpoint and journal_size_limit are write-connection settings — reading from read pool returns defaults, not the configured values. (Session 32)
+- [sqlite] TableStats() joins dbstat with sqlite_master ON type='table' to exclude index btrees. dbstat lists both table and index btrees under the `name` column — without the join, COUNT(*) on an index name causes "no such table" errors. Row counts use COUNT(*) per table (separate query per table, table names from sqlite_master so safe for quoting). (Session 32)
+- [sqlite] Stats.CurrentPragmas is map[string]any — populated by Pragmas() during Stats(). Admin dashboard gets complete PRAGMA state alongside file/pool/memory stats in one call. Native types preserved: int64 for integer PRAGMAs, string for text PRAGMAs (journal_mode). (Session 32)
+
 ## Next Priorities
 
 <!-- What the last session thinks should come next, in order -->
 
-1. **Revisit `framework/sqlite`** — last touched Session 18 (13 sessions ago). PRAGMA runtime reconfiguration (cache_size, mmap_size changes without restart), table-level size stats for admin dashboard
-2. **Revisit `framework/sqlite/migrate`** — last touched Session 19 (12 sessions ago). Migration versioning validation (detect gaps, detect orphaned DB records), checksum mismatch warnings in Up() log output, batch status queries
-3. **Revisit `framework/sqlite/driver`** — last touched Session 20 (11 sessions ago). sqlite3_busy_handler (callback-based backoff), sqlite3_wal_hook (WAL monitoring), sqlite3_trace_v2 (statement tracing for debug), blob I/O for large objects
-4. **Revisit `framework/http/middleware`** — last touched Session 28. Auth flow ergonomics, middleware composition helpers, consider request context enrichment helpers
-5. **Revisit `framework/http`** — last touched Session 28. SSE broker/hub pattern (manages multiple connections, fan-out from event source, stats)
-6. **Revisit `framework/app`** — last touched Session 30. Future: module dependency declaration (explicit DependsOn for boot ordering), module tags/labels for admin introspection, conditional modules (enabled/disabled via config)
-7. **Revisit `framework/db`** — last touched Session 27. Consider: batch update/delete helpers, query logging/tracing hook, prepared statement caching
-8. **Revisit `framework/config`** — last touched Session 29. Future: config value change detection (compare Export snapshots), config documentation generator
+1. **Revisit `framework/sqlite/migrate`** — last touched Session 19 (13 sessions ago). Migration versioning validation (detect gaps, detect orphaned DB records), checksum mismatch warnings in Up() log output, batch status queries
+2. **Revisit `framework/sqlite/driver`** — last touched Session 32 (Connector added). sqlite3_busy_handler (callback-based backoff), sqlite3_wal_hook (WAL monitoring), sqlite3_trace_v2 (statement tracing for debug), blob I/O for large objects
+3. **Revisit `framework/http/middleware`** — last touched Session 28 (4 sessions ago). Auth flow ergonomics, middleware composition helpers, consider request context enrichment helpers
+4. **Revisit `framework/http`** — last touched Session 28. SSE broker/hub pattern (manages multiple connections, fan-out from event source, stats)
+5. **Revisit `framework/app`** — last touched Session 30. Future: module dependency declaration (explicit DependsOn for boot ordering), module tags/labels for admin introspection, conditional modules (enabled/disabled via config)
+6. **Revisit `framework/db`** — last touched Session 27 (5 sessions ago). Consider: batch update/delete helpers, query logging/tracing hook, prepared statement caching
+7. **Revisit `framework/config`** — last touched Session 29. Future: config value change detection (compare Export snapshots), config documentation generator
 9. **Revisit `framework/log`** — just revisited in Session 31. Future: mmap-based query for very large files (deferred — current linear scan acceptable for admin viewer with daily rotation), log rotation callback (notify when file rotates), per-request sampling (sample by request_id hash for consistent traces)
 10. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
 
