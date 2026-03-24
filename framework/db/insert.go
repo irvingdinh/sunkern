@@ -9,6 +9,26 @@ import (
 	"time"
 )
 
+// autoFillBaseModel sets empty ID and zero timestamps on a struct's BaseModel
+// fields via reflection. Called by Model() and ModelSlice() to auto-populate
+// standard fields on insertion.
+func autoFillBaseModel(rv reflect.Value, m *fieldMapping, now time.Time) {
+	if idIdx, ok := m.colToIndex["id"]; ok {
+		f := rv.FieldByIndex(idIdx)
+		if f.CanSet() && f.Kind() == reflect.String && f.String() == "" {
+			f.SetString(NewID())
+		}
+	}
+	for _, col := range []string{"created_at", "updated_at"} {
+		if idx, ok := m.colToIndex[col]; ok {
+			f := rv.FieldByIndex(idx)
+			if f.CanSet() && f.Type() == reflect.TypeOf(time.Time{}) && f.Interface().(time.Time).IsZero() {
+				f.Set(reflect.ValueOf(now))
+			}
+		}
+	}
+}
+
 // InsertBuilder builds an INSERT query. Create one with Insert().
 type InsertBuilder struct {
 	table    *TableInfo
@@ -52,7 +72,10 @@ func (b *InsertBuilder) OnConflict(cols ...column) *ConflictBuilder {
 // struct matches what gets inserted:
 //   - Generates a new ID if the "id" field is an empty string
 //   - Sets created_at and updated_at to time.Now() if they are zero values
-//   - Skips nil *time.Time fields (lets DB DEFAULT apply)
+//   - Skips nil pointer fields (lets DB DEFAULT apply)
+//   - Dereferences non-nil pointer fields before binding
+//
+// Columns are emitted in deterministic (sorted) order.
 //
 // Usage:
 //
@@ -75,60 +98,41 @@ func (b *InsertBuilder) Model(v any) *InsertBuilder {
 	m := getMapping(rt)
 	now := time.Now()
 
-	// Auto-fill BaseModel fields when a pointer is passed, so the caller's
-	// struct stays in sync with what gets inserted.
+	// Auto-fill BaseModel fields when a pointer is passed.
 	if canSet {
-		if idIdx, ok := m.colToIndex["id"]; ok {
-			f := rv.FieldByIndex(idIdx)
-			if f.Kind() == reflect.String && f.String() == "" {
-				f.SetString(NewID())
-			}
-		}
-		for _, col := range []string{"created_at", "updated_at"} {
-			if idx, ok := m.colToIndex[col]; ok {
-				f := rv.FieldByIndex(idx)
-				if f.Type() == reflect.TypeOf(time.Time{}) && f.Interface().(time.Time).IsZero() {
-					f.Set(reflect.ValueOf(now))
-				}
-			}
-		}
+		autoFillBaseModel(rv, m, now)
 	}
 
+	sorted := sortedMapKeys(m.colToIndex)
 	var cols []column
 	var vals []any
 
-	for colName, idx := range m.colToIndex {
+	for _, colName := range sorted {
+		idx := m.colToIndex[colName]
 		field := rv.FieldByIndex(idx)
 		fieldType := field.Type()
 		val := field.Interface()
 
-		// Handle *time.Time: skip nil (let DB DEFAULT apply).
-		if fieldType == reflect.TypeOf((*time.Time)(nil)) {
+		// Pointer types: skip nil (let DB DEFAULT apply), dereference non-nil.
+		if fieldType.Kind() == reflect.Ptr {
 			if field.IsNil() {
 				continue
 			}
-			t := val.(*time.Time)
 			cols = append(cols, newSyntheticColumn(b.table.name, colName))
-			vals = append(vals, *t)
+			vals = append(vals, field.Elem().Interface())
 			continue
 		}
 
-		// Handle time.Time: auto-set created_at/updated_at if zero.
-		// This covers the non-pointer path where canSet is false.
-		if fieldType == reflect.TypeOf(time.Time{}) {
-			t := val.(time.Time)
-			if t.IsZero() && (colName == "created_at" || colName == "updated_at") {
-				t = now
-			}
-			cols = append(cols, newSyntheticColumn(b.table.name, colName))
-			vals = append(vals, t)
-			continue
-		}
-
-		// Auto-generate ID for non-pointer path.
+		// Non-pointer auto-fill (for the case where canSet is false).
 		if colName == "id" && fieldType.Kind() == reflect.String && val.(string) == "" {
 			cols = append(cols, newSyntheticColumn(b.table.name, colName))
 			vals = append(vals, NewID())
+			continue
+		}
+		if (colName == "created_at" || colName == "updated_at") &&
+			fieldType == reflect.TypeOf(time.Time{}) && val.(time.Time).IsZero() {
+			cols = append(cols, newSyntheticColumn(b.table.name, colName))
+			vals = append(vals, now)
 			continue
 		}
 
@@ -138,6 +142,87 @@ func (b *InsertBuilder) Model(v any) *InsertBuilder {
 
 	b.columns = cols
 	b.values = [][]any{vals}
+	return b
+}
+
+// ModelSlice reads a slice of structs and builds a multi-row INSERT.
+// Each element is processed like Model(): BaseModel fields (ID, timestamps)
+// are auto-filled. Unlike Model(), nil pointer fields insert NULL rather
+// than being omitted, since all rows must have identical column lists.
+//
+// Accepts []T or []*T. For pointer slices, nil elements are skipped.
+//
+//	notes := []Note{{Title: "A"}, {Title: "B"}, {Title: "C"}}
+//	db.Insert(&Notes.TableInfo).ModelSlice(notes).Exec(ctx, writeDB)
+func (b *InsertBuilder) ModelSlice(slice any) *InsertBuilder {
+	rv := reflect.ValueOf(slice)
+	if rv.Kind() == reflect.Ptr {
+		rv = rv.Elem()
+	}
+	if rv.Kind() != reflect.Slice || rv.Len() == 0 {
+		return b
+	}
+
+	elemType := rv.Type().Elem()
+	isPtr := elemType.Kind() == reflect.Ptr
+	if isPtr {
+		elemType = elemType.Elem()
+	}
+
+	m := getMapping(elemType)
+	now := time.Now()
+	sorted := sortedMapKeys(m.colToIndex)
+
+	// Build column list (same for all rows).
+	cols := make([]column, len(sorted))
+	for i, k := range sorted {
+		cols[i] = newSyntheticColumn(b.table.name, k)
+	}
+
+	// Extract values for each row.
+	allVals := make([][]any, 0, rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		elem := rv.Index(i)
+		if isPtr {
+			if elem.IsNil() {
+				continue
+			}
+			elem = elem.Elem()
+		}
+
+		// Auto-fill BaseModel fields.
+		autoFillBaseModel(elem, m, now)
+
+		vals := make([]any, len(sorted))
+		for j, colName := range sorted {
+			idx := m.colToIndex[colName]
+			field := elem.FieldByIndex(idx)
+			fieldType := field.Type()
+
+			if fieldType.Kind() == reflect.Ptr {
+				if field.IsNil() {
+					vals[j] = nil
+				} else {
+					vals[j] = field.Elem().Interface()
+				}
+				continue
+			}
+
+			val := field.Interface()
+			if colName == "id" && fieldType.Kind() == reflect.String && val.(string) == "" {
+				vals[j] = NewID()
+			} else if (colName == "created_at" || colName == "updated_at") &&
+				fieldType == reflect.TypeOf(time.Time{}) && val.(time.Time).IsZero() {
+				vals[j] = now
+			} else {
+				vals[j] = val
+			}
+		}
+		allVals = append(allVals, vals)
+	}
+
+	b.columns = cols
+	b.values = allVals
 	return b
 }
 

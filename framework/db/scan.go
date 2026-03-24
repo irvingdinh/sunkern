@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"reflect"
+	"sort"
 	"sync"
 	"time"
 )
@@ -185,6 +186,17 @@ func scanRow[T any](rows *sql.Rows, columns []string, m *fieldMapping) (T, error
 	}
 
 	return item, nil
+}
+
+// sortedMapKeys returns the keys of a map[string][]int in sorted order.
+// Used by Model/SetModel for deterministic column ordering in generated SQL.
+func sortedMapKeys(m map[string][]int) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // setField converts a raw driver value to the target struct field type.

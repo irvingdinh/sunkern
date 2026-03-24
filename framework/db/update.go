@@ -45,6 +45,18 @@ func (b *UpdateBuilder) SetExpr(col column, expr Expr) *UpdateBuilder {
 	return b
 }
 
+// SetNull adds "column = NULL" to the SET clause. Use this to explicitly
+// set a nullable column to NULL, since SetModel() skips nil pointers
+// (which means "don't update this field").
+//
+//	db.Update(&Notes.TableInfo).
+//	    SetModel(req).
+//	    SetNull(Notes.Description).
+//	    Where(Notes.ID.Eq(id))
+func (b *UpdateBuilder) SetNull(col column) *UpdateBuilder {
+	return b.SetExpr(col, Raw("NULL"))
+}
+
 // Increment adds "column = column + amount" to the SET clause.
 func (b *UpdateBuilder) Increment(col column, amount int64) *UpdateBuilder {
 	return b.SetExpr(col, Raw(
@@ -63,10 +75,14 @@ func (b *UpdateBuilder) Decrement(col column, amount int64) *UpdateBuilder {
 // fields. It:
 //   - Always sets updated_at to time.Now()
 //   - Skips "id" and "created_at" (never update these)
-//   - Skips nil *time.Time fields (preserves existing DB value)
-//   - Skips zero-value fields (zero = "don't update this field")
+//   - Skips nil pointer fields (preserves existing DB value)
+//   - Dereferences non-nil pointer fields before binding
+//   - Skips zero-value non-pointer fields (zero = "don't update this field")
+//
+// SET clauses are emitted in deterministic (sorted) order.
 //
 // For explicit zero-value updates, chain .Set() after .SetModel().
+// For explicit NULL updates, chain .SetNull() after .SetModel().
 func (b *UpdateBuilder) SetModel(v any) *UpdateBuilder {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() == reflect.Ptr {
@@ -77,15 +93,15 @@ func (b *UpdateBuilder) SetModel(v any) *UpdateBuilder {
 	m := getMapping(rt)
 	now := time.Now()
 
-	for colName, idx := range m.colToIndex {
+	for _, colName := range sortedMapKeys(m.colToIndex) {
 		// Never update primary key or creation timestamp.
 		if colName == "id" || colName == "created_at" {
 			continue
 		}
 
+		idx := m.colToIndex[colName]
 		field := rv.FieldByIndex(idx)
 		fieldType := field.Type()
-		val := field.Interface()
 
 		// Always set updated_at to now.
 		if colName == "updated_at" {
@@ -94,30 +110,23 @@ func (b *UpdateBuilder) SetModel(v any) *UpdateBuilder {
 			continue
 		}
 
-		// Handle *time.Time: skip nil (preserves DB value).
-		if fieldType == reflect.TypeOf((*time.Time)(nil)) {
+		// Pointer types: skip nil (preserves DB value), dereference non-nil.
+		if fieldType.Kind() == reflect.Ptr {
 			if field.IsNil() {
 				continue
 			}
 			col := newSyntheticColumn(b.table.name, colName)
-			b.sets = append(b.sets, setClause{col: col, val: *val.(*time.Time)})
+			b.sets = append(b.sets, setClause{col: col, val: field.Elem().Interface()})
 			continue
 		}
 
-		// Skip zero-value fields.
+		// Skip zero-value non-pointer fields.
 		if field.IsZero() {
 			continue
 		}
 
-		// Handle time.Time: format for SQLite.
-		if fieldType == reflect.TypeOf(time.Time{}) {
-			col := newSyntheticColumn(b.table.name, colName)
-			b.sets = append(b.sets, setClause{col: col, val: val.(time.Time)})
-			continue
-		}
-
 		col := newSyntheticColumn(b.table.name, colName)
-		b.sets = append(b.sets, setClause{col: col, val: val})
+		b.sets = append(b.sets, setClause{col: col, val: field.Interface()})
 	}
 
 	return b

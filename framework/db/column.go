@@ -246,6 +246,56 @@ func (c NullIntColumn) Asc() OrderExpr               { return OrderExpr{col: c, 
 func (c NullIntColumn) Desc() OrderExpr              { return OrderExpr{col: c, desc: true} }
 
 // ===========================================================================
+// NullBoolColumn
+// ===========================================================================
+
+// NullBoolColumn represents a nullable INTEGER column storing 0/1 booleans.
+// Maps to *bool in model structs.
+type NullBoolColumn struct{ columnRef }
+
+// NullBool creates a NullBoolColumn and registers it with the table.
+func NullBool(t *TableInfo, name string) NullBoolColumn {
+	c := NullBoolColumn{columnRef{table: t.name, name: name}}
+	t.addColumn(c)
+	return c
+}
+
+func (c NullBoolColumn) Eq(val bool) Expr { return newComp(c, "=", val) }
+func (c NullBoolColumn) IsTrue() Expr     { return newComp(c, "=", true) }
+func (c NullBoolColumn) IsFalse() Expr    { return newComp(c, "=", false) }
+func (c NullBoolColumn) IsNull() Expr     { return newNullCheck(c, true) }
+func (c NullBoolColumn) IsNotNull() Expr  { return newNullCheck(c, false) }
+func (c NullBoolColumn) Asc() OrderExpr   { return OrderExpr{col: c, desc: false} }
+func (c NullBoolColumn) Desc() OrderExpr  { return OrderExpr{col: c, desc: true} }
+
+// ===========================================================================
+// NullFloatColumn
+// ===========================================================================
+
+// NullFloatColumn represents a nullable REAL column. Maps to *float64 in
+// model structs.
+type NullFloatColumn struct{ columnRef }
+
+// NullFloat creates a NullFloatColumn and registers it with the table.
+func NullFloat(t *TableInfo, name string) NullFloatColumn {
+	c := NullFloatColumn{columnRef{table: t.name, name: name}}
+	t.addColumn(c)
+	return c
+}
+
+func (c NullFloatColumn) Eq(val float64) Expr            { return newComp(c, "=", val) }
+func (c NullFloatColumn) Ne(val float64) Expr            { return newComp(c, "<>", val) }
+func (c NullFloatColumn) Gt(val float64) Expr            { return newComp(c, ">", val) }
+func (c NullFloatColumn) Lt(val float64) Expr            { return newComp(c, "<", val) }
+func (c NullFloatColumn) Gte(val float64) Expr           { return newComp(c, ">=", val) }
+func (c NullFloatColumn) Lte(val float64) Expr           { return newComp(c, "<=", val) }
+func (c NullFloatColumn) Between(low, high float64) Expr { return newBetween(c, low, high) }
+func (c NullFloatColumn) IsNull() Expr                   { return newNullCheck(c, true) }
+func (c NullFloatColumn) IsNotNull() Expr                { return newNullCheck(c, false) }
+func (c NullFloatColumn) Asc() OrderExpr                 { return OrderExpr{col: c, desc: false} }
+func (c NullFloatColumn) Desc() OrderExpr                { return OrderExpr{col: c, desc: true} }
+
+// ===========================================================================
 // RawColumn — escape hatch for SELECT expressions
 // ===========================================================================
 
