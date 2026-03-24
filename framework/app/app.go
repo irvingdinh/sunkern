@@ -185,12 +185,15 @@ func (a *App) run() error {
 	// Phase 1: Register all modules. Every module's Register() runs before
 	// any module's Boot(). Only container.Provide / config.SetDefault calls
 	// belong in Register.
+	phaseStart := time.Now()
 	slog.Info("registering modules", "count", len(a.modules), "modules", a.moduleNames())
 	if err := a.register(); err != nil {
 		return err
 	}
+	registerMs := time.Since(phaseStart).Milliseconds()
 
 	// Phase 2: Init framework services.
+	phaseStart = time.Now()
 	t := time.Now()
 	sunkerndb.Load()
 	container.Supply[*sunkerndb.DB](sunkerndb.Global())
@@ -224,14 +227,26 @@ func (a *App) run() error {
 	// module Register (which registers service-level defaults and rules).
 	// Catches misconfigurations before any module's Boot phase.
 	config.Validate()
+	frameworkMs := time.Since(phaseStart).Milliseconds()
 
 	// Phase 3: Boot all modules. Modules resolve services from the container
 	// and wire routes, event handlers, cron jobs, etc.
+	phaseStart = time.Now()
 	if err := a.boot(); err != nil {
 		return err
 	}
+	moduleBootMs := time.Since(phaseStart).Milliseconds()
+
+	// Phase 3b: Post-boot. Modules implementing PostBooter run setup after
+	// ALL modules have completed Boot — data seeding, cache warm-up, etc.
+	phaseStart = time.Now()
+	if err := a.postBoot(); err != nil {
+		return err
+	}
+	postBootMs := time.Since(phaseStart).Milliseconds()
 
 	// Phase 4: Start lifecycle hooks.
+	phaseStart = time.Now()
 	ctx := context.Background()
 	hookReports, err := container.Global().StartHooks(ctx)
 	if err != nil {
@@ -241,13 +256,19 @@ func (a *App) run() error {
 	for _, r := range hookReports {
 		slog.Debug("hook started", "hook", r.Name, "took_ms", r.DurationMs)
 	}
+	hooksMs := time.Since(phaseStart).Milliseconds()
 
 	a.ready.Store(true)
 	close(a.readyCh)
 
 	startAttrs := []any{
 		"env", a.env,
-		"boot_time", time.Since(bootStart),
+		"boot_time_ms", time.Since(bootStart).Milliseconds(),
+		"register_ms", registerMs,
+		"framework_ms", frameworkMs,
+		"module_boot_ms", moduleBootMs,
+		"post_boot_ms", postBootMs,
+		"hooks_ms", hooksMs,
 		"modules", len(a.modules),
 		"services", container.Len(),
 		"hooks", len(container.Global().Hooks()),
@@ -271,6 +292,13 @@ func (a *App) run() error {
 	defer cancel()
 
 	var errs []error
+
+	// Pre-shutdown: modules implementing PreShutdowner prepare for shutdown
+	// (stop accepting work, drain in-flight requests, flush buffers).
+	if err := a.preShutdown(shutdownCtx); err != nil {
+		errs = append(errs, err)
+	}
+
 	stopReports, stopErr := container.Global().StopHooks(shutdownCtx)
 	if stopErr != nil {
 		errs = append(errs, stopErr)
@@ -316,6 +344,38 @@ func (a *App) boot() error {
 		a.booted = append(a.booted, m)
 	}
 	return nil
+}
+
+func (a *App) postBoot() error {
+	for _, m := range a.booted {
+		pb, ok := m.(PostBooter)
+		if !ok {
+			continue
+		}
+		t := time.Now()
+		if err := pb.PostBoot(); err != nil {
+			_ = a.shutdownModules(context.Background())
+			return fmt.Errorf("post-boot %q: %w", m.Name(), err)
+		}
+		slog.Debug("module post-booted", "module", m.Name(), "took", time.Since(t))
+	}
+	return nil
+}
+
+func (a *App) preShutdown(ctx context.Context) error {
+	var errs []error
+	for _, m := range a.booted {
+		ps, ok := m.(PreShutdowner)
+		if !ok {
+			continue
+		}
+		t := time.Now()
+		if err := ps.PreShutdown(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("pre-shutdown %q: %w", m.Name(), err))
+		}
+		slog.Debug("module pre-shutdown complete", "module", m.Name(), "took", time.Since(t))
+	}
+	return errors.Join(errs...)
 }
 
 func (a *App) shutdownModules(ctx context.Context) error {

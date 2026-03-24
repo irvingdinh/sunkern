@@ -57,6 +57,65 @@ func (m *testModule) Shutdown(ctx context.Context) error {
 	return nil
 }
 
+// testModuleWithPostBoot extends testModule with the PostBooter interface.
+type testModuleWithPostBoot struct {
+	testModule
+	postBootFn func() error
+}
+
+func (m *testModuleWithPostBoot) PostBoot() error {
+	m.mu.Lock()
+	m.calls = append(m.calls, "post-boot")
+	m.mu.Unlock()
+	if m.postBootFn != nil {
+		return m.postBootFn()
+	}
+	return nil
+}
+
+// testModuleWithPreShutdown extends testModule with the PreShutdowner interface.
+type testModuleWithPreShutdown struct {
+	testModule
+	preShutdownFn func(context.Context) error
+}
+
+func (m *testModuleWithPreShutdown) PreShutdown(ctx context.Context) error {
+	m.mu.Lock()
+	m.calls = append(m.calls, "pre-shutdown")
+	m.mu.Unlock()
+	if m.preShutdownFn != nil {
+		return m.preShutdownFn(ctx)
+	}
+	return nil
+}
+
+// testModuleWithBothHooks extends testModule with PostBooter and PreShutdowner.
+type testModuleWithBothHooks struct {
+	testModule
+	postBootFn    func() error
+	preShutdownFn func(context.Context) error
+}
+
+func (m *testModuleWithBothHooks) PostBoot() error {
+	m.mu.Lock()
+	m.calls = append(m.calls, "post-boot")
+	m.mu.Unlock()
+	if m.postBootFn != nil {
+		return m.postBootFn()
+	}
+	return nil
+}
+
+func (m *testModuleWithBothHooks) PreShutdown(ctx context.Context) error {
+	m.mu.Lock()
+	m.calls = append(m.calls, "pre-shutdown")
+	m.mu.Unlock()
+	if m.preShutdownFn != nil {
+		return m.preShutdownFn(ctx)
+	}
+	return nil
+}
+
 // newTestApp creates an App with an immediate-cancel signal context so Run
 // proceeds through boot and immediately begins shutdown without blocking.
 func newTestApp(t *testing.T) *App {
@@ -474,6 +533,311 @@ func TestModuleGroupShutdownOnlyBooted(t *testing.T) {
 	_ = g.Shutdown(context.Background())
 	if len(shutdowns) != 0 {
 		t.Errorf("Shutdown after failed Boot should be no-op, got %v", shutdowns)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// PostBoot / PreShutdown
+// ---------------------------------------------------------------------------
+
+func TestPostBoot(t *testing.T) {
+	a := newTestApp(t)
+
+	m := &testModuleWithPostBoot{
+		testModule: testModule{BaseModule: BaseModule{ModuleName: "m1"}},
+	}
+	a.Use(m)
+
+	if err := a.run(); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	if !contains(m.calls, "post-boot") {
+		t.Error("PostBoot should have been called")
+	}
+}
+
+func TestPostBootAfterAllBoot(t *testing.T) {
+	a := newTestApp(t)
+
+	var mu sync.Mutex
+	var events []string
+	record := func(s string) {
+		mu.Lock()
+		events = append(events, s)
+		mu.Unlock()
+	}
+
+	// m1: regular module (no PostBoot)
+	a.Use(&testModule{
+		BaseModule: BaseModule{ModuleName: "m1"},
+		bootFn:     func() error { record("m1:boot"); return nil },
+	})
+
+	// m2: has PostBoot
+	a.Use(&testModuleWithPostBoot{
+		testModule: testModule{
+			BaseModule: BaseModule{ModuleName: "m2"},
+			bootFn:     func() error { record("m2:boot"); return nil },
+		},
+		postBootFn: func() error { record("m2:post-boot"); return nil },
+	})
+
+	// m3: regular module (no PostBoot)
+	a.Use(&testModule{
+		BaseModule: BaseModule{ModuleName: "m3"},
+		bootFn:     func() error { record("m3:boot"); return nil },
+	})
+
+	if err := a.run(); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	// All boots before any post-boot.
+	lastBoot := -1
+	firstPostBoot := len(events)
+	for i, e := range events {
+		if strings.HasSuffix(e, ":boot") && i > lastBoot {
+			lastBoot = i
+		}
+		if strings.HasSuffix(e, ":post-boot") && i < firstPostBoot {
+			firstPostBoot = i
+		}
+	}
+	if lastBoot >= firstPostBoot {
+		t.Errorf("post-boot should come after all boots: events = %v", events)
+	}
+}
+
+func TestPostBootFailureRollback(t *testing.T) {
+	a := newTestApp(t)
+
+	m1 := &testModule{BaseModule: BaseModule{ModuleName: "m1"}}
+	m2 := &testModuleWithPostBoot{
+		testModule: testModule{BaseModule: BaseModule{ModuleName: "m2"}},
+		postBootFn: func() error { return errors.New("m2 post-boot failed") },
+	}
+	m3 := &testModule{BaseModule: BaseModule{ModuleName: "m3"}}
+
+	a.Use(m1, m2, m3)
+
+	err := a.run()
+	if err == nil || !strings.Contains(err.Error(), "m2 post-boot failed") {
+		t.Fatalf("expected post-boot error, got: %v", err)
+	}
+
+	// All three modules booted → all three should be shut down on rollback.
+	if !contains(m1.calls, "shutdown") {
+		t.Error("m1 should have been shut down")
+	}
+	if !contains(m2.calls, "shutdown") {
+		t.Error("m2 should have been shut down")
+	}
+	if !contains(m3.calls, "shutdown") {
+		t.Error("m3 should have been shut down")
+	}
+}
+
+func TestPreShutdown(t *testing.T) {
+	a := newTestApp(t)
+
+	var mu sync.Mutex
+	var events []string
+	record := func(s string) {
+		mu.Lock()
+		events = append(events, s)
+		mu.Unlock()
+	}
+
+	m := &testModuleWithPreShutdown{
+		testModule: testModule{
+			BaseModule: BaseModule{ModuleName: "m1"},
+			shutdownFn: func(_ context.Context) error { record("m1:shutdown"); return nil },
+		},
+		preShutdownFn: func(_ context.Context) error { record("m1:pre-shutdown"); return nil },
+	}
+	a.Use(m)
+
+	if err := a.run(); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	// Pre-shutdown should come before shutdown.
+	preIdx := -1
+	shutIdx := -1
+	for i, e := range events {
+		if e == "m1:pre-shutdown" {
+			preIdx = i
+		}
+		if e == "m1:shutdown" {
+			shutIdx = i
+		}
+	}
+	if preIdx == -1 {
+		t.Fatal("pre-shutdown not called")
+	}
+	if shutIdx == -1 {
+		t.Fatal("shutdown not called")
+	}
+	if preIdx >= shutIdx {
+		t.Errorf("pre-shutdown (idx=%d) should come before shutdown (idx=%d)", preIdx, shutIdx)
+	}
+}
+
+func TestPreShutdownBestEffort(t *testing.T) {
+	a := newTestApp(t)
+
+	m1 := &testModuleWithPreShutdown{
+		testModule: testModule{BaseModule: BaseModule{ModuleName: "m1"}},
+		preShutdownFn: func(_ context.Context) error {
+			return errors.New("m1 pre-shutdown failed")
+		},
+	}
+	m2 := &testModule{BaseModule: BaseModule{ModuleName: "m2"}}
+
+	a.Use(m1, m2)
+
+	err := a.run()
+	// PreShutdown error should be in the returned error.
+	if err == nil || !strings.Contains(err.Error(), "m1 pre-shutdown failed") {
+		t.Fatalf("expected pre-shutdown error, got: %v", err)
+	}
+
+	// Both modules should still be shut down despite pre-shutdown error.
+	if !contains(m1.calls, "shutdown") {
+		t.Error("m1 should have been shut down")
+	}
+	if !contains(m2.calls, "shutdown") {
+		t.Error("m2 should have been shut down")
+	}
+}
+
+func TestFullLifecycleOrder(t *testing.T) {
+	a := newTestApp(t)
+
+	var mu sync.Mutex
+	var events []string
+	record := func(s string) {
+		mu.Lock()
+		events = append(events, s)
+		mu.Unlock()
+	}
+
+	m := &testModuleWithBothHooks{
+		testModule: testModule{
+			BaseModule: BaseModule{ModuleName: "m1"},
+			registerFn: func() error { record("register"); return nil },
+			bootFn:     func() error { record("boot"); return nil },
+			shutdownFn: func(_ context.Context) error { record("shutdown"); return nil },
+		},
+		postBootFn:    func() error { record("post-boot"); return nil },
+		preShutdownFn: func(_ context.Context) error { record("pre-shutdown"); return nil },
+	}
+	a.Use(m)
+
+	if err := a.run(); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	want := []string{"register", "boot", "post-boot", "pre-shutdown", "shutdown"}
+	if len(events) != len(want) {
+		t.Fatalf("events = %v, want %v", events, want)
+	}
+	for i := range want {
+		if events[i] != want[i] {
+			t.Errorf("events[%d] = %q, want %q", i, events[i], want[i])
+		}
+	}
+}
+
+func TestModuleGroupPostBoot(t *testing.T) {
+	var order []string
+	record := func(s string) { order = append(order, s) }
+
+	g := &ModuleGroup{
+		GroupName: "admin",
+		Modules: []Module{
+			&testModule{
+				BaseModule: BaseModule{ModuleName: "auth"},
+				bootFn:     func() error { record("auth:boot"); return nil },
+			},
+			&testModuleWithPostBoot{
+				testModule: testModule{
+					BaseModule: BaseModule{ModuleName: "users"},
+					bootFn:     func() error { record("users:boot"); return nil },
+				},
+				postBootFn: func() error { record("users:post-boot"); return nil },
+			},
+		},
+	}
+
+	if err := g.Register(); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Boot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.PostBoot(); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{"auth:boot", "users:boot", "users:post-boot"}
+	if len(order) != len(want) {
+		t.Fatalf("events = %v, want %v", order, want)
+	}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Errorf("events[%d] = %q, want %q", i, order[i], want[i])
+		}
+	}
+}
+
+func TestModuleGroupPreShutdown(t *testing.T) {
+	var order []string
+	record := func(s string) { order = append(order, s) }
+
+	g := &ModuleGroup{
+		GroupName: "admin",
+		Modules: []Module{
+			&testModuleWithPreShutdown{
+				testModule: testModule{
+					BaseModule: BaseModule{ModuleName: "auth"},
+					shutdownFn: func(_ context.Context) error { record("auth:shutdown"); return nil },
+				},
+				preShutdownFn: func(_ context.Context) error { record("auth:pre-shutdown"); return nil },
+			},
+			&testModule{
+				BaseModule: BaseModule{ModuleName: "users"},
+				shutdownFn: func(_ context.Context) error { record("users:shutdown"); return nil },
+			},
+		},
+	}
+
+	if err := g.Register(); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Boot(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-shutdown: only auth has PreShutdowner.
+	if err := g.PreShutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Then shutdown in reverse.
+	if err := g.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{"auth:pre-shutdown", "users:shutdown", "auth:shutdown"}
+	if len(order) != len(want) {
+		t.Fatalf("events = %v, want %v", order, want)
+	}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Errorf("events[%d] = %q, want %q", i, order[i], want[i])
+		}
 	}
 }
 

@@ -22,6 +22,29 @@ type Module interface {
 	Shutdown(ctx context.Context) error
 }
 
+// PostBooter is optionally implemented by modules that need to run setup
+// after ALL modules have completed Boot(). Use it when setup depends on
+// other modules being fully wired — data seeding, cache warm-up, or
+// starting background workers that need multiple services.
+//
+// If PostBoot returns an error, all booted modules are shut down
+// (same rollback semantics as Boot failure).
+type PostBooter interface {
+	PostBoot() error
+}
+
+// PreShutdowner is optionally implemented by modules that need to prepare
+// for shutdown before individual module Shutdown() calls begin. All
+// PreShutdown calls complete before any Shutdown call starts.
+//
+// Common use cases: stop accepting new work, drain in-flight requests,
+// flush buffers, send shutdown notifications.
+//
+// PreShutdown is best-effort — errors are collected, not fatal.
+type PreShutdowner interface {
+	PreShutdown(ctx context.Context) error
+}
+
 // BaseModule provides no-op defaults for the Module interface. Embed it
 // in concrete modules and override only the methods you need.
 //
@@ -80,6 +103,36 @@ func (g *ModuleGroup) Boot() error {
 
 func (g *ModuleGroup) Shutdown(ctx context.Context) error {
 	return g.shutdownBooted(ctx)
+}
+
+// PostBoot delegates to children that implement PostBooter.
+func (g *ModuleGroup) PostBoot() error {
+	for _, m := range g.booted {
+		pb, ok := m.(PostBooter)
+		if !ok {
+			continue
+		}
+		if err := pb.PostBoot(); err != nil {
+			return fmt.Errorf("module %s/%s post-boot: %w", g.GroupName, m.Name(), err)
+		}
+	}
+	return nil
+}
+
+// PreShutdown delegates to children that implement PreShutdowner.
+func (g *ModuleGroup) PreShutdown(ctx context.Context) error {
+	var errs []error
+	for _, m := range g.booted {
+		ps, ok := m.(PreShutdowner)
+		if !ok {
+			continue
+		}
+		if err := ps.PreShutdown(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("module %s/%s pre-shutdown: %w",
+				g.GroupName, m.Name(), err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (g *ModuleGroup) shutdownBooted(ctx context.Context) error {
