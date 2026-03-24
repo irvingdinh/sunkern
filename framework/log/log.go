@@ -40,8 +40,7 @@ func Load() {
 		AddSource: true,
 	})
 
-	dataDir := config.Get[string]("data_dir")
-	logsDir := filepath.Join(dataDir, "logs")
+	logsDir := filepath.Join(config.DataDir(), "logs")
 	if err := os.MkdirAll(logsDir, 0o755); err != nil {
 		panic(fmt.Sprintf("log: creating logs directory: %v", err))
 	}

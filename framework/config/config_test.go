@@ -167,7 +167,7 @@ func TestJSONOverridesDefault(t *testing.T) {
 
 func TestGetPanicsOnMissing(t *testing.T) {
 	loadEmpty(t)
-	mustPanic(t, "key not found", func() {
+	mustPanic(t, "not found", func() {
 		Get[string]("nonexistent.key")
 	})
 }
@@ -748,4 +748,295 @@ func TestConcurrentAccess(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+// ---------------------------------------------------------------------------
+// Has
+// ---------------------------------------------------------------------------
+
+func TestHasDefault(t *testing.T) {
+	loadEmpty(t)
+	SetDefault("port", 19110)
+	if !Has("port") {
+		t.Error("Has(port) = false, want true")
+	}
+}
+
+func TestHasJSON(t *testing.T) {
+	loadWithJSON(t, `{"db": {"host": "localhost"}}`)
+	if !Has("db.host") {
+		t.Error("Has(db.host) = false, want true")
+	}
+}
+
+func TestHasEnvVar(t *testing.T) {
+	loadEmpty(t)
+	t.Setenv("JWT_SECRET", "s3cret")
+	if !Has("jwt.secret") {
+		t.Error("Has(jwt.secret) = false, want true")
+	}
+}
+
+func TestHasMissing(t *testing.T) {
+	loadEmpty(t)
+	if Has("nonexistent") {
+		t.Error("Has(nonexistent) = true, want false")
+	}
+}
+
+func TestHasZeroValue(t *testing.T) {
+	loadEmpty(t)
+	SetDefault("empty", "")
+	if !Has("empty") {
+		t.Error("Has(empty) with zero value = false, want true")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DataDir
+// ---------------------------------------------------------------------------
+
+func TestDataDir(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("DATA_DIR", dir)
+	Load()
+	if got := DataDir(); got != dir {
+		t.Errorf("DataDir() = %q, want %q", got, dir)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// EnvName
+// ---------------------------------------------------------------------------
+
+func TestEnvName(t *testing.T) {
+	cases := map[string]string{
+		"port":        "PORT",
+		"jwt.secret":  "JWT_SECRET",
+		"db.host":     "DB_HOST",
+		"log.level":   "LOG_LEVEL",
+		"data_dir":    "DATA_DIR",
+		"a.b.c":       "A_B_C",
+	}
+	for key, want := range cases {
+		if got := EnvName(key); got != want {
+			t.Errorf("EnvName(%q) = %q, want %q", key, got, want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SetDefaults (bulk)
+// ---------------------------------------------------------------------------
+
+func TestSetDefaults(t *testing.T) {
+	loadEmpty(t)
+	SetDefaults(map[string]any{
+		"http.port":         19110,
+		"http.read_timeout": "15s",
+		"http.idle_timeout": "60s",
+	})
+	if got := Get[int]("http.port"); got != 19110 {
+		t.Errorf("http.port = %d, want 19110", got)
+	}
+	if got := Get[string]("http.read_timeout"); got != "15s" {
+		t.Errorf("http.read_timeout = %q, want %q", got, "15s")
+	}
+	if got := Get[string]("http.idle_timeout"); got != "60s" {
+		t.Errorf("http.idle_timeout = %q, want %q", got, "60s")
+	}
+}
+
+func TestSetDefaultsOverridesExisting(t *testing.T) {
+	loadEmpty(t)
+	SetDefault("http.port", 8080)
+	SetDefaults(map[string]any{
+		"http.port": 19110,
+	})
+	if got := Get[int]("http.port"); got != 19110 {
+		t.Errorf("http.port = %d, want 19110 (bulk should override)", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// All
+// ---------------------------------------------------------------------------
+
+func TestAll(t *testing.T) {
+	loadWithJSON(t, `{"db": {"host": "file-host"}, "port": 8080}`)
+	SetDefault("db.host", "default-host")
+	SetDefault("db.port", 5432)
+	t.Setenv("PORT", "443")
+
+	all := All()
+
+	// data_dir is always present.
+	if _, ok := all["data_dir"]; !ok {
+		t.Error("All() missing data_dir")
+	}
+
+	// db.host: default → file override.
+	if got, ok := all["db.host"]; !ok || got != "file-host" {
+		t.Errorf("db.host = %v, want %q", got, "file-host")
+	}
+
+	// db.port: only default.
+	if got, ok := all["db.port"]; !ok || got != 5432 {
+		t.Errorf("db.port = %v, want 5432", got)
+	}
+
+	// port: file 8080 → env "443" (env wins).
+	if got, ok := all["port"]; !ok || got != "443" {
+		t.Errorf("port = %v, want %q", got, "443")
+	}
+}
+
+func TestAllReturnsSnapshotCopy(t *testing.T) {
+	loadEmpty(t)
+	SetDefault("key", "value")
+	all := All()
+	all["key"] = "mutated"
+	if got := Get[string]("key"); got != "value" {
+		t.Errorf("mutation leaked: key = %q, want %q", got, "value")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Keys
+// ---------------------------------------------------------------------------
+
+func TestKeys(t *testing.T) {
+	loadWithJSON(t, `{"db": {"host": "localhost"}}`)
+	SetDefault("port", 19110)
+	SetDefault("app.name", "sunkern")
+
+	keys := Keys()
+
+	// Should contain at least data_dir, port, app.name, db.host.
+	want := map[string]bool{
+		"data_dir": true,
+		"port":     true,
+		"app.name": true,
+		"db.host":  true,
+	}
+	got := make(map[string]bool)
+	for _, k := range keys {
+		got[k] = true
+	}
+	for k := range want {
+		if !got[k] {
+			t.Errorf("Keys() missing %q", k)
+		}
+	}
+
+	// Should be sorted.
+	for i := 1; i < len(keys); i++ {
+		if keys[i] < keys[i-1] {
+			t.Errorf("Keys() not sorted: %q before %q", keys[i-1], keys[i])
+			break
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Sub
+// ---------------------------------------------------------------------------
+
+func TestSub(t *testing.T) {
+	loadWithJSON(t, `{"db": {"host": "localhost", "port": 5432}}`)
+	SetDefault("db.pool_size", 10)
+	SetDefault("http.port", 19110)
+
+	sub := Sub("db")
+	if sub == nil {
+		t.Fatal("Sub(db) = nil, want non-nil")
+	}
+
+	// host from file.
+	if got, ok := sub["host"]; !ok || got != "localhost" {
+		t.Errorf("sub[host] = %v, want %q", got, "localhost")
+	}
+
+	// port from file.
+	if got, ok := sub["port"]; !ok {
+		t.Error("sub[port] missing")
+	} else if v, ok := toFloat64(got); !ok || v != 5432 {
+		t.Errorf("sub[port] = %v, want 5432", got)
+	}
+
+	// pool_size from default.
+	if got, ok := sub["pool_size"]; !ok || got != 10 {
+		t.Errorf("sub[pool_size] = %v, want 10", got)
+	}
+
+	// http.port should NOT be in db sub.
+	if _, ok := sub["http.port"]; ok {
+		t.Error("sub[http.port] should not be present")
+	}
+}
+
+func TestSubWithEnvOverride(t *testing.T) {
+	loadEmpty(t)
+	SetDefault("db.host", "default-host")
+	t.Setenv("DB_HOST", "env-host")
+
+	sub := Sub("db")
+	if got, ok := sub["host"]; !ok || got != "env-host" {
+		t.Errorf("sub[host] = %v, want %q (env should override)", got, "env-host")
+	}
+}
+
+func TestSubMissing(t *testing.T) {
+	loadEmpty(t)
+	if sub := Sub("nonexistent"); sub != nil {
+		t.Errorf("Sub(nonexistent) = %v, want nil", sub)
+	}
+}
+
+func TestSubReturnsCopy(t *testing.T) {
+	loadEmpty(t)
+	SetDefault("db.host", "localhost")
+	sub := Sub("db")
+	sub["host"] = "mutated"
+	if got := Get[string]("db.host"); got != "localhost" {
+		t.Errorf("mutation leaked: db.host = %q, want %q", got, "localhost")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Load creates data directory
+// ---------------------------------------------------------------------------
+
+func TestLoadCreatesDataDir(t *testing.T) {
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "nested", "data")
+	t.Setenv("DATA_DIR", dir)
+	Load()
+
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("data dir not created: %v", err)
+	}
+	if !info.IsDir() {
+		t.Error("data dir is not a directory")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Improved panic messages
+// ---------------------------------------------------------------------------
+
+func TestGetPanicIncludesEnvHint(t *testing.T) {
+	loadEmpty(t)
+	mustPanic(t, "JWT_SECRET", func() {
+		Get[string]("jwt.secret")
+	})
+}
+
+func TestGetCoercionPanicIncludesRawValue(t *testing.T) {
+	loadEmpty(t)
+	t.Setenv("PORT", "not-a-number")
+	mustPanic(t, "not-a-number", func() {
+		Get[int]("port")
+	})
 }

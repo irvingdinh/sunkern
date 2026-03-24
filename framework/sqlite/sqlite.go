@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
@@ -45,13 +44,7 @@ var global struct {
 // hook to close both pools. It reads the database path from config
 // ({data_dir}/database.sqlite). Call after config.Load().
 func Load() {
-	dataDir := config.Get[string]("data_dir")
-
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		panic(fmt.Sprintf("sqlite: creating data directory: %v", err))
-	}
-
-	dbPath := filepath.Join(dataDir, "database.sqlite")
+	dbPath := filepath.Join(config.DataDir(), "database.sqlite")
 
 	writeDB, err := sql.Open("sqlite3", "file:"+dbPath)
 	if err != nil {

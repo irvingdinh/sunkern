@@ -49,7 +49,7 @@ func TestLoadCreatesLogDirectory(t *testing.T) {
 	Load()
 	defer Close()
 
-	logsDir := filepath.Join(config.Get[string]("data_dir"), "logs")
+	logsDir := filepath.Join(config.DataDir(), "logs")
 	info, err := os.Stat(logsDir)
 	if err != nil {
 		t.Fatalf("logs directory not created: %v", err)
@@ -68,7 +68,7 @@ func TestLoadSetsDefaultLogger(t *testing.T) {
 	// Logging should write to the file. Verify a file exists in DATA_DIR/logs.
 	slog.Info("test message")
 
-	logsDir := filepath.Join(config.Get[string]("data_dir"), "logs")
+	logsDir := filepath.Join(config.DataDir(), "logs")
 	entries, _ := filepath.Glob(filepath.Join(logsDir, "*.log"))
 	if len(entries) == 0 {
 		t.Fatal("expected at least one log file after logging")

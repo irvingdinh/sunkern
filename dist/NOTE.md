@@ -8,7 +8,7 @@
 
 ## Current State
 
-**Last session**: 2026-03-24 — Session 6 (framework/http revisit — struct-tag request validation)
+**Last session**: 2026-03-24 — Session 7 (framework/config maturation)
 **Working tree**: clean
 **Branch**: with-experiment
 
@@ -18,12 +18,12 @@
 |---------|----------|--------------|-------|
 | `framework/app` | **Growing** | Session 4 | ModuleGroup boot rollback fix, lifecycle logging, module name tracking |
 | `framework/container` | **Growing** | Session 4 | Override/OverrideSupply, named hooks, all framework hooks named |
-| `framework/config` | Initial | — | 3-layer resolution works |
-| `framework/log` | Initial | — | Dual output works |
+| `framework/config` | **Growing** | Session 7 | Added Has, All, Keys, Sub, DataDir, EnvName, SetDefaults; Load creates data dir; improved panic messages |
+| `framework/log` | Initial | — | Dual output works; now uses config.DataDir() |
 | `framework/http` | **Maturing** | Session 6 | Revisited: struct-tag validation (required, min/max, email, url, oneof), Validator interface, FieldError details in APIError, auto-validates in Bind/BindQuery |
 | `framework/http/middleware` | **Growing** | Session 3 | RequestID, RequestLogger, Recover (panic recovery), CORS (functional options), RateLimit (token bucket) |
 | `framework/db` | **Maturing** | Session 5 | Revisited: deterministic column order, generalized pointer handling, SetNull, ModelSlice batch insert, NullBoolColumn/NullFloatColumn, cursor pagination (After + HasMore) |
-| `framework/sqlite` | Initial | — | Dual pool works |
+| `framework/sqlite` | Initial | Session 7 | Dual pool works; removed redundant data dir creation (config.Load handles it now); uses config.DataDir() |
 | `framework/sqlite/driver` | Initial | — | CGo binding works |
 | `framework/sqlite/migrate` | Initial | — | SQL migration engine works |
 
@@ -92,6 +92,18 @@ Session 6 (http revisit, contact manager with validation, 5k rows):
 - [memory] 42 MB RSS after 25k+ writes and 90k+ load test requests
 - [validation overhead] negligible — 74k req/s rejection path vs 52k baseline GET shows validation adds <0.1ms
 
+Session 7 (config, feature-flag app with config introspection, 100 DB rows):
+- [config/GET all] 65,630 req/s, p99 2.6ms — All() with 10 keys, env override check
+- [config/GET keys] 67,625 req/s, p99 2.5ms — Keys() sorted, 10 keys with EnvName mapping
+- [config/GET sub] 67,625 req/s, p99 2.5ms — Sub("feature") returning 3 keys
+- [config/GET features] 65,461 req/s, p99 2.5ms — Has() + Sub() + GetOr() combined
+- [config/GET health] 66,270 req/s, p99 2.5ms — GetOr() for app name/version
+- [settings/GET list] 10,148 req/s, p99 — list 100 rows, sorted by key
+- [settings/GET single] 56,001 req/s, p99 2.7ms — single read by key
+- [settings/PUT upsert] 36,810 req/s, p99 — read-then-write upsert
+- [memory] 30 MB RSS after 160k+ requests
+- [race] No data races detected with -race flag on concurrent config access
+
 ## Design Decisions
 
 <!-- Key decisions and rationale so future sessions don't reverse them. Format:
@@ -125,18 +137,23 @@ Session 6 (http revisit, contact manager with validation, 5k rows):
 - [http] Validation errors return 422 with `{"error": {"code": "validation_error", "message": "Validation failed", "details": [...]}}`. Field-level details include field name, rule name, and human-readable message. (Session 6)
 - [http] Validator interface allows custom cross-field validation after tag-based validation passes. Used for bulk operations (validate each item in an array) or business rules that tags can't express. (Session 6)
 - [http] Embedded structs are recursed — enables shared paginationParams with validation reused across list endpoints. (Session 6)
+- [config] Load() creates the data directory — downstream packages (sqlite, log) no longer need to. Single point of responsibility. (Session 7)
+- [config] All() and Keys() only enumerate keys from defaults + config file, then check env overrides. Keys that exist solely as env vars (never registered via SetDefault or config.json) are not discoverable — this is intentional; it avoids scanning the entire environment. (Session 7)
+- [config] Sub() returns a flat map with prefix stripped — not a nested config instance. Simple and sufficient for passing config sections to subsystems. Returns nil (not empty map) when no keys match. (Session 7)
+- [config] Panic messages in Get() now include the env var name as a hint — `config: key "jwt.secret" not found (set JWT_SECRET env var or add to config.json)`. Coercion failures include the raw value for debugging. (Session 7)
 
 ## Next Priorities
 
 <!-- What the last session thinks should come next, in order -->
 
-1. **`framework/config` / `framework/log`** — still at Initial maturity, need playground stress-testing and API review
+1. **`framework/log`** — still at Initial maturity, needs playground stress-testing and API review (config is now Growing)
 2. **Revisit `framework/http`** — file upload handling (multipart/form-data), SSE support for real-time events
 3. **`framework/db` advanced** — RETURNING clause (eliminate update-then-fetch pattern), subqueries in WHERE, CASE expressions
 4. **Revisit `framework/http/middleware`** — auth middleware (JWT validation, role-based), request timeout middleware
 5. **Revisit `framework/app` / `framework/container`** — now Growing, revisit after other packages evolve
-6. **Revisit `framework/db`** — revisit after http/config/log mature, fresh perspective on API ergonomics
-7. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
+6. **Revisit `framework/config`** — revisit after log matures, consider config validation (type constraints, allowed values)
+7. **Revisit `framework/db`** — revisit after http/config/log mature, fresh perspective on API ergonomics
+8. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
 
 ## In-Progress Work
 
