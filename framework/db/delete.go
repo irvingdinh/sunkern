@@ -13,6 +13,14 @@ type DeleteBuilder struct {
 	table     *TableInfo
 	where     []Expr
 	returning []column
+	ctes      []*CTEDef
+}
+
+// With attaches Common Table Expressions to this DELETE. The WITH clause is
+// rendered before the DELETE statement.
+func (b *DeleteBuilder) With(ctes ...*CTEDef) *DeleteBuilder {
+	b.ctes = append(b.ctes, ctes...)
+	return b
 }
 
 // Delete starts a DELETE query for the given table.
@@ -34,6 +42,9 @@ func (b *DeleteBuilder) Build() (string, []any, error) {
 
 	var buf strings.Builder
 	var args []any
+
+	// WITH clause
+	writeCTEs(&buf, &args, b.ctes)
 
 	buf.WriteString("DELETE FROM ")
 	buf.WriteString(quoteIdent(b.table.name))

@@ -9,8 +9,8 @@ import (
 
 // SelectBuilder builds a SELECT query. Create one with Select().
 type SelectBuilder struct {
-	table    *TableInfo
-	columns  []Expr // if empty, uses table.Star()
+	table    *TableInfo // nil for tableless SELECT (e.g., CTE base case)
+	columns  []Expr     // if empty, uses table.Star()
 	distinct bool
 	where    []Expr // ANDed together
 	orderBy  []OrderExpr
@@ -19,6 +19,7 @@ type SelectBuilder struct {
 	joins    []joinClause
 	groupBy  []Expr
 	having   []Expr
+	ctes     []*CTEDef
 }
 
 type joinClause struct {
@@ -27,9 +28,23 @@ type joinClause struct {
 	on       Expr
 }
 
-// Select starts a SELECT query for the given table.
+// Select starts a SELECT query for the given table. Pass nil for a tableless
+// SELECT (e.g., SELECT 1 as a CTE base case).
 func Select(table *TableInfo) *SelectBuilder {
 	return &SelectBuilder{table: table}
+}
+
+// With attaches Common Table Expressions to this query. The WITH clause is
+// rendered before the SELECT. If any CTE is recursive, WITH RECURSIVE is used.
+//
+//	active := db.NewCTE("active_users",
+//	    db.Select(&Users.TableInfo).Where(Users.Active.Eq(true)),
+//	)
+//	q := db.Select(active.Ref()).With(active).
+//	    Columns(active.Col("id"), active.Col("name"))
+func (b *SelectBuilder) With(ctes ...*CTEDef) *SelectBuilder {
+	b.ctes = append(b.ctes, ctes...)
+	return b
 }
 
 // Distinct causes SELECT DISTINCT to be generated.
@@ -112,13 +127,16 @@ func (b *SelectBuilder) Build() (string, []any) {
 	var buf strings.Builder
 	var args []any
 
+	// WITH clause
+	writeCTEs(&buf, &args, b.ctes)
+
 	// SELECT
 	buf.WriteString("SELECT ")
 	if b.distinct {
 		buf.WriteString("DISTINCT ")
 	}
 	cols := b.columns
-	if len(cols) == 0 {
+	if len(cols) == 0 && b.table != nil {
 		cols = b.table.Star()
 	}
 	for i, col := range cols {
@@ -128,9 +146,11 @@ func (b *SelectBuilder) Build() (string, []any) {
 		col.WriteSQL(&buf, &args)
 	}
 
-	// FROM
-	buf.WriteString(" FROM ")
-	b.table.WriteSQL(&buf, &args)
+	// FROM (omitted for tableless SELECT, e.g., CTE base case)
+	if b.table != nil {
+		buf.WriteString(" FROM ")
+		b.table.WriteSQL(&buf, &args)
+	}
 
 	// JOINs
 	writeJoins(&buf, &args, b.joins)
@@ -203,6 +223,9 @@ func (b *SelectBuilder) buildCount() (string, []any) {
 	var buf strings.Builder
 	var args []any
 
+	// WITH clause
+	writeCTEs(&buf, &args, b.ctes)
+
 	if b.distinct && len(b.columns) > 0 {
 		buf.WriteString("SELECT COUNT(DISTINCT ")
 		for i, col := range b.columns {
@@ -211,11 +234,14 @@ func (b *SelectBuilder) buildCount() (string, []any) {
 			}
 			col.WriteSQL(&buf, &args)
 		}
-		buf.WriteString(") FROM ")
+		buf.WriteString(")")
 	} else {
-		buf.WriteString("SELECT COUNT(*) FROM ")
+		buf.WriteString("SELECT COUNT(*)")
 	}
-	b.table.WriteSQL(&buf, &args)
+	if b.table != nil {
+		buf.WriteString(" FROM ")
+		b.table.WriteSQL(&buf, &args)
+	}
 
 	writeJoins(&buf, &args, b.joins)
 

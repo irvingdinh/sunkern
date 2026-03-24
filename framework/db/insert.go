@@ -36,6 +36,14 @@ type InsertBuilder struct {
 	values    [][]any // one inner slice per row
 	conflict  *conflictClause
 	returning []column
+	ctes      []*CTEDef
+}
+
+// With attaches Common Table Expressions to this INSERT. The WITH clause is
+// rendered before the INSERT statement.
+func (b *InsertBuilder) With(ctes ...*CTEDef) *InsertBuilder {
+	b.ctes = append(b.ctes, ctes...)
+	return b
 }
 
 // Insert starts an INSERT query for the given table.
@@ -231,6 +239,9 @@ func (b *InsertBuilder) ModelSlice(slice any) *InsertBuilder {
 func (b *InsertBuilder) Build() (string, []any) {
 	var buf strings.Builder
 	var args []any
+
+	// WITH clause
+	writeCTEs(&buf, &args, b.ctes)
 
 	buf.WriteString("INSERT INTO ")
 	buf.WriteString(quoteIdent(b.table.name))

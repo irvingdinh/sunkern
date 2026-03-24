@@ -23,6 +23,7 @@ type SetBuilder struct {
 	orderBy []OrderExpr
 	limit   *int
 	offset  *int
+	ctes    []*CTEDef
 }
 
 // Union combines SELECT queries with UNION, which removes duplicate rows
@@ -89,10 +90,20 @@ func (b *SetBuilder) Offset(n int) *SetBuilder {
 	return b
 }
 
+// With attaches Common Table Expressions to this set operation. The WITH
+// clause is rendered before the first SELECT.
+func (b *SetBuilder) With(ctes ...*CTEDef) *SetBuilder {
+	b.ctes = append(b.ctes, ctes...)
+	return b
+}
+
 // Build generates the SQL string and args for the set operation.
 func (b *SetBuilder) Build() (string, []any) {
 	var buf strings.Builder
 	var args []any
+
+	// WITH clause
+	writeCTEs(&buf, &args, b.ctes)
 
 	for i, q := range b.queries {
 		if i > 0 {

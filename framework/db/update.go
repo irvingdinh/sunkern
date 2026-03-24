@@ -16,6 +16,14 @@ type UpdateBuilder struct {
 	sets      []setClause
 	where     []Expr
 	returning []column
+	ctes      []*CTEDef
+}
+
+// With attaches Common Table Expressions to this UPDATE. The WITH clause is
+// rendered before the UPDATE statement.
+func (b *UpdateBuilder) With(ctes ...*CTEDef) *UpdateBuilder {
+	b.ctes = append(b.ctes, ctes...)
+	return b
 }
 
 type setClause struct {
@@ -167,6 +175,9 @@ func (b *UpdateBuilder) Build() (string, []any, error) {
 
 	var buf strings.Builder
 	var args []any
+
+	// WITH clause
+	writeCTEs(&buf, &args, b.ctes)
 
 	buf.WriteString("UPDATE ")
 	buf.WriteString(quoteIdent(b.table.name))
