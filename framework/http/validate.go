@@ -313,6 +313,9 @@ func resolveFieldName(f reflect.StructField) string {
 	if tag := f.Tag.Get("query"); tag != "" && tag != "-" {
 		return tag
 	}
+	if tag := f.Tag.Get("form"); tag != "" && tag != "-" {
+		return tag
+	}
 	if len(f.Name) > 0 {
 		return strings.ToLower(f.Name[:1]) + f.Name[1:]
 	}

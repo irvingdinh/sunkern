@@ -42,9 +42,11 @@ var (
 	ErrNotFound            = &APIError{Status: httpstd.StatusNotFound, Code: "not_found", Message: "Not found"}
 	ErrConflict            = &APIError{Status: httpstd.StatusConflict, Code: "conflict", Message: "Conflict"}
 	ErrUnprocessableEntity = &APIError{Status: httpstd.StatusUnprocessableEntity, Code: "unprocessable_entity", Message: "Unprocessable entity"}
-	ErrTooManyRequests     = &APIError{Status: httpstd.StatusTooManyRequests, Code: "too_many_requests", Message: "Too many requests"}
-	ErrInternal            = &APIError{Status: httpstd.StatusInternalServerError, Code: "internal_error", Message: "Internal server error"}
-	ErrValidation          = &APIError{Status: httpstd.StatusUnprocessableEntity, Code: "validation_error", Message: "Validation failed"}
+	ErrPayloadTooLarge      = &APIError{Status: httpstd.StatusRequestEntityTooLarge, Code: "payload_too_large", Message: "Payload too large"}
+	ErrUnsupportedMediaType = &APIError{Status: httpstd.StatusUnsupportedMediaType, Code: "unsupported_media_type", Message: "Unsupported media type"}
+	ErrTooManyRequests      = &APIError{Status: httpstd.StatusTooManyRequests, Code: "too_many_requests", Message: "Too many requests"}
+	ErrInternal             = &APIError{Status: httpstd.StatusInternalServerError, Code: "internal_error", Message: "Internal server error"}
+	ErrValidation           = &APIError{Status: httpstd.StatusUnprocessableEntity, Code: "validation_error", Message: "Validation failed"}
 )
 
 // NewError creates a custom APIError with the given status, code, and message.
