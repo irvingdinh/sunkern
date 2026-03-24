@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -841,189 +842,369 @@ func writeTestEntries(t *testing.T, date string, count int) {
 func TestQuery(t *testing.T) {
 	setup(t)
 	writeTestEntries(t, "2025_03_15", 50)
+	ctx := context.Background()
 
 	// All entries.
-	entries, total, err := Query("2025_03_15", QueryOptions{})
+	res, err := Query(ctx, "2025_03_15", QueryOptions{})
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
-	if total != 50 {
-		t.Errorf("total = %d, want 50", total)
+	if res.Total != 50 {
+		t.Errorf("total = %d, want 50", res.Total)
 	}
-	if len(entries) != 50 {
-		t.Errorf("entries = %d, want 50", len(entries))
+	if len(res.Entries) != 50 {
+		t.Errorf("entries = %d, want 50", len(res.Entries))
 	}
 
 	// Level filter.
-	entries, total, _ = Query("2025_03_15", QueryOptions{Level: "ERROR"})
-	if total != 10 {
-		t.Errorf("ERROR total = %d, want 10", total)
+	res, _ = Query(ctx, "2025_03_15", QueryOptions{Level: "ERROR"})
+	if res.Total != 10 {
+		t.Errorf("ERROR total = %d, want 10", res.Total)
 	}
-	if len(entries) != 10 {
-		t.Errorf("ERROR entries = %d, want 10", len(entries))
+	if len(res.Entries) != 10 {
+		t.Errorf("ERROR entries = %d, want 10", len(res.Entries))
 	}
 
 	// Search.
-	entries, total, _ = Query("2025_03_15", QueryOptions{Search: "event 42"})
-	if total != 1 {
-		t.Errorf("search total = %d, want 1", total)
+	res, _ = Query(ctx, "2025_03_15", QueryOptions{Search: "event 42"})
+	if res.Total != 1 {
+		t.Errorf("search total = %d, want 1", res.Total)
 	}
 
 	// RequestID filter.
-	entries, total, _ = Query("2025_03_15", QueryOptions{RequestID: "req-0"})
-	if total != 5 {
-		t.Errorf("request_id total = %d, want 5", total)
+	res, _ = Query(ctx, "2025_03_15", QueryOptions{RequestID: "req-0"})
+	if res.Total != 5 {
+		t.Errorf("request_id total = %d, want 5", res.Total)
 	}
 
 	// Pagination.
-	entries, total, _ = Query("2025_03_15", QueryOptions{Limit: 5, Offset: 10})
-	if total != 50 {
-		t.Errorf("paginated total = %d, want 50", total)
+	res, _ = Query(ctx, "2025_03_15", QueryOptions{Limit: 5, Offset: 10})
+	if res.Total != 50 {
+		t.Errorf("paginated total = %d, want 50", res.Total)
 	}
-	if len(entries) != 5 {
-		t.Errorf("paginated entries = %d, want 5", len(entries))
+	if len(res.Entries) != 5 {
+		t.Errorf("paginated entries = %d, want 5", len(res.Entries))
 	}
-	if entries[0].Message != "event 10" {
-		t.Errorf("first entry = %q, want 'event 10'", entries[0].Message)
+	if res.Entries[0].Message != "event 10" {
+		t.Errorf("first entry = %q, want 'event 10'", res.Entries[0].Message)
 	}
 }
 
 func TestQueryDescOrder(t *testing.T) {
 	setup(t)
 	writeTestEntries(t, "2025_03_15", 50)
+	ctx := context.Background()
 
 	// Desc order — newest first.
-	entries, total, err := Query("2025_03_15", QueryOptions{Order: "desc"})
+	res, err := Query(ctx, "2025_03_15", QueryOptions{Order: "desc"})
 	if err != nil {
 		t.Fatalf("Query desc: %v", err)
 	}
-	if total != 50 {
-		t.Errorf("total = %d, want 50", total)
+	if res.Total != 50 {
+		t.Errorf("total = %d, want 50", res.Total)
 	}
-	if len(entries) != 50 {
-		t.Errorf("entries = %d, want 50", len(entries))
+	if len(res.Entries) != 50 {
+		t.Errorf("entries = %d, want 50", len(res.Entries))
 	}
 	// First entry should be the last one written (event 49).
-	if entries[0].Message != "event 49" {
-		t.Errorf("first desc entry = %q, want 'event 49'", entries[0].Message)
+	if res.Entries[0].Message != "event 49" {
+		t.Errorf("first desc entry = %q, want 'event 49'", res.Entries[0].Message)
 	}
 	// Last entry should be the first one written (event 0).
-	if entries[49].Message != "event 0" {
-		t.Errorf("last desc entry = %q, want 'event 0'", entries[49].Message)
+	if res.Entries[49].Message != "event 0" {
+		t.Errorf("last desc entry = %q, want 'event 0'", res.Entries[49].Message)
 	}
 
 	// Desc with pagination.
-	entries, total, _ = Query("2025_03_15", QueryOptions{Order: "desc", Limit: 5, Offset: 0})
-	if total != 50 {
-		t.Errorf("paginated desc total = %d, want 50", total)
+	res, _ = Query(ctx, "2025_03_15", QueryOptions{Order: "desc", Limit: 5, Offset: 0})
+	if res.Total != 50 {
+		t.Errorf("paginated desc total = %d, want 50", res.Total)
 	}
-	if len(entries) != 5 {
-		t.Errorf("paginated desc entries = %d, want 5", len(entries))
+	if len(res.Entries) != 5 {
+		t.Errorf("paginated desc entries = %d, want 5", len(res.Entries))
 	}
 	// First page of desc: events 49, 48, 47, 46, 45.
-	if entries[0].Message != "event 49" {
-		t.Errorf("first desc page entry = %q, want 'event 49'", entries[0].Message)
+	if res.Entries[0].Message != "event 49" {
+		t.Errorf("first desc page entry = %q, want 'event 49'", res.Entries[0].Message)
 	}
-	if entries[4].Message != "event 45" {
-		t.Errorf("last desc page entry = %q, want 'event 45'", entries[4].Message)
+	if res.Entries[4].Message != "event 45" {
+		t.Errorf("last desc page entry = %q, want 'event 45'", res.Entries[4].Message)
 	}
 
 	// Desc page 2.
-	entries, _, _ = Query("2025_03_15", QueryOptions{Order: "desc", Limit: 5, Offset: 5})
-	if entries[0].Message != "event 44" {
-		t.Errorf("desc page 2 first = %q, want 'event 44'", entries[0].Message)
+	res, _ = Query(ctx, "2025_03_15", QueryOptions{Order: "desc", Limit: 5, Offset: 5})
+	if res.Entries[0].Message != "event 44" {
+		t.Errorf("desc page 2 first = %q, want 'event 44'", res.Entries[0].Message)
 	}
 }
 
 func TestQueryTimeRange(t *testing.T) {
 	setup(t)
 	writeTestEntries(t, "2025_03_15", 50)
+	ctx := context.Background()
 
 	// After: entries at or after 10:00:30 (events 30-49).
 	after := time.Date(2025, 3, 15, 10, 0, 30, 0, time.UTC)
-	entries, total, err := Query("2025_03_15", QueryOptions{After: after})
+	res, err := Query(ctx, "2025_03_15", QueryOptions{After: after})
 	if err != nil {
 		t.Fatalf("Query after: %v", err)
 	}
-	if total != 20 {
-		t.Errorf("after total = %d, want 20", total)
+	if res.Total != 20 {
+		t.Errorf("after total = %d, want 20", res.Total)
 	}
-	if len(entries) != 20 {
-		t.Errorf("after entries = %d, want 20", len(entries))
+	if len(res.Entries) != 20 {
+		t.Errorf("after entries = %d, want 20", len(res.Entries))
 	}
 
 	// Before: entries strictly before 10:00:10 (events 0-9).
 	before := time.Date(2025, 3, 15, 10, 0, 10, 0, time.UTC)
-	entries, total, _ = Query("2025_03_15", QueryOptions{Before: before})
-	if total != 10 {
-		t.Errorf("before total = %d, want 10", total)
+	res, _ = Query(ctx, "2025_03_15", QueryOptions{Before: before})
+	if res.Total != 10 {
+		t.Errorf("before total = %d, want 10", res.Total)
 	}
 
 	// Combined range: 10:00:10 <= t < 10:00:20 (events 10-19).
-	entries, total, _ = Query("2025_03_15", QueryOptions{
+	res, _ = Query(ctx, "2025_03_15", QueryOptions{
 		After:  time.Date(2025, 3, 15, 10, 0, 10, 0, time.UTC),
 		Before: time.Date(2025, 3, 15, 10, 0, 20, 0, time.UTC),
 	})
-	if total != 10 {
-		t.Errorf("range total = %d, want 10", total)
+	if res.Total != 10 {
+		t.Errorf("range total = %d, want 10", res.Total)
 	}
-	if len(entries) != 10 {
-		t.Errorf("range entries = %d, want 10", len(entries))
+	if len(res.Entries) != 10 {
+		t.Errorf("range entries = %d, want 10", len(res.Entries))
 	}
 }
 
 func TestQueryCountOnly(t *testing.T) {
 	setup(t)
 	writeTestEntries(t, "2025_03_15", 50)
+	ctx := context.Background()
 
 	// CountOnly: total is computed, entries is nil.
-	entries, total, err := Query("2025_03_15", QueryOptions{CountOnly: true})
+	res, err := Query(ctx, "2025_03_15", QueryOptions{CountOnly: true})
 	if err != nil {
 		t.Fatalf("Query countOnly: %v", err)
 	}
-	if total != 50 {
-		t.Errorf("countOnly total = %d, want 50", total)
+	if res.Total != 50 {
+		t.Errorf("countOnly total = %d, want 50", res.Total)
 	}
-	if len(entries) != 0 {
-		t.Errorf("countOnly entries = %d, want 0", len(entries))
+	if len(res.Entries) != 0 {
+		t.Errorf("countOnly entries = %d, want 0", len(res.Entries))
 	}
 
 	// CountOnly with level filter.
-	_, total, _ = Query("2025_03_15", QueryOptions{CountOnly: true, Level: "ERROR"})
-	if total != 10 {
-		t.Errorf("countOnly ERROR total = %d, want 10", total)
+	res, _ = Query(ctx, "2025_03_15", QueryOptions{CountOnly: true, Level: "ERROR"})
+	if res.Total != 10 {
+		t.Errorf("countOnly ERROR total = %d, want 10", res.Total)
 	}
 
 	// CountOnly with user_id filter.
-	_, total, _ = Query("2025_03_15", QueryOptions{CountOnly: true, UserID: "user-0"})
-	if total != 17 {
-		t.Errorf("countOnly user-0 total = %d, want 17", total)
+	res, _ = Query(ctx, "2025_03_15", QueryOptions{CountOnly: true, UserID: "user-0"})
+	if res.Total != 17 {
+		t.Errorf("countOnly user-0 total = %d, want 17", res.Total)
 	}
 }
 
 func TestQueryUserIDFilter(t *testing.T) {
 	setup(t)
 	writeTestEntries(t, "2025_03_15", 50)
+	ctx := context.Background()
 
-	entries, total, err := Query("2025_03_15", QueryOptions{UserID: "user-0"})
+	res, err := Query(ctx, "2025_03_15", QueryOptions{UserID: "user-0"})
 	if err != nil {
 		t.Fatalf("Query user_id: %v", err)
 	}
 	// user-0 = indices 0,3,6,9,12,...,48 → 17 entries (i%3==0).
-	if total != 17 {
-		t.Errorf("user_id total = %d, want 17", total)
+	if res.Total != 17 {
+		t.Errorf("user_id total = %d, want 17", res.Total)
 	}
-	if len(entries) != 17 {
-		t.Errorf("user_id entries = %d, want 17", len(entries))
+	if len(res.Entries) != 17 {
+		t.Errorf("user_id entries = %d, want 17", len(res.Entries))
 	}
 }
 
 func TestQueryNonExistentDate(t *testing.T) {
 	setup(t)
+	ctx := context.Background()
 
-	_, _, err := Query("1999_01_01", QueryOptions{})
+	_, err := Query(ctx, "1999_01_01", QueryOptions{})
 	if err == nil {
 		t.Fatal("expected error for non-existent date")
+	}
+}
+
+func TestQueryInvalidDateFormat(t *testing.T) {
+	setup(t)
+	ctx := context.Background()
+
+	for _, bad := range []string{"invalid", "2025-03-15", "20250315", ""} {
+		_, err := Query(ctx, bad, QueryOptions{})
+		if err == nil {
+			t.Errorf("expected error for date %q", bad)
+		}
+		if !strings.Contains(err.Error(), "invalid date") {
+			t.Errorf("error for %q should mention 'invalid date': %v", bad, err)
+		}
+	}
+}
+
+func TestQueryContextCancellation(t *testing.T) {
+	setup(t)
+	// Write enough entries to trigger the context check (>1024 lines).
+	writeTestEntries(t, "2025_03_15", 2000)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	res, err := Query(ctx, "2025_03_15", QueryOptions{})
+	if err == nil {
+		t.Fatal("expected error from cancelled context")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled, got %v", err)
+	}
+	// Should have partial results (some entries scanned before cancellation).
+	_ = res
+}
+
+func TestQuerySkippedMalformedLines(t *testing.T) {
+	setup(t)
+
+	logsDir := filepath.Join(config.DataDir(), "logs")
+	os.MkdirAll(logsDir, 0o755)
+
+	// Write a mix of valid and invalid lines.
+	content := `{"time":"2025-03-15T10:00:00Z","level":"INFO","msg":"good 1"}
+not json at all
+{"time":"2025-03-15T10:00:01Z","level":"INFO","msg":"good 2"}
+{broken json
+{"time":"2025-03-15T10:00:02Z","level":"INFO","msg":"good 3"}
+`
+	os.WriteFile(filepath.Join(logsDir, "2025_03_15.log"), []byte(content), 0o644)
+
+	ctx := context.Background()
+	res, err := Query(ctx, "2025_03_15", QueryOptions{})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if res.Total != 3 {
+		t.Errorf("total = %d, want 3", res.Total)
+	}
+	if res.Skipped != 2 {
+		t.Errorf("skipped = %d, want 2", res.Skipped)
+	}
+	if len(res.Entries) != 3 {
+		t.Errorf("entries = %d, want 3", len(res.Entries))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Sampling
+// ---------------------------------------------------------------------------
+
+func TestSamplingHandlerNoSampling(t *testing.T) {
+	var buf bytes.Buffer
+	inner := slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+
+	// Zero rates = no sampling, should return inner unchanged.
+	h := newSamplingHandler(inner, SamplingRate{})
+	if _, ok := h.(*samplingHandler); ok {
+		t.Fatal("expected inner handler returned when no sampling configured")
+	}
+}
+
+func TestSamplingHandlerDropsRecords(t *testing.T) {
+	var buf bytes.Buffer
+	inner := slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	h := newSamplingHandler(inner, SamplingRate{Debug: 10, Info: 5})
+	logger := slog.New(h)
+
+	// Fire 100 DEBUG messages — only 10 should pass (1-in-10).
+	for i := 0; i < 100; i++ {
+		logger.Debug("debug msg")
+	}
+	debugLines := nonEmptyLines(buf.String())
+	if len(debugLines) != 10 {
+		t.Errorf("debug lines = %d, want 10", len(debugLines))
+	}
+
+	buf.Reset()
+
+	// Fire 100 INFO messages — only 20 should pass (1-in-5).
+	for i := 0; i < 100; i++ {
+		logger.Info("info msg")
+	}
+	infoLines := nonEmptyLines(buf.String())
+	if len(infoLines) != 20 {
+		t.Errorf("info lines = %d, want 20", len(infoLines))
+	}
+
+	buf.Reset()
+
+	// WARN and ERROR always pass through.
+	for i := 0; i < 50; i++ {
+		logger.Warn("warn msg")
+		logger.Error("error msg")
+	}
+	warnErrorLines := nonEmptyLines(buf.String())
+	if len(warnErrorLines) != 100 {
+		t.Errorf("warn+error lines = %d, want 100", len(warnErrorLines))
+	}
+}
+
+func TestSamplingHandlerWithAttrsAndGroup(t *testing.T) {
+	var buf bytes.Buffer
+	inner := slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	h := newSamplingHandler(inner, SamplingRate{Debug: 2})
+
+	// WithAttrs and WithGroup should preserve sampling behavior.
+	h2 := h.WithAttrs([]slog.Attr{slog.String("key", "val")})
+	h3 := h2.WithGroup("grp")
+	logger := slog.New(h3)
+
+	for i := 0; i < 10; i++ {
+		logger.Debug("test")
+	}
+	lines := nonEmptyLines(buf.String())
+	if len(lines) != 5 {
+		t.Errorf("lines after WithAttrs+WithGroup = %d, want 5", len(lines))
+	}
+
+	// Verify the attrs are present.
+	var m map[string]any
+	json.Unmarshal([]byte(lines[0]), &m)
+	if m["key"] != "val" {
+		t.Errorf("expected key=val attr in output")
+	}
+}
+
+func TestMergedHandlerEnabledOptimization(t *testing.T) {
+	// Both sinks at WARN — DEBUG and INFO should be disabled.
+	consoleH := slog.NewJSONHandler(&bytes.Buffer{}, &slog.HandlerOptions{Level: slog.LevelWarn})
+	fileH := slog.NewJSONHandler(&bytes.Buffer{}, &slog.HandlerOptions{Level: slog.LevelWarn})
+	merged := newMergedHandler(consoleH, fileH)
+
+	if merged.Enabled(context.Background(), slog.LevelDebug) {
+		t.Error("DEBUG should be disabled when both sinks are WARN+")
+	}
+	if merged.Enabled(context.Background(), slog.LevelInfo) {
+		t.Error("INFO should be disabled when both sinks are WARN+")
+	}
+	if !merged.Enabled(context.Background(), slog.LevelWarn) {
+		t.Error("WARN should be enabled")
+	}
+	if !merged.Enabled(context.Background(), slog.LevelError) {
+		t.Error("ERROR should be enabled")
+	}
+
+	// One sink at DEBUG, one at ERROR — DEBUG should be enabled (one child accepts).
+	consoleH2 := slog.NewJSONHandler(&bytes.Buffer{}, &slog.HandlerOptions{Level: slog.LevelDebug})
+	fileH2 := slog.NewJSONHandler(&bytes.Buffer{}, &slog.HandlerOptions{Level: slog.LevelError})
+	merged2 := newMergedHandler(consoleH2, fileH2)
+
+	if !merged2.Enabled(context.Background(), slog.LevelDebug) {
+		t.Error("DEBUG should be enabled when console accepts it")
 	}
 }
 

@@ -22,10 +22,11 @@ func newMergedHandler(console, file slog.Handler) *mergedHandler {
 	return &mergedHandler{console: console, file: file}
 }
 
-// Enabled always returns true so the slog.Logger does not short-circuit
-// before Handle; each child still filters by level in Handle.
-func (*mergedHandler) Enabled(context.Context, slog.Level) bool {
-	return true
+// Enabled returns true when at least one child handler accepts the level.
+// This lets slog skip Record allocation entirely when both sinks filter out
+// the level (e.g., both set to WARN — DEBUG/INFO calls become no-ops).
+func (h *mergedHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.console.Enabled(ctx, level) || h.file.Enabled(ctx, level)
 }
 
 func (h *mergedHandler) Handle(ctx context.Context, r slog.Record) error {

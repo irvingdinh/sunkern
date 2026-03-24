@@ -2,8 +2,10 @@ package log
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -169,9 +171,22 @@ func matchesFilter(e Entry, opts QueryOptions) bool {
 	return true
 }
 
+// datePattern matches YYYY_MM_DD log file date strings.
+var datePattern = regexp.MustCompile(`^\d{4}_\d{2}_\d{2}$`)
+
+// QueryResult holds the outcome of a [Query] call.
+type QueryResult struct {
+	Entries []Entry // matching entries (nil when CountOnly is true)
+	Total   int     // count of matching entries before Limit/Offset
+	Skipped int     // count of malformed JSONL lines skipped during scan
+}
+
 // Query reads log entries from the file for the given date (e.g.
-// "2025_03_15") and returns those matching opts. The second return value is
-// the total count of matching entries before Limit/Offset are applied.
+// "2025_03_15") and returns those matching opts.
+//
+// The context enables cancellation of long-running scans over large files.
+// When the context is cancelled mid-scan, Query returns results collected so
+// far along with [context.Canceled] or [context.DeadlineExceeded].
 //
 // By default entries are returned in chronological order (oldest first). Set
 // Order to "desc" for reverse chronological order (newest first). When
@@ -179,10 +194,14 @@ func matchesFilter(e Entry, opts QueryOptions) bool {
 //
 // Call [Flush] before querying if you need to see entries logged in the
 // current process.
-func Query(date string, opts QueryOptions) ([]Entry, int, error) {
+func Query(ctx context.Context, date string, opts QueryOptions) (QueryResult, error) {
+	if !datePattern.MatchString(date) {
+		return QueryResult{}, fmt.Errorf("log: invalid date %q (expected YYYY_MM_DD)", date)
+	}
+
 	f, err := OpenFile(date)
 	if err != nil {
-		return nil, 0, err
+		return QueryResult{}, err
 	}
 	defer f.Close()
 
@@ -191,10 +210,23 @@ func Query(date string, opts QueryOptions) ([]Entry, int, error) {
 
 	desc := strings.EqualFold(opts.Order, "desc")
 
-	var entries []Entry
-	total := 0
+	var (
+		entries []Entry
+		total   int
+		skipped int
+		lines   int
+	)
 
 	for scanner.Scan() {
+		// Check context every 1024 lines to balance responsiveness
+		// against the overhead of the channel check.
+		lines++
+		if lines&0x3FF == 0 {
+			if err := ctx.Err(); err != nil {
+				return QueryResult{Entries: entries, Total: total, Skipped: skipped}, err
+			}
+		}
+
 		line := scanner.Bytes()
 		if len(line) == 0 {
 			continue
@@ -202,7 +234,8 @@ func Query(date string, opts QueryOptions) ([]Entry, int, error) {
 
 		entry, err := parseEntry(line)
 		if err != nil {
-			continue // skip malformed lines
+			skipped++
+			continue
 		}
 
 		if !matchesFilter(entry, opts) {
@@ -230,11 +263,12 @@ func Query(date string, opts QueryOptions) ([]Entry, int, error) {
 	}
 
 	if err := scanner.Err(); err != nil {
-		return entries, total, fmt.Errorf("log: scan %s: %w", date, err)
+		return QueryResult{Entries: entries, Total: total, Skipped: skipped},
+			fmt.Errorf("log: scan %s: %w", date, err)
 	}
 
 	if opts.CountOnly || len(entries) == 0 {
-		return entries, total, nil
+		return QueryResult{Entries: entries, Total: total, Skipped: skipped}, nil
 	}
 
 	// Descending: reverse then paginate.
@@ -253,5 +287,5 @@ func Query(date string, opts QueryOptions) ([]Entry, int, error) {
 		entries = entries[start:end]
 	}
 
-	return entries, total, nil
+	return QueryResult{Entries: entries, Total: total, Skipped: skipped}, nil
 }

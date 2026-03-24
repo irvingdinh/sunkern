@@ -14,6 +14,7 @@ import (
 	"sunkern.local/framework/container"
 )
 
+
 // ConsoleLevel wraps [slog.LevelVar] for the console (stdout) output sink.
 // Resolve it from the container to inspect or change the console log level at
 // runtime without restarting the application.
@@ -50,13 +51,23 @@ var global state
 // [*FileLevel] for runtime adjustment. A shutdown hook is registered to
 // flush and close the file writer during graceful shutdown.
 func Load() {
+	config.SetDefaults(map[string]any{
+		"log.level":         "INFO",
+		"log.console.level": "",
+		"log.sample.debug":  0,
+		"log.sample.info":   0,
+	})
+
 	fileLevelStr := config.GetOr[string]("log.level", "INFO")
 	var fileLevel FileLevel
 	if err := parseLevel(&fileLevel.LevelVar, fileLevelStr); err != nil {
 		panic(fmt.Sprintf("log: %v", err))
 	}
 
-	consoleLevelStr := config.GetOr[string]("log.console.level", fileLevelStr)
+	consoleLevelStr := config.GetOr[string]("log.console.level", "")
+	if consoleLevelStr == "" {
+		consoleLevelStr = fileLevelStr // inherit from log.level when not set
+	}
 	var consoleLevel ConsoleLevel
 	if err := parseLevel(&consoleLevel.LevelVar, consoleLevelStr); err != nil {
 		panic(fmt.Sprintf("log: %v", err))
@@ -82,7 +93,17 @@ func Load() {
 	})
 
 	merged := newMergedHandler(consoleHandler, fileHandler)
-	root := newContextHandler(merged)
+
+	// Apply per-level sampling when configured. Sampling drops a fraction
+	// of DEBUG/INFO records before they reach either sink, reducing log
+	// volume on high-traffic paths without losing WARN/ERROR visibility.
+	rate := SamplingRate{
+		Debug: config.GetOr[int]("log.sample.debug", 0),
+		Info:  config.GetOr[int]("log.sample.info", 0),
+	}
+	sampled := newSamplingHandler(merged, rate)
+
+	root := newContextHandler(sampled)
 	slog.SetDefault(slog.New(root))
 
 	container.Supply[*ConsoleLevel](&consoleLevel)

@@ -8,7 +8,7 @@
 
 ## Current State
 
-**Last session**: 2026-03-25 — Session 30 (framework/app revisited — PostBooter/PreShutdowner lifecycle hooks, phase timing)
+**Last session**: 2026-03-25 — Session 31 (framework/log revisited — sampling handler, context-aware Query, Enabled optimization, config defaults)
 **Working tree**: clean
 **Branch**: with-experiment
 
@@ -19,7 +19,7 @@
 | `framework/app` | **Maturing** | Session 30 | Revisited: PostBooter optional interface (PostBoot() after ALL modules Boot — data seeding, cache warm-up, cross-module workers), PreShutdowner optional interface (PreShutdown(ctx) before individual Shutdown — drain work, flush buffers), phase timing in startup log (boot_time_ms broken into register_ms/framework_ms/module_boot_ms/post_boot_ms/hooks_ms), ModuleGroup delegates PostBoot/PreShutdown to children, 8 new tests (21 total). Previous (Session 25): health check system, ReadyCh, Env/Version. Previous (Session 13): *App supplied to container, boot/shutdown timing. Previous: ModuleGroup boot rollback fix |
 | `framework/container` | **Maturing** | Session 26 | Revisited: ServiceInfo enriched with JSON tags, Kind (supplied/provided), Caller (file:line), ErrorText; ServiceStatus.MarshalJSON; HookReport with per-hook timing from StartHooks/StopHooks; caller tracking in Provide/Supply/Override (runtime.Caller); duplicate-registration panics show both original+duplicate call sites; app.go logs hook start/stop at Debug level. Previous (Session 13): introspection APIs (Keys, Inspect, Len), ServiceInfo/ServiceStatus types, Hooks() accessor. Previous: Override/OverrideSupply, named hooks, all framework hooks named |
 | `framework/config` | **Maturing** | Session 29 | Revisited: Source tracking (resolveWithSource returns env/file/default per key), MarkSensitive/IsSensitive for masking secrets in Export, Export() returns []Entry with key/value/source/env_name sorted by key, Freeze/IsFrozen (auto-freeze after Validate, SetDefault/SetDefaults/AddRule/MarkSensitive panic if frozen), Load() resets frozen+sensitive for test reuse. Previous (Session 16): config validation (AddRule, Validate, 10 built-in rules). Previous (Session 7): Has, All, Keys, Sub, DataDir, EnvName, SetDefaults; Load creates data dir; improved panic messages |
-| `framework/log` | **Maturing** | Session 17 | Revisited: buffered file writer (64KB bufio.Writer + 200ms periodic flush goroutine — ~145k log writes/sec), Flush() export, Query improvements (Order desc/asc, After/Before time range, CountOnly mode). Previous (Session 8): Separate console/file levels, log file management, JSONL entry parsing + querying |
+| `framework/log` | **Maturing** | Session 31 | Revisited: samplingHandler for per-level log volume control (atomic counters, DEBUG/INFO configurable via log.sample.debug/log.sample.info — 1.3M msg/s throughput), mergedHandler.Enabled optimization (skips Record allocation when both sinks filter level), Query now takes context.Context for cancellation (checks every 1024 lines), QueryResult struct replaces tuple return (adds Skipped count for malformed lines), date validation in Query (rejects invalid YYYY_MM_DD format), config defaults registered in Load() for discoverability (log.level, log.console.level, log.sample.debug, log.sample.info visible in config.Keys()), 8 new tests (47 total). Previous (Session 17): buffered file writer (64KB bufio.Writer + 200ms flush). Previous (Session 8): Separate console/file levels, log file management, JSONL entry parsing + querying |
 | `framework/http` | **Maturing** | Session 28 | Revisited: PaginationParams (embeddable, Paginate() returns page/perPage/offset with defaults 20/100), BindQuery/BindForm embedded struct recursion (enables shared param types), Created() response helper (201 shorthand), configurable server timeouts (http.read_timeout/write_timeout/idle_timeout via config), middleware writeErrorJSON consolidation (DRY'd 4 files into shared helper). Previous (Session 14): SSE support. Previous (Session 10): Bind/BindForm MaxBytesError → 413. Previous: file upload handling, all sentinels |
 | `framework/http/middleware` | **Maturing** | Session 28 | Revisited: writeErrorJSON shared helper (extracted from auth, apitoken, recover, ratelimit — DRY'd 4 inline JSON blocks into error.go). Previous (Session 15): Timeout, PBKDF2-SHA256 password hashing, APIToken middleware, GenerateToken. Previous (Session 10): JWT, Auth, RequireRole, MaxBytes. Plus existing: RequestID, RequestLogger, Recover, CORS, RateLimit |
 | `framework/db` | **Maturing** | Session 27 | Revisited: INSERT...SELECT (FromSelect on InsertBuilder), DoUpdateAll (auto SET excluded for non-target/non-immutable columns), ConflictBuilder.Where (partial unique index), ConflictWhere (conditional DO UPDATE WHERE), Excluded() helper (reference incoming values in WHERE), Returning accepts ...Expr (backward compatible, columns use unqualified names, Expr uses WriteSQL), ReturningStar() on all mutation builders. Previous (Session 24): CTEs, With() on all builders. Previous (Session 23): set operations, FILTER, Query interface. Previous (Session 22): window functions, GROUP_CONCAT. Previous (Session 21): JOIN ergonomics. Previous (Session 12): RETURNING, subqueries, CASE. Previous (Session 5): nullable types, cursor pagination |
@@ -354,6 +354,22 @@ Session 30 (app revisit, task queue simulator with PostBoot seeding + PreShutdow
 - [PreShutdown] worker drained in-flight work before shutdown; tasks module stopped processing flag — both logged correctly
 - [phase timing] startup log: boot_time_ms=9, register_ms=1, framework_ms=4, module_boot_ms=0, post_boot_ms=0, hooks_ms=0
 
+Session 31 (log revisit, event generator with sampling + log query + config introspection, 2500 events, 22k log entries, 7.6MB log file):
+- [log/flood 10k] 840,769 msg/s — 10k DEBUG+INFO messages through sampling handler (1:10 DEBUG, 1:5 INFO)
+- [log/flood 50k] 1,329,964 msg/s — 50k messages through sampling handler, sustained throughput
+- [log/sampling] 10k messages → 1,501 entries on disk (5k DEBUG at 1:10 = 500, 5k INFO at 1:5 = 1000, plus overhead) — correct sampling ratios
+- [log/GET query] 94 req/s, p99 270ms — Query with limit=20 on 22k entries (7.6MB JSONL file), IO-bound as expected
+- [log/GET query-error] 83 req/s, p99 300ms — Query with ERROR level filter on 22k entries
+- [log/GET query-count] 58 req/s, p99 662ms — CountOnly on 22k entries (scans full file, no entries allocated)
+- [log/GET query-desc] 27 req/s, p99 742ms — desc order query (collects all, reverses, paginates)
+- [log/GET files] 44k req/s, p99 5.1ms — ListFiles directory scan
+- [log/GET config] 67k req/s, p99 3.6ms — config.Keys() + Sub() for log.* keys
+- [events/GET list] 94k req/s, p99 1.9ms — paginated list on 2k rows (no regression from log changes)
+- [events/POST create] 11.5k req/s, p99 9.1ms — JSON bind + INSERT + slog call with sampling active
+- [health] 89k req/s, p99 1.8ms — baseline
+- [memory] 311 MB RSS after 60k messages + 2.5k events + sustained load test (includes 7.6MB JSONL scan allocations)
+- [race] No data races detected with -race flag on concurrent write flood + query + generate + config reads
+
 ## Design Decisions
 
 <!-- Key decisions and rationale so future sessions don't reverse them. Format:
@@ -569,19 +585,30 @@ Session 30 (app revisit, task queue simulator with PostBoot seeding + PreShutdow
 - [app] ModuleGroup always implements PostBooter and PreShutdowner (methods exist on the type). When no children implement the interface, the loop is a no-op. This avoids conditional implementation complexity and is consistent with Register/Boot/Shutdown delegation pattern. (Session 30)
 - [app] Phase timing uses int64 milliseconds (not time.Duration string) for JSON-friendly output. boot_time_ms is the total, individual phases are additive: register_ms + framework_ms + module_boot_ms + post_boot_ms + hooks_ms ≈ boot_time_ms. Changed from previous boot_time (Duration.String()) to boot_time_ms for consistency. (Session 30)
 
+- [log] samplingHandler uses lock-free atomic.Int64 counters per level — one atomic increment + modulo check per log call. Zero allocation on the sampled-out path. Only DEBUG and INFO are sampled; WARN and ERROR always pass through (they indicate conditions needing attention). (Session 31)
+- [log] SamplingRate is a value type (not interface/options) with just Debug/Info int fields. Rates of 0 mean "no sampling". newSamplingHandler returns the inner handler unchanged when all rates are zero — zero indirection overhead when sampling is disabled. (Session 31)
+- [log] Sampling config keys: log.sample.debug and log.sample.info (env: LOG_SAMPLE_DEBUG, LOG_SAMPLE_INFO). Default 0 (no sampling). Registered via config.SetDefaults in Load() alongside log.level and log.console.level — all log keys now discoverable via config.Keys(). (Session 31)
+- [log] mergedHandler.Enabled now checks `console.Enabled || file.Enabled` instead of always returning true. When both sinks filter a level (e.g., both at WARN, caller logs DEBUG), slog skips Record allocation entirely. Previous behavior always allocated a Record and delegated filtering to Handle. (Session 31)
+- [log] Query takes context.Context for cancellation. Checks ctx.Err() every 1024 lines (bitmask: lines&0x3FF==0). This balances cancellation responsiveness against the overhead of the channel check — at ~94 req/s on a 7.6MB file, 1024-line batches add negligible latency but enable mid-scan abort for admin dashboard timeout scenarios. (Session 31)
+- [log] QueryResult replaces the ([]Entry, int, error) return. Adds Skipped int for malformed JSONL lines. Admin dashboards can show "3 entries skipped (parse error)" — data quality monitoring without breaking the query. (Session 31)
+- [log] Date validation in Query uses regexp `^\d{4}_\d{2}_\d{2}$` — rejects invalid dates early with a clear error message instead of propagating confusing filesystem errors ("open invalid: no such file"). The regex is compiled once (package-level var). (Session 31)
+- [log] log.console.level defaults to empty string in SetDefaults, and Load() treats empty string as "inherit from log.level". This is necessary because SetDefaults stores the value, and GetOr finds it (non-missing key), so the old GetOr fallback wouldn't work. Empty string acts as the "not set" sentinel. (Session 31)
+- [log] Config defaults registered in Load() (not init()) — consistent with sqlite and http packages. init() runs before config.Load() in app lifecycle, so keys registered there would be lost if config.Load() resets state. Load()-time registration ensures defaults are visible after the config system is initialized. (Session 31)
+- [log] samplingHandler.counters is *[2]atomic.Int64 (pointer, not value) — WithAttrs/WithGroup share the same counter pointer so the sampling rate is global across all derived loggers. Copying atomic.Int64 by value would violate sync/atomic contract (must not copy after first use). Shared counters mean slog.With("module", "auth").Debug() and slog.Debug() both contribute to the same DEBUG counter — the 1-in-N rate applies to the total call volume, not per-logger. (Session 31)
+
 ## Next Priorities
 
 <!-- What the last session thinks should come next, in order -->
 
-1. **Revisit `framework/log`** — last touched Session 17 (13 sessions ago). Log sampling handler for high-traffic paths, mmap-based query for very large files (deferred — current linear scan is acceptable for admin viewer with daily rotation)
-2. **Revisit `framework/sqlite`** — last touched Session 18 (12 sessions ago). PRAGMA runtime reconfiguration (cache_size, mmap_size changes without restart), table-level size stats for admin dashboard
-3. **Revisit `framework/sqlite/migrate`** — last touched Session 19 (11 sessions ago). Migration versioning validation (detect gaps, detect orphaned DB records), checksum mismatch warnings in Up() log output, batch status queries
-4. **Revisit `framework/sqlite/driver`** — last touched Session 20 (10 sessions ago). sqlite3_busy_handler (callback-based backoff), sqlite3_wal_hook (WAL monitoring), sqlite3_trace_v2 (statement tracing for debug), blob I/O for large objects
-5. **Revisit `framework/http/middleware`** — last touched Session 28. Auth flow ergonomics, middleware composition helpers, consider request context enrichment helpers
-6. **Revisit `framework/http`** — last touched Session 28. SSE broker/hub pattern (manages multiple connections, fan-out from event source, stats)
-7. **Revisit `framework/app`** — just revisited in Session 30. Future: module dependency declaration (explicit DependsOn for boot ordering), module tags/labels for admin introspection, conditional modules (enabled/disabled via config)
-8. **Revisit `framework/db`** — db package is now comprehensive. Consider: batch update/delete helpers (UpdateAll, DeleteAll for common patterns), query logging/tracing hook, prepared statement caching
-9. **Revisit `framework/config`** — last revisited in Session 29. Future: config value change detection (compare Export snapshots), config documentation generator (list all keys with types/defaults/env names for docs)
+1. **Revisit `framework/sqlite`** — last touched Session 18 (13 sessions ago). PRAGMA runtime reconfiguration (cache_size, mmap_size changes without restart), table-level size stats for admin dashboard
+2. **Revisit `framework/sqlite/migrate`** — last touched Session 19 (12 sessions ago). Migration versioning validation (detect gaps, detect orphaned DB records), checksum mismatch warnings in Up() log output, batch status queries
+3. **Revisit `framework/sqlite/driver`** — last touched Session 20 (11 sessions ago). sqlite3_busy_handler (callback-based backoff), sqlite3_wal_hook (WAL monitoring), sqlite3_trace_v2 (statement tracing for debug), blob I/O for large objects
+4. **Revisit `framework/http/middleware`** — last touched Session 28. Auth flow ergonomics, middleware composition helpers, consider request context enrichment helpers
+5. **Revisit `framework/http`** — last touched Session 28. SSE broker/hub pattern (manages multiple connections, fan-out from event source, stats)
+6. **Revisit `framework/app`** — last touched Session 30. Future: module dependency declaration (explicit DependsOn for boot ordering), module tags/labels for admin introspection, conditional modules (enabled/disabled via config)
+7. **Revisit `framework/db`** — last touched Session 27. Consider: batch update/delete helpers, query logging/tracing hook, prepared statement caching
+8. **Revisit `framework/config`** — last touched Session 29. Future: config value change detection (compare Export snapshots), config documentation generator
+9. **Revisit `framework/log`** — just revisited in Session 31. Future: mmap-based query for very large files (deferred — current linear scan acceptable for admin viewer with daily rotation), log rotation callback (notify when file rotates), per-request sampling (sample by request_id hash for consistent traces)
 10. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
 
 ## In-Progress Work
