@@ -159,6 +159,7 @@ func (a *App) run() error {
 	} else if n > 0 {
 		slog.Info("migrations applied", "count", n, "took", time.Since(t))
 	}
+	container.Supply(migrationEngine)
 
 	// TODO: init cache, event bus, cron, queue.
 	t = time.Now()
