@@ -18,3 +18,15 @@ When you need to reference a dependency not yet cloned locally, shallow-clone it
 | Repository | Description |
 |---|---|
 | `spf13/viper` | Configuration library used by the project |
+| `go-gorm/gorm` | Most popular Go ORM — reflection-based, struct tags, method chaining |
+| `uptrace/bun` | SQL-first query builder — explicit query objects, struct tags |
+| `ent/ent` | Facebook's entity framework — code generation, DSL schema definition |
+| `sqlc-dev/sqlc` | Generates type-safe Go from SQL queries — code generation approach |
+| `stephenafamo/bob` | Type-safe SQL query builder using Go generics — mod-based API |
+| `bokwoon95/sq` | Type-safe SQL query builder — struct-based tables, minimal deps |
+| `drizzle-team/drizzle-orm` | SQL-like TypeScript query builder — schema-as-code, SQL-shaped API |
+| `kysely-org/kysely` | Type-safe SQL query builder for TypeScript — AST-based, immutable builders |
+| `prisma/prisma` | Schema-first ORM with code generation — custom DSL, generated client |
+| `laravel/framework` | Laravel's Eloquent ORM (PHP) — Active Record, fluent query builder, scopes |
+| `sqlalchemy/sqlalchemy` | Python's SQL toolkit — dual-layer Core (expression builder) + ORM |
+| `diesel-rs/diesel` | Rust's type-safe query builder — compile-time validation, schema macros |

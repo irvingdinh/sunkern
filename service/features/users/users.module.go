@@ -1,4 +1,4 @@
-package usermod
+package users
 
 import (
 	"sunkern.local/framework/app"
@@ -7,27 +7,28 @@ import (
 	"sunkern.local/framework/sqlite"
 )
 
-// Module is the user module. It registers a simple GET /api/users endpoint
-// for testing the full stack.
+// Module is the users feature module.
 type Module struct {
 	app.BaseModule
 }
 
-// New creates a user module.
+// New creates the users module.
 func New() *Module {
 	return &Module{
 		BaseModule: app.BaseModule{ModuleName: "users"},
 	}
 }
 
-// Boot resolves the HTTP server and database from the container and
-// registers the /api/users route.
+// Boot resolves dependencies and registers routes.
 func (m *Module) Boot() error {
 	server := container.MustMake[sunkernhttp.Server]()
-	db := container.MustMake[*sqlite.DB]()
+	sqliteDB := container.MustMake[*sqlite.DB]()
 
-	h := &handler{db: db.ReadDB()}
-	server.Mux().HandleFunc("GET /api/users", h.listUsers)
+	uc := &usersController{
+		readDB:  sqliteDB.ReadDB(),
+		writeDB: sqliteDB.WriteDB(),
+	}
+	server.Mux().HandleFunc("GET /api/users", uc.list)
 
 	return nil
 }

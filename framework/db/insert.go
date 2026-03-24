@@ -1,0 +1,146 @@
+package db
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"reflect"
+	"strings"
+	"time"
+)
+
+// InsertBuilder builds an INSERT query. Create one with Insert().
+type InsertBuilder struct {
+	table   *TableInfo
+	columns []column
+	values  [][]any // one inner slice per row
+}
+
+// Insert starts an INSERT query for the given table.
+func Insert(table *TableInfo) *InsertBuilder {
+	return &InsertBuilder{table: table}
+}
+
+// Columns sets the target columns. Must be called before Values.
+func (b *InsertBuilder) Columns(cols ...column) *InsertBuilder {
+	b.columns = cols
+	return b
+}
+
+// Values adds one row of values. The count must match the columns set by
+// Columns. Call multiple times for batch insert.
+func (b *InsertBuilder) Values(vals ...any) *InsertBuilder {
+	b.values = append(b.values, vals)
+	return b
+}
+
+// Model reads a struct's db tags to determine columns and values. It:
+//   - Sets created_at and updated_at to time.Now() if they are zero values
+//   - Skips nil *time.Time fields (lets DB DEFAULT apply)
+//   - Formats time.Time values to the canonical SQLite format
+func (b *InsertBuilder) Model(v any) *InsertBuilder {
+	rv := reflect.ValueOf(v)
+	if rv.Kind() == reflect.Ptr {
+		rv = rv.Elem()
+	}
+	rt := rv.Type()
+
+	m := getMapping(rt)
+	now := time.Now()
+
+	var cols []column
+	var vals []any
+
+	for colName, idx := range m.colToIndex {
+		field := rv.FieldByIndex(idx)
+		fieldType := field.Type()
+		val := field.Interface()
+
+		// Handle *time.Time: skip nil (let DB DEFAULT apply).
+		if fieldType == reflect.TypeOf((*time.Time)(nil)) {
+			if field.IsNil() {
+				continue
+			}
+			t := val.(*time.Time)
+			cols = append(cols, newSyntheticColumn(b.table.name, colName))
+			vals = append(vals, *t)
+			continue
+		}
+
+		// Handle time.Time: auto-set created_at/updated_at if zero.
+		if fieldType == reflect.TypeOf(time.Time{}) {
+			t := val.(time.Time)
+			if t.IsZero() && (colName == "created_at" || colName == "updated_at") {
+				t = now
+			}
+			cols = append(cols, newSyntheticColumn(b.table.name, colName))
+			vals = append(vals, t)
+			continue
+		}
+
+		cols = append(cols, newSyntheticColumn(b.table.name, colName))
+		vals = append(vals, val)
+	}
+
+	b.columns = cols
+	b.values = [][]any{vals}
+	return b
+}
+
+// Build generates the SQL string and args.
+func (b *InsertBuilder) Build() (string, []any) {
+	var buf strings.Builder
+	var args []any
+
+	buf.WriteString("INSERT INTO ")
+	buf.WriteString(quoteIdent(b.table.name))
+
+	// Columns
+	buf.WriteString(" (")
+	for i, col := range b.columns {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		buf.WriteString(quoteIdent(col.columnName()))
+	}
+	buf.WriteString(")")
+
+	// VALUES
+	buf.WriteString(" VALUES ")
+	for ri, row := range b.values {
+		if ri > 0 {
+			buf.WriteString(", ")
+		}
+		buf.WriteString("(")
+		for vi, val := range row {
+			if vi > 0 {
+				buf.WriteString(", ")
+			}
+			buf.WriteString("?")
+			args = append(args, val)
+		}
+		buf.WriteString(")")
+	}
+
+	return buf.String(), args
+}
+
+// Exec executes the INSERT and returns the result.
+func (b *InsertBuilder) Exec(ctx context.Context, q Querier) (sql.Result, error) {
+	sqlStr, args := b.Build()
+	result, err := q.ExecContext(ctx, sqlStr, args...)
+	if err != nil {
+		return nil, fmt.Errorf("db: insert: %w", err)
+	}
+	return result, nil
+}
+
+// syntheticColumn is a minimal column implementation used by Model() when
+// it discovers columns via reflection rather than from the typed column vars.
+type syntheticColumn struct {
+	columnRef
+}
+
+func newSyntheticColumn(table, name string) syntheticColumn {
+	return syntheticColumn{columnRef: columnRef{table: table, name: name}}
+}

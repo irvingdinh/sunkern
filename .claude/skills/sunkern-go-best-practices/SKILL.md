@@ -18,9 +18,11 @@ Guide for working with the Sunkern framework. Only verified and stable packages 
 |---------|--------|-----------|
 | `framework/config` | Stable | `rules/framework-config.md` |
 | `framework/log` | Stable | `rules/framework-log.md` |
+| `service/features/*` | Stable | `rules/service-module-structure.md` |
 | `framework/container` | Not yet documented | - |
 | `framework/app` | Not yet documented | - |
 | `framework/http` | Not yet documented | - |
+| `framework/db` | Not yet documented | - |
 
 ## When to Apply
 
@@ -28,8 +30,22 @@ Reference these guidelines when:
 - Reading or setting configuration values anywhere in the codebase
 - Adding structured logging to handlers, middleware, or business logic
 - Writing new modules that need config defaults or log output
+- Creating, modifying, or reviewing service feature modules
+- Adding new features, controllers, entities, or sub-resources
 
 ## Quick Reference
+
+### Service Module Structure (HIGH)
+
+- `module-file-naming` - Files use dot-suffix convention: `{feature}.module.go`, `{resource}.controller.go`, `{singular}.entity.go`
+- `module-directory-naming` - Plural, lowercase, hyphenated: `users/`, `orders/`, `api-keys/`. No `mod` suffix
+- `module-flat-package` - One Go package per feature. NO sub-packages for layers (entities/, controllers/)
+- `module-controller-naming` - Controller structs are unexported, named by resource: `usersController`, `settingsController`
+- `module-entity-merge` - Domain model struct + table schema live in ONE entity file: `user.entity.go`
+- `module-route-locality` - All route registration happens in `Boot()` of the module, never in a central file
+- `module-sub-resources` - Sub-resource controllers are separate files in the SAME package: `user-settings.controller.go`
+- `module-sub-modules` - Complex features use `ModuleGroup` with sub-packages per domain, NOT per layer
+- `module-cross-refs` - Features import each other's types one-way. Extract to `features/shared/` only if circular
 
 ### Configuration (HIGH)
 
@@ -58,6 +74,7 @@ Reference these guidelines when:
 Read individual rule files for detailed API reference and code examples:
 
 ```
+rules/service-module-structure.md
 rules/framework-config.md
 rules/framework-log.md
 ```

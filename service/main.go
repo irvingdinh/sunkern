@@ -6,7 +6,7 @@ import (
 	"io/fs"
 
 	"sunkern.local/framework/app"
-	"sunkern.local/service/features/usermod"
+	"sunkern.local/service/features/users"
 )
 
 //go:embed migrations/*.sql
@@ -21,6 +21,6 @@ func main() {
 	a := app.New(
 		app.WithMigrations(migrations),
 	)
-	a.Use(usermod.New())
+	a.Use(users.New())
 	a.Run()
 }
