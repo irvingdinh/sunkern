@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -102,12 +101,5 @@ func extractBearerToken(r *http.Request) string {
 }
 
 func writeInternalError(w http.ResponseWriter) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusInternalServerError)
-	json.NewEncoder(w).Encode(map[string]any{
-		"error": map[string]any{
-			"code":    "internal_error",
-			"message": "Internal server error",
-		},
-	})
+	writeErrorJSON(w, http.StatusInternalServerError, "internal_error", "Internal server error")
 }

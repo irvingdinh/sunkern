@@ -8,7 +8,7 @@
 
 ## Current State
 
-**Last session**: 2026-03-25 — Session 26 (framework/container revisited — introspection enrichment, hook reports, caller tracking)
+**Last session**: 2026-03-25 — Session 28 (framework/http revisited — PaginationParams, embedded BindQuery/BindForm, middleware error consolidation, configurable timeouts, Created helper)
 **Working tree**: clean
 **Branch**: with-experiment
 
@@ -20,9 +20,9 @@
 | `framework/container` | **Maturing** | Session 26 | Revisited: ServiceInfo enriched with JSON tags, Kind (supplied/provided), Caller (file:line), ErrorText; ServiceStatus.MarshalJSON; HookReport with per-hook timing from StartHooks/StopHooks; caller tracking in Provide/Supply/Override (runtime.Caller); duplicate-registration panics show both original+duplicate call sites; app.go logs hook start/stop at Debug level. Previous (Session 13): introspection APIs (Keys, Inspect, Len), ServiceInfo/ServiceStatus types, Hooks() accessor. Previous: Override/OverrideSupply, named hooks, all framework hooks named |
 | `framework/config` | **Maturing** | Session 16 | Revisited: config validation (AddRule, Validate, 10 built-in rules: Required, NotEmpty, Positive, NonNegative, OneOf, Min, Max, Range, MinLen, MaxLen). Rule type is a function — composable, zero boilerplate. Validate() integrated into app lifecycle after framework init, before module Boot. Previous (Session 7): Has, All, Keys, Sub, DataDir, EnvName, SetDefaults; Load creates data dir; improved panic messages |
 | `framework/log` | **Maturing** | Session 17 | Revisited: buffered file writer (64KB bufio.Writer + 200ms periodic flush goroutine — ~145k log writes/sec), Flush() export, Query improvements (Order desc/asc, After/Before time range, CountOnly mode). Previous (Session 8): Separate console/file levels, log file management, JSONL entry parsing + querying |
-| `framework/http` | **Maturing** | Session 14 | Revisited: SSE support (NewEventStream, SSEWriter with Send/SendJSON/Heartbeat/Retry/Done, LastEventID, write deadline extension via ResponseController, ErrStreamingNotSupported sentinel). Previous (Session 10): Bind/BindForm MaxBytesError → 413. Previous: file upload handling, all sentinels |
-| `framework/http/middleware` | **Maturing** | Session 15 | Revisited: Timeout (context deadline per route), PBKDF2-SHA256 password hashing (HashPassword/CheckPassword, 600k iterations, PHC format, stdlib-only), APIToken middleware (opaque bearer tokens with DB lookup via TokenLookup callback), GenerateToken (32-byte random hex). Previous (Session 10): JWT (HMAC-SHA256 sign/verify, Claims, context helpers), Auth (Bearer token + user_id logging), RequireRole (role-based 403), MaxBytes (body size limiter). Plus existing: RequestID, RequestLogger, Recover, CORS, RateLimit |
-| `framework/db` | **Maturing** | Session 24 | Revisited: CTEDef type (NewCTE/NewRecursiveCTE, Columns/As/Ref/Col methods), With() on all 5 builders, writeCTEs shared helper, Select(nil) for tableless SELECT. Previous (Session 23): set operations, FILTER, Query interface. Previous (Session 22): window functions, GROUP_CONCAT. Previous (Session 21): JOIN ergonomics. Previous (Session 12): RETURNING, subqueries, CASE. Previous (Session 5): nullable types, cursor pagination |
+| `framework/http` | **Maturing** | Session 28 | Revisited: PaginationParams (embeddable, Paginate() returns page/perPage/offset with defaults 20/100), BindQuery/BindForm embedded struct recursion (enables shared param types), Created() response helper (201 shorthand), configurable server timeouts (http.read_timeout/write_timeout/idle_timeout via config), middleware writeErrorJSON consolidation (DRY'd 4 files into shared helper). Previous (Session 14): SSE support. Previous (Session 10): Bind/BindForm MaxBytesError → 413. Previous: file upload handling, all sentinels |
+| `framework/http/middleware` | **Maturing** | Session 28 | Revisited: writeErrorJSON shared helper (extracted from auth, apitoken, recover, ratelimit — DRY'd 4 inline JSON blocks into error.go). Previous (Session 15): Timeout, PBKDF2-SHA256 password hashing, APIToken middleware, GenerateToken. Previous (Session 10): JWT, Auth, RequireRole, MaxBytes. Plus existing: RequestID, RequestLogger, Recover, CORS, RateLimit |
+| `framework/db` | **Maturing** | Session 27 | Revisited: INSERT...SELECT (FromSelect on InsertBuilder), DoUpdateAll (auto SET excluded for non-target/non-immutable columns), ConflictBuilder.Where (partial unique index), ConflictWhere (conditional DO UPDATE WHERE), Excluded() helper (reference incoming values in WHERE), Returning accepts ...Expr (backward compatible, columns use unqualified names, Expr uses WriteSQL), ReturningStar() on all mutation builders. Previous (Session 24): CTEs, With() on all builders. Previous (Session 23): set operations, FILTER, Query interface. Previous (Session 22): window functions, GROUP_CONCAT. Previous (Session 21): JOIN ergonomics. Previous (Session 12): RETURNING, subqueries, CASE. Previous (Session 5): nullable types, cursor pagination |
 | `framework/sqlite` | **Maturing** | Session 18 | Revisited: background maintenance goroutine (periodic PRAGMA optimize + WAL auto-checkpoint when WAL exceeds threshold), Health(ctx) for readiness checks, 2 new config keys (db.optimize_interval, db.wal_checkpoint_threshold). Maintenance lifecycle managed by container hooks (OnStart/OnStop). Previous (Session 11): Stats, Checkpoint, Optimize, IntegrityCheck, Backup. Configurable PRAGMAs. |
 | `framework/sqlite/driver` | **Maturing** | Session 20 | Revisited: structured Error type with primary+extended result codes (Code/ExtendedCode/Message), context cancellation via sqlite3_interrupt (ExecContext/QueryContext on conn+stmt), MemoryUsed/MemoryHighwater exported functions, time.Time bind with ms precision + UTC, extended result codes enabled per connection, nil guards on Close, compile-time interface assertions. Previous (Session 11): blob binding safety fix (CBytes+C.free pattern). |
 | `framework/sqlite/migrate` | **Maturing** | Session 19 | Revisited: SHA-256 checksums (drift detection via Dirty field), execution_ms tracking, UpTo/DownTo/Version/Redo methods, MigrationStatus enriched with HasDown/StmtCount/Checksum/Dirty/ExecutionMs + JSON tags, backward-compatible schema upgrade (ALTER TABLE ADD COLUMN), Checksum() exported, applyUp/applyDown split, *Engine supplied to container. Previous (Session 11): migration timing, Pending(), error context with statement index. |
@@ -308,6 +308,28 @@ Session 26 (container revisit, service registry dashboard with introspection end
 - [introspection comparison] Session 13: 59k req/s for Inspect(5 services). Session 26: 67k req/s for Inspect(8 services) + Kind+Caller fields — no regression despite richer ServiceInfo
 - [JSON serialization] ServiceStatus MarshalJSON verified at init: "built"/"pending"/"failed" strings, omitempty for empty error
 
+Session 27 (db revisit, settings store with upserts + INSERT...SELECT + RETURNING, 2000+ rows):
+- [db/PUT DoUpdateAll+ReturningStar] 30,081 req/s, p99 2.7ms — upsert with DoUpdateAll + partial index WHERE + ReturningStar
+- [db/PUT ConflictWhere+Excluded] 32,884 req/s, p99 2.3ms — versioned upsert with ConflictWhere + Excluded() comparison
+- [db/POST INSERT...SELECT] 2,552 req/s, p99 15.4ms — archive 2000+ rows via INSERT...SELECT + ON CONFLICT DO NOTHING
+- [db/DELETE ReturningStar] 36,677 req/s, p99 2.4ms — soft delete via SoftDelete().ReturningStar()
+- [db/GET list] 1,090 req/s, p99 31.1ms — list 2000 settings with COUNT + SELECT (IO-bound full table)
+- [memory] 52 MB RSS after 20k+ load test requests across all endpoints
+- [race] No data races detected with -race flag on concurrent upserts + archives + deletes + reads
+- [version guard] ConflictWhere correctly rejected stale writes: v5 accepted, v3 rejected, v7 accepted
+- [idempotent archive] Second INSERT...SELECT returned 0 rows (ON CONFLICT DO NOTHING)
+
+Session 28 (http revisit, bookmark manager with PaginationParams + embedded BindQuery + Created + middleware consolidation, 500 rows):
+- [http/GET list] 21,946 req/s, p99 5.6ms — PaginationParams embedded in listRequest, COUNT + SELECT on 500 rows
+- [http/GET list-paginated] 28,320 req/s, p99 5.1ms — explicit page=2&per_page=10, smaller result set
+- [http/POST create] 29,211 req/s, p99 7.4ms — JSON bind + validation + INSERT, Created() response (201)
+- [http/GET single] 62,809 req/s, p99 2.7ms — single read by path param
+- [http/POST panic] 34,640 req/s, p99 4.7ms — every request panics, Recover uses consolidated writeErrorJSON
+- [memory] 23 MB RSS after 200 writes + 1000 load test reads
+- [race] No data races detected with -race build flag
+- [pagination] Default: page=1, per_page=20. Clamping: page<=0→1, per_page<=0→20, per_page>100→20
+- [embedded BindQuery] PaginationParams + custom Tags field both bound correctly from query string
+
 ## Design Decisions
 
 <!-- Key decisions and rationale so future sessions don't reverse them. Format:
@@ -494,18 +516,34 @@ Session 26 (container revisit, service registry dashboard with introspection end
 - [container] hookLabel changed to return unquoted names; error messages use %q for consistent quoting. Output: `starting hook "database": connection refused` (same as before for named hooks). Positional fallback: `starting hook "2": ...` (now quoted, was unquoted). Minor cosmetic improvement. (Session 26)
 - [container] App.go now logs hook start/stop at Debug level with per-hook name and timing. This provides startup/shutdown observability without polluting normal (Info) output. Example: `hook started hook=http took_ms=0`. (Session 26)
 
+- [db] FromSelect(query Query) on InsertBuilder replaces VALUES with a SELECT subquery. Build() checks `b.fromSelect != nil` and calls query.Build() inline, concatenating args in order. Column list is optional — omitting Columns() produces `INSERT INTO table SELECT ...` which lets SQLite infer columns from SELECT. (Session 27)
+- [db] DoUpdateAll() on ConflictBuilder generates SetExcluded for all insert columns EXCEPT conflict targets, "id", and "created_at". Consistent with SetModel() skip logic — primary key and creation timestamp are immutable. Reads cb.insert.columns, so Columns() or Model() must be called before OnConflict(). (Session 27)
+- [db] ConflictBuilder.Where() adds WHERE to the ON CONFLICT target clause (partial unique index matching). This is the WHERE between the conflict column list and DO NOTHING/DO UPDATE — tells SQLite which unique index to match. Stored on ConflictBuilder and forwarded to conflictClause.targetWhere in DoNothing/DoUpdate/DoUpdateAll. (Session 27)
+- [db] ConflictWhere() on InsertBuilder adds WHERE to the DO UPDATE clause (conditional update). Called AFTER OnConflict().DoUpdate() returns *InsertBuilder. Sets conflictClause.updateWhere — the WHERE after DO UPDATE SET. Use with Excluded() to compare incoming vs existing values (e.g., version-gated upserts). (Session 27)
+- [db] Excluded(col) is a package-level function wrapping excludedRef — reuses the existing type used by SetExcluded. Returns Expr, so it works in ColGt/ColEq/And/Or and any expression context. SetExcluded creates a ConflictSet (col = excluded.col); Excluded() creates a bare Expr for use in WHERE conditions. (Session 27)
+- [db] Returning(...Expr) replaces Returning(...column) on all mutation builders. Backward compatible: column interface embeds Expr, so all typed columns (StringColumn, IntColumn, etc.) pass through. writeReturning uses type assertion — if expr satisfies column interface, writes unqualified quoteIdent(col.columnName()); otherwise uses expr.WriteSQL(buf, args). This preserves the Session 12 convention of unqualified RETURNING column names. (Session 27)
+- [db] ReturningStar() sets returning = []Expr{Raw("*")} — simple, composes with Returning[T]/ReturningAll[T] generic functions unchanged. Raw("*") passes through WriteSQL producing bare `*`. (Session 27)
+
+- [http] PaginationParams is a concrete struct (not interface) with Page/PerPage int fields and query tags. Paginate() is a value method returning (page, perPage, offset) — works on copies, no mutation. DefaultPerPage=20, MaxPerPage=100 are exported constants. Embedding in request structs enables BindQuery to populate pagination fields alongside custom fields. (Session 28)
+- [http] BindQuery/BindForm embedded struct recursion mirrors validate.go's parseSpecs pattern — check field.Anonymous && field.Type.Kind() == reflect.Struct, recurse into the embedded value. This enables composable request structs where shared params (pagination, sorting) are embedded alongside endpoint-specific fields. (Session 28)
+- [http] Created(w, data) is a thin wrapper over writeJSON(w, 201, envelope{"data": data}). Not a generic "status shorthand factory" — just the one most common status that isn't 200. Adding more (Accepted, etc.) only when playground apps demonstrate repeated need. YAGNI. (Session 28)
+- [http] Server timeouts configurable via config keys http.read_timeout, http.write_timeout, http.idle_timeout (time.Duration strings). SetDefault called in NewServer for discoverability via config.Keys()/All(). Default values unchanged (15s/15s/60s) — backward compatible. (Session 28)
+- [middleware] writeErrorJSON(w, status, code, msg) is an unexported helper in error.go. Replaces 4 identical inline JSON blocks across auth.go, apitoken.go, recover.go, ratelimit.go. The circular import constraint (middleware can't import parent http) still applies — this is the middleware-internal equivalent of http.Error(). (Session 28)
+- [middleware] RateLimit's Retry-After header is set BEFORE writeErrorJSON — writeErrorJSON calls w.WriteHeader which flushes headers. This ordering is correct: set all headers, then write status+body. Previous code set Content-Type manually before WriteHeader, which also worked, but the consolidated helper handles Content-Type internally. (Session 28)
+
 ## Next Priorities
 
 <!-- What the last session thinks should come next, in order -->
 
-1. **Revisit `framework/db`** — raw RETURNING with db.Raw columns. CTE done. Consider: INSERT...SELECT builder, upsert improvements
-2. **Revisit `framework/http`** — SSE broker/hub pattern as a higher-level abstraction (manages multiple connections, fan-out from event source, stats), once event bus exists
-3. **Revisit `framework/app`** — lifecycle hooks for plugins (pre-boot, post-boot callbacks), module dependency declaration, boot order optimization. Health check system done
-4. **Revisit `framework/config`** — last touched Session 16 (10 sessions ago). Config watching (detect file changes), environment-specific config files, config dump endpoint for admin
+1. **Revisit `framework/config`** — last touched Session 16 (12 sessions ago). Config watching (detect file changes), environment-specific config files, config dump endpoint for admin
+2. **Revisit `framework/app`** — last touched Session 25 (3 sessions ago). Lifecycle hooks for plugins (pre-boot, post-boot callbacks), module dependency declaration, boot order optimization
+3. **Revisit `framework/http/middleware`** — last touched Session 28 (error consolidation only). Auth flow ergonomics, middleware composition helpers, consider request context enrichment helpers
+4. **Revisit `framework/http`** — last touched Session 28. SSE broker/hub pattern (manages multiple connections, fan-out from event source, stats) — deferred from Session 28 in favor of higher-impact ergonomic improvements
 5. **Revisit `framework/log`** — log sampling handler for high-traffic paths, mmap-based query for very large files (deferred — current linear scan is acceptable for admin viewer with daily rotation)
 6. **Revisit `framework/sqlite`** — PRAGMA runtime reconfiguration (cache_size, mmap_size changes without restart), table-level size stats for admin dashboard
 7. **Revisit `framework/sqlite/migrate`** — migration versioning validation (detect gaps, detect orphaned DB records), checksum mismatch warnings in Up() log output, batch status queries
 8. **Revisit `framework/sqlite/driver`** — sqlite3_busy_handler (callback-based backoff), sqlite3_wal_hook (WAL monitoring), sqlite3_trace_v2 (statement tracing for debug), blob I/O for large objects
+9. **Revisit `framework/db`** — db package is now comprehensive. Consider: batch update/delete helpers (UpdateAll, DeleteAll for common patterns), query logging/tracing hook, prepared statement caching
 9. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
 
 ## In-Progress Work

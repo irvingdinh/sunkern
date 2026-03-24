@@ -28,11 +28,32 @@ type Server interface {
 	Group(prefix string) *RouteGroup
 }
 
+// Default timeout values. Overridable via config keys http.read_timeout,
+// http.write_timeout, and http.idle_timeout (as time.Duration strings).
+const (
+	DefaultReadTimeout  = 15 * time.Second
+	DefaultWriteTimeout = 15 * time.Second
+	DefaultIdleTimeout  = 60 * time.Second
+)
+
 // NewServer creates an HTTP server, registers lifecycle hooks, and returns
-// a Server. It reads the listen address from config (key "http.addr",
-// default ":19110"). Intended to be registered via container.Supply.
+// a Server. It reads configuration from:
+//   - http.addr — listen address (default ":19110")
+//   - http.read_timeout — read timeout (default 15s)
+//   - http.write_timeout — write timeout (default 15s)
+//   - http.idle_timeout — idle timeout (default 60s)
+//
+// Intended to be registered via container.Supply.
 func NewServer() (Server, error) {
+	config.SetDefault("http.addr", DefaultAddr)
+	config.SetDefault("http.read_timeout", DefaultReadTimeout.String())
+	config.SetDefault("http.write_timeout", DefaultWriteTimeout.String())
+	config.SetDefault("http.idle_timeout", DefaultIdleTimeout.String())
+
 	addr := config.GetOr[string]("http.addr", DefaultAddr)
+	readTimeout := config.GetOr[time.Duration]("http.read_timeout", DefaultReadTimeout)
+	writeTimeout := config.GetOr[time.Duration]("http.write_timeout", DefaultWriteTimeout)
+	idleTimeout := config.GetOr[time.Duration]("http.idle_timeout", DefaultIdleTimeout)
 
 	mux := httpstd.NewServeMux()
 	mux.HandleFunc("/", func(w httpstd.ResponseWriter, r *httpstd.Request) {
@@ -47,9 +68,9 @@ func NewServer() (Server, error) {
 	srv := &httpstd.Server{
 		Addr:         addr,
 		Handler:      handler,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		ReadTimeout:  readTimeout,
+		WriteTimeout: writeTimeout,
+		IdleTimeout:  idleTimeout,
 	}
 
 	container.AppendHook(container.Hook{

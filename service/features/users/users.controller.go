@@ -18,8 +18,7 @@ type usersController struct {
 
 // listRequest holds query parameters for the list endpoint.
 type listRequest struct {
-	Page    int `query:"page"`
-	PerPage int `query:"per_page"`
+	sunkernhttp.PaginationParams
 }
 
 func (c *usersController) list(w http.ResponseWriter, r *http.Request) {
@@ -28,16 +27,7 @@ func (c *usersController) list(w http.ResponseWriter, r *http.Request) {
 		sunkernhttp.Error(w, err)
 		return
 	}
-
-	page := params.Page
-	if page <= 0 {
-		page = 1
-	}
-	perPage := params.PerPage
-	if perPage <= 0 || perPage > 100 {
-		perPage = 20
-	}
-	offset := (page - 1) * perPage
+	page, perPage, offset := params.Paginate()
 
 	q := db.Select(&Users.TableInfo).
 		Apply(db.NotDeleted(Users.DeletedAt)).
@@ -118,7 +108,7 @@ func (c *usersController) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sunkernhttp.JSON(w, http.StatusCreated, user)
+	sunkernhttp.Created(w, user)
 }
 
 type updateRequest struct {

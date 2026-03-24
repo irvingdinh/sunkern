@@ -12,6 +12,12 @@ func JSON(w httpstd.ResponseWriter, status int, data any) {
 	writeJSON(w, status, envelope{"data": data})
 }
 
+// Created writes a 201 Created response with the given data.
+// Shorthand for JSON(w, http.StatusCreated, data).
+func Created(w httpstd.ResponseWriter, data any) {
+	writeJSON(w, httpstd.StatusCreated, envelope{"data": data})
+}
+
 // JSONList writes a paginated list response with status 200. The response
 // body is: {"data": <items>, "pagination": {...}}.
 func JSONList(w httpstd.ResponseWriter, items any, total, page, perPage int) {

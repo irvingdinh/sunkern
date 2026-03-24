@@ -171,12 +171,26 @@ func BindForm(r *httpstd.Request, dst any) error {
 	if rv.Kind() != reflect.Pointer || rv.Elem().Kind() != reflect.Struct {
 		return ErrInternal.WithMessage("BindForm: dst must be a pointer to a struct")
 	}
-	rv = rv.Elem()
-	rt := rv.Type()
 
+	if err := bindFormFields(rv.Elem(), r); err != nil {
+		return err
+	}
+	return Validate(dst)
+}
+
+func bindFormFields(rv reflect.Value, r *httpstd.Request) error {
+	rt := rv.Type()
 	for i := range rt.NumField() {
 		field := rt.Field(i)
 		if !field.IsExported() {
+			continue
+		}
+
+		// Recurse into embedded structs.
+		if field.Anonymous && field.Type.Kind() == reflect.Struct {
+			if err := bindFormFields(rv.Field(i), r); err != nil {
+				return err
+			}
 			continue
 		}
 
@@ -216,8 +230,7 @@ func BindForm(r *httpstd.Request, dst any) error {
 			return ErrBadRequest.WithMessage(fmt.Sprintf("Invalid form field %q: %s", tag, err.Error()))
 		}
 	}
-
-	return Validate(dst)
+	return nil
 }
 
 func parseMultipart(r *httpstd.Request) error {

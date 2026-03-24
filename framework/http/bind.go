@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	httpstd "net/http"
+	"net/url"
 	"reflect"
 	"strconv"
 )
@@ -33,19 +34,42 @@ func Bind(r *httpstd.Request, dst any) error {
 // Fields without a matching query parameter retain their current value —
 // set struct field defaults before calling BindQuery.
 //
-//	q := ListParams{Page: 1, PerPage: 20}
-//	if err := sunkernhttp.BindQuery(r, &q); err != nil { ... }
+// Embedded structs are recursed into, enabling shared parameter types
+// like [PaginationParams]:
+//
+//	type listRequest struct {
+//	    sunkernhttp.PaginationParams
+//	    Status string `query:"status"`
+//	}
 func BindQuery(r *httpstd.Request, dst any) error {
 	rv := reflect.ValueOf(dst)
 	if rv.Kind() != reflect.Pointer || rv.Elem().Kind() != reflect.Struct {
 		return ErrInternal.WithMessage("BindQuery: dst must be a pointer to a struct")
 	}
-	rv = rv.Elem()
-	rt := rv.Type()
 
 	params := r.URL.Query()
+	if err := bindQueryFields(rv.Elem(), params); err != nil {
+		return err
+	}
+	return Validate(dst)
+}
+
+func bindQueryFields(rv reflect.Value, params url.Values) error {
+	rt := rv.Type()
 	for i := range rt.NumField() {
 		field := rt.Field(i)
+		if !field.IsExported() {
+			continue
+		}
+
+		// Recurse into embedded structs.
+		if field.Anonymous && field.Type.Kind() == reflect.Struct {
+			if err := bindQueryFields(rv.Field(i), params); err != nil {
+				return err
+			}
+			continue
+		}
+
 		tag := field.Tag.Get("query")
 		if tag == "" || tag == "-" {
 			continue
@@ -58,7 +82,7 @@ func BindQuery(r *httpstd.Request, dst any) error {
 			return ErrBadRequest.WithMessage(fmt.Sprintf("Invalid query parameter %q: %s", tag, err.Error()))
 		}
 	}
-	return Validate(dst)
+	return nil
 }
 
 // isMaxBytesError reports whether err (or any wrapped error) is caused

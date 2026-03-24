@@ -1,7 +1,6 @@
 package middleware
 
 import (
-	"encoding/json"
 	"net"
 	"net/http"
 	"sync"
@@ -60,15 +59,8 @@ func RateLimit(rps float64, burst int, opts ...RateLimitOption) func(http.Handle
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			key := rl.keyFunc(r)
 			if !rl.allow(key) {
-				w.Header().Set("Content-Type", "application/json")
 				w.Header().Set("Retry-After", "1")
-				w.WriteHeader(http.StatusTooManyRequests)
-				json.NewEncoder(w).Encode(map[string]any{
-					"error": map[string]any{
-						"code":    "too_many_requests",
-						"message": "Too many requests",
-					},
-				})
+				writeErrorJSON(w, http.StatusTooManyRequests, "too_many_requests", "Too many requests")
 				return
 			}
 			next.ServeHTTP(w, r)

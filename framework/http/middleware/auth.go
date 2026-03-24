@@ -1,7 +1,6 @@
 package middleware
 
 import (
-	"encoding/json"
 	"net/http"
 
 	sunkernlog "sunkern.local/framework/log"
@@ -77,29 +76,10 @@ func RequireRole(roles ...string) func(http.Handler) http.Handler {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Error response helpers (inline JSON to avoid circular import with
-// parent http package — same pattern as recover.go and ratelimit.go)
-// ---------------------------------------------------------------------------
-
 func writeUnauthorized(w http.ResponseWriter, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusUnauthorized)
-	json.NewEncoder(w).Encode(map[string]any{
-		"error": map[string]any{
-			"code":    "unauthorized",
-			"message": msg,
-		},
-	})
+	writeErrorJSON(w, http.StatusUnauthorized, "unauthorized", msg)
 }
 
 func writeForbidden(w http.ResponseWriter, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusForbidden)
-	json.NewEncoder(w).Encode(map[string]any{
-		"error": map[string]any{
-			"code":    "forbidden",
-			"message": msg,
-		},
-	})
+	writeErrorJSON(w, http.StatusForbidden, "forbidden", msg)
 }
