@@ -8,7 +8,7 @@
 
 ## Current State
 
-**Last session**: 2026-03-24 — Session 5 (framework/db revisit — nullable write paths, batch insert, cursor pagination)
+**Last session**: 2026-03-24 — Session 6 (framework/http revisit — struct-tag request validation)
 **Working tree**: clean
 **Branch**: with-experiment
 
@@ -20,7 +20,7 @@
 | `framework/container` | **Growing** | Session 4 | Override/OverrideSupply, named hooks, all framework hooks named |
 | `framework/config` | Initial | — | 3-layer resolution works |
 | `framework/log` | Initial | — | Dual output works |
-| `framework/http` | **Growing** | Session 3 | Route groups, binding, response helpers, error types, timeouts, auto-OPTIONS registration |
+| `framework/http` | **Maturing** | Session 6 | Revisited: struct-tag validation (required, min/max, email, url, oneof), Validator interface, FieldError details in APIError, auto-validates in Bind/BindQuery |
 | `framework/http/middleware` | **Growing** | Session 3 | RequestID, RequestLogger, Recover (panic recovery), CORS (functional options), RateLimit (token bucket) |
 | `framework/db` | **Maturing** | Session 5 | Revisited: deterministic column order, generalized pointer handling, SetNull, ModelSlice batch insert, NullBoolColumn/NullFloatColumn, cursor pagination (After + HasMore) |
 | `framework/sqlite` | Initial | — | Dual pool works |
@@ -85,6 +85,13 @@ Session 5 (db revisit, notes app with all nullable types, 125k rows):
 - [db/POST batch] ~batch 50 notes per req, p99 16.4ms — ModelSlice with mixed nullable fields
 - [memory] 85 MB RSS after 125k+ writes under sustained load
 
+Session 6 (http revisit, contact manager with validation, 5k rows):
+- [http/GET list] 7,283 req/s, p99 17.9ms — paginated, 5k rows, query validation active
+- [http/POST reject] 73,944 req/s, p99 3.5ms — validation rejection path (4 errors per request)
+- [http/GET single] 52,251 req/s, p99 2.7ms — single read by ID
+- [memory] 42 MB RSS after 25k+ writes and 90k+ load test requests
+- [validation overhead] negligible — 74k req/s rejection path vs 52k baseline GET shows validation adds <0.1ms
+
 ## Design Decisions
 
 <!-- Key decisions and rationale so future sessions don't reverse them. Format:
@@ -111,13 +118,20 @@ Session 5 (db revisit, notes app with all nullable types, 125k rows):
 - [db] Nil pointer fields skip in Model() (single-row INSERT, let DEFAULT apply), insert NULL in ModelSlice() (multi-row INSERT, all rows need same columns). Non-nil pointers always dereference before binding. (Session 5)
 - [db] SetNull(col) is syntactic sugar for SetExpr(col, Raw("NULL")) — provides explicit intent for clearing nullable fields, since SetModel() skips nil pointers (meaning "don't update"). (Session 5)
 - [db] After(cursor, limit) fetches limit+1 rows; HasMore() trims and returns hasMore flag. Caller manages ORDER BY for flexibility (forward vs backward pagination). (Session 5)
+- [http] Validation runs automatically inside Bind/BindQuery — zero-effort for the AI agent. Uses `validate` struct tags. Tag cache via sync.Map parsed once per type. (Session 6)
+- [http] Zero-value fields skip non-required rules — matches Gin convention. For optional fields, zero = "not provided", so min/max/email/etc are skipped. Use `required` to enforce presence. (Session 6)
+- [http] Pointer fields: nil = zero (required check); non-nil = dereference and validate. Perfect for PATCH update structs where nil means "don't update" and non-nil means "update to this value". (Session 6)
+- [http] Field name resolution for error messages: json tag > query tag > lowercased Go name. Matches the binding context — JSON body uses json tags, query params use query tags. (Session 6)
+- [http] Validation errors return 422 with `{"error": {"code": "validation_error", "message": "Validation failed", "details": [...]}}`. Field-level details include field name, rule name, and human-readable message. (Session 6)
+- [http] Validator interface allows custom cross-field validation after tag-based validation passes. Used for bulk operations (validate each item in an array) or business rules that tags can't express. (Session 6)
+- [http] Embedded structs are recursed — enables shared paginationParams with validation reused across list endpoints. (Session 6)
 
 ## Next Priorities
 
 <!-- What the last session thinks should come next, in order -->
 
-1. **Revisit `framework/http`** — request validation (beyond binding), file upload handling, SSE support
-2. **`framework/config` / `framework/log`** — still at Initial maturity, need playground stress-testing and API review
+1. **`framework/config` / `framework/log`** — still at Initial maturity, need playground stress-testing and API review
+2. **Revisit `framework/http`** — file upload handling (multipart/form-data), SSE support for real-time events
 3. **`framework/db` advanced** — RETURNING clause (eliminate update-then-fetch pattern), subqueries in WHERE, CASE expressions
 4. **Revisit `framework/http/middleware`** — auth middleware (JWT validation, role-based), request timeout middleware
 5. **Revisit `framework/app` / `framework/container`** — now Growing, revisit after other packages evolve

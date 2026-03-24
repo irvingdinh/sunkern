@@ -8,8 +8,10 @@ import (
 	"strconv"
 )
 
-// Bind decodes the JSON request body into dst. Returns an *APIError with
-// status 400 if the body is missing or malformed. dst must be a pointer.
+// Bind decodes the JSON request body into dst and validates it using
+// `validate` struct tags. Returns an *APIError with status 400 if the
+// body is missing or malformed, or status 422 if validation fails.
+// dst must be a pointer to a struct.
 func Bind(r *httpstd.Request, dst any) error {
 	if r.Body == nil {
 		return ErrBadRequest.WithMessage("Request body is required")
@@ -18,11 +20,12 @@ func Bind(r *httpstd.Request, dst any) error {
 	if err := dec.Decode(dst); err != nil {
 		return ErrBadRequest.WithMessage("Invalid request body: " + err.Error())
 	}
-	return nil
+	return Validate(dst)
 }
 
-// BindQuery parses URL query parameters into dst using `query` struct tags.
-// Supported field types: string, int, int64, uint, uint64, float64, bool.
+// BindQuery parses URL query parameters into dst using `query` struct tags
+// and validates the result using `validate` struct tags. Supported field
+// types: string, int, int64, uint, uint64, float64, bool.
 // Fields without a matching query parameter retain their current value —
 // set struct field defaults before calling BindQuery.
 //
@@ -51,7 +54,7 @@ func BindQuery(r *httpstd.Request, dst any) error {
 			return ErrBadRequest.WithMessage(fmt.Sprintf("Invalid query parameter %q: %s", tag, err.Error()))
 		}
 	}
-	return nil
+	return Validate(dst)
 }
 
 func setFieldFromString(fv reflect.Value, s string) error {

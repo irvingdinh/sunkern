@@ -85,7 +85,7 @@ func (c *usersController) get(w http.ResponseWriter, r *http.Request) {
 }
 
 type createRequest struct {
-	Email string `json:"email"`
+	Email string `json:"email" validate:"required,email"`
 	Name  string `json:"name"`
 }
 
@@ -93,11 +93,6 @@ func (c *usersController) create(w http.ResponseWriter, r *http.Request) {
 	var req createRequest
 	if err := sunkernhttp.Bind(r, &req); err != nil {
 		sunkernhttp.Error(w, err)
-		return
-	}
-
-	if req.Email == "" {
-		sunkernhttp.Error(w, sunkernhttp.ErrBadRequest.WithMessage("email is required"))
 		return
 	}
 
