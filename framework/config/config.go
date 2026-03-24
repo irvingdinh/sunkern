@@ -17,17 +17,41 @@ import (
 // layer. Return a non-nil error to indicate a validation failure.
 type Rule func(key string, value any, exists bool) error
 
+// Source indicates which layer a config value was resolved from.
+type Source string
+
+const (
+	// SourceEnv means the value was resolved from an environment variable.
+	SourceEnv Source = "env"
+	// SourceFile means the value was loaded from config.json.
+	SourceFile Source = "file"
+	// SourceDefault means the value was registered via SetDefault.
+	SourceDefault Source = "default"
+)
+
+// Entry represents a single config key with resolution metadata. Used by
+// Export for admin dashboard display.
+type Entry struct {
+	Key     string `json:"key"`
+	Value   any    `json:"value"`
+	Source  Source `json:"source"`
+	EnvName string `json:"env_name"`
+}
+
 type state struct {
-	mu       sync.RWMutex
-	values   map[string]any    // from JSON file (flattened)
-	defaults map[string]any    // from SetDefault calls
-	rules    map[string][]Rule // from AddRule calls
+	mu        sync.RWMutex
+	frozen    bool
+	values    map[string]any       // from JSON file (flattened)
+	defaults  map[string]any       // from SetDefault calls
+	rules     map[string][]Rule    // from AddRule calls
+	sensitive map[string]struct{}  // keys whose values are masked in Export
 }
 
 var global = state{
-	values:   make(map[string]any),
-	defaults: make(map[string]any),
-	rules:    make(map[string][]Rule),
+	values:    make(map[string]any),
+	defaults:  make(map[string]any),
+	rules:     make(map[string][]Rule),
+	sensitive: make(map[string]struct{}),
 }
 
 // Load resolves the data directory, creates it if needed, loads
@@ -78,9 +102,11 @@ func Load() {
 	defaults["data_dir"] = dataDir
 
 	global.mu.Lock()
+	global.frozen = false
 	global.values = flat
 	global.defaults = defaults
 	global.rules = make(map[string][]Rule)
+	global.sensitive = make(map[string]struct{})
 	global.mu.Unlock()
 }
 
@@ -89,8 +115,13 @@ func Load() {
 // values and environment variables take precedence.
 //
 // When multiple modules call SetDefault for the same key, the last call wins.
+// Panics if the config has been frozen (after Validate).
 func SetDefault(key string, value any) {
 	global.mu.Lock()
+	if global.frozen {
+		global.mu.Unlock()
+		panic(fmt.Sprintf("config: SetDefault(%q) called after config is frozen", key))
+	}
 	global.defaults[key] = value
 	global.mu.Unlock()
 }
@@ -106,6 +137,10 @@ func SetDefault(key string, value any) {
 //	})
 func SetDefaults(m map[string]any) {
 	global.mu.Lock()
+	if global.frozen {
+		global.mu.Unlock()
+		panic("config: SetDefaults called after config is frozen")
+	}
 	for k, v := range m {
 		global.defaults[k] = v
 	}
@@ -281,6 +316,111 @@ func Sub(prefix string) map[string]any {
 	return result
 }
 
+// MarkSensitive marks keys whose values should be masked in Export output.
+// Typically called alongside SetDefault during the registration phase for
+// keys containing secrets, credentials, or tokens.
+//
+//	config.SetDefault("jwt.secret", "")
+//	config.MarkSensitive("jwt.secret", "resend.api_token", "s3.secret_key")
+//
+// Panics if the config has been frozen (after Validate).
+func MarkSensitive(keys ...string) {
+	global.mu.Lock()
+	if global.frozen {
+		global.mu.Unlock()
+		panic("config: MarkSensitive called after config is frozen")
+	}
+	for _, k := range keys {
+		global.sensitive[k] = struct{}{}
+	}
+	global.mu.Unlock()
+}
+
+// IsSensitive reports whether a key has been marked as sensitive.
+func IsSensitive(key string) bool {
+	global.mu.RLock()
+	_, ok := global.sensitive[key]
+	global.mu.RUnlock()
+	return ok
+}
+
+// Export returns all known config entries with their resolved values, source
+// attribution, and environment variable names. Entries are sorted by key.
+//
+// Sensitive keys have their values replaced with "***". This makes Export
+// safe to return directly from admin API endpoints without leaking secrets.
+//
+// The returned slice is a copy and safe to modify.
+func Export() []Entry {
+	global.mu.RLock()
+
+	// Collect all known keys.
+	seen := make(map[string]struct{})
+	for k := range global.defaults {
+		seen[k] = struct{}{}
+	}
+	for k := range global.values {
+		seen[k] = struct{}{}
+	}
+
+	// Snapshot sensitive set under the same lock.
+	sensitiveSnapshot := make(map[string]struct{}, len(global.sensitive))
+	for k := range global.sensitive {
+		sensitiveSnapshot[k] = struct{}{}
+	}
+
+	global.mu.RUnlock()
+
+	// Build sorted key list.
+	keys := make([]string, 0, len(seen))
+	for k := range seen {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	// Resolve each key with source tracking.
+	entries := make([]Entry, 0, len(keys))
+	for _, key := range keys {
+		val, source, ok := resolveWithSource(key)
+		if !ok {
+			continue
+		}
+
+		// Mask sensitive values.
+		if _, sensitive := sensitiveSnapshot[key]; sensitive {
+			val = "***"
+		}
+
+		entries = append(entries, Entry{
+			Key:     key,
+			Value:   val,
+			Source:  source,
+			EnvName: keyToEnvVar(key),
+		})
+	}
+
+	return entries
+}
+
+// Freeze prevents further SetDefault, SetDefaults, MarkSensitive, and
+// AddRule calls. Called automatically at the end of Validate. Can also be
+// called manually to freeze config earlier.
+//
+// Freeze is idempotent — calling it multiple times is safe.
+func Freeze() {
+	global.mu.Lock()
+	global.frozen = true
+	global.mu.Unlock()
+}
+
+// IsFrozen reports whether the config has been frozen.
+func IsFrozen() bool {
+	global.mu.RLock()
+	frozen := global.frozen
+	global.mu.RUnlock()
+	return frozen
+}
+
 // ---------------------------------------------------------------------------
 // Internal
 // ---------------------------------------------------------------------------
@@ -288,23 +428,30 @@ func Sub(prefix string) map[string]any {
 // resolve returns the value for a key, checking all three layers.
 // Resolution order: env var → config file → registered defaults.
 func resolve(key string) (any, bool) {
+	val, _, ok := resolveWithSource(key)
+	return val, ok
+}
+
+// resolveWithSource returns the value for a key along with which layer it
+// was resolved from. Resolution order: env var → config file → defaults.
+func resolveWithSource(key string) (any, Source, bool) {
 	envKey := keyToEnvVar(key)
 	if envVal, ok := os.LookupEnv(envKey); ok {
-		return envVal, true
+		return envVal, SourceEnv, true
 	}
 
 	global.mu.RLock()
 	defer global.mu.RUnlock()
 
 	if val, ok := global.values[key]; ok {
-		return val, true
+		return val, SourceFile, true
 	}
 
 	if val, ok := global.defaults[key]; ok {
-		return val, true
+		return val, SourceDefault, true
 	}
 
-	return nil, false
+	return nil, "", false
 }
 
 // keyToEnvVar converts a dot-notation key to an environment variable name.

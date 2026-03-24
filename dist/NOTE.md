@@ -8,7 +8,7 @@
 
 ## Current State
 
-**Last session**: 2026-03-25 — Session 28 (framework/http revisited — PaginationParams, embedded BindQuery/BindForm, middleware error consolidation, configurable timeouts, Created helper)
+**Last session**: 2026-03-25 — Session 29 (framework/config revisited — source tracking, sensitive masking, export for admin, config freeze)
 **Working tree**: clean
 **Branch**: with-experiment
 
@@ -18,7 +18,7 @@
 |---------|----------|--------------|-------|
 | `framework/app` | **Maturing** | Session 25 | Revisited: health check system (HealthChecker/CheckFunc/HealthReport, concurrent CheckHealth, AddHealthCheck), ReadyCh() symmetric with ShuttingDown(), Env()/Version() with config integration, sqlite health auto-registered, startup log includes env/health_checks/version. Previous (Session 13): *App supplied to container, boot/shutdown timing, startup summary. Previous: ModuleGroup boot rollback fix, lifecycle logging |
 | `framework/container` | **Maturing** | Session 26 | Revisited: ServiceInfo enriched with JSON tags, Kind (supplied/provided), Caller (file:line), ErrorText; ServiceStatus.MarshalJSON; HookReport with per-hook timing from StartHooks/StopHooks; caller tracking in Provide/Supply/Override (runtime.Caller); duplicate-registration panics show both original+duplicate call sites; app.go logs hook start/stop at Debug level. Previous (Session 13): introspection APIs (Keys, Inspect, Len), ServiceInfo/ServiceStatus types, Hooks() accessor. Previous: Override/OverrideSupply, named hooks, all framework hooks named |
-| `framework/config` | **Maturing** | Session 16 | Revisited: config validation (AddRule, Validate, 10 built-in rules: Required, NotEmpty, Positive, NonNegative, OneOf, Min, Max, Range, MinLen, MaxLen). Rule type is a function — composable, zero boilerplate. Validate() integrated into app lifecycle after framework init, before module Boot. Previous (Session 7): Has, All, Keys, Sub, DataDir, EnvName, SetDefaults; Load creates data dir; improved panic messages |
+| `framework/config` | **Maturing** | Session 29 | Revisited: Source tracking (resolveWithSource returns env/file/default per key), MarkSensitive/IsSensitive for masking secrets in Export, Export() returns []Entry with key/value/source/env_name sorted by key, Freeze/IsFrozen (auto-freeze after Validate, SetDefault/SetDefaults/AddRule/MarkSensitive panic if frozen), Load() resets frozen+sensitive for test reuse. Previous (Session 16): config validation (AddRule, Validate, 10 built-in rules). Previous (Session 7): Has, All, Keys, Sub, DataDir, EnvName, SetDefaults; Load creates data dir; improved panic messages |
 | `framework/log` | **Maturing** | Session 17 | Revisited: buffered file writer (64KB bufio.Writer + 200ms periodic flush goroutine — ~145k log writes/sec), Flush() export, Query improvements (Order desc/asc, After/Before time range, CountOnly mode). Previous (Session 8): Separate console/file levels, log file management, JSONL entry parsing + querying |
 | `framework/http` | **Maturing** | Session 28 | Revisited: PaginationParams (embeddable, Paginate() returns page/perPage/offset with defaults 20/100), BindQuery/BindForm embedded struct recursion (enables shared param types), Created() response helper (201 shorthand), configurable server timeouts (http.read_timeout/write_timeout/idle_timeout via config), middleware writeErrorJSON consolidation (DRY'd 4 files into shared helper). Previous (Session 14): SSE support. Previous (Session 10): Bind/BindForm MaxBytesError → 413. Previous: file upload handling, all sentinels |
 | `framework/http/middleware` | **Maturing** | Session 28 | Revisited: writeErrorJSON shared helper (extracted from auth, apitoken, recover, ratelimit — DRY'd 4 inline JSON blocks into error.go). Previous (Session 15): Timeout, PBKDF2-SHA256 password hashing, APIToken middleware, GenerateToken. Previous (Session 10): JWT, Auth, RequireRole, MaxBytes. Plus existing: RequestID, RequestLogger, Recover, CORS, RateLimit |
@@ -330,6 +330,18 @@ Session 28 (http revisit, bookmark manager with PaginationParams + embedded Bind
 - [pagination] Default: page=1, per_page=20. Clamping: page<=0→1, per_page<=0→20, per_page>100→20
 - [embedded BindQuery] PaginationParams + custom Tags field both bound correctly from query string
 
+Session 29 (config revisit, settings inspector with Export + source tracking + sensitive masking + freeze, 500 rows):
+- [config/GET export] 65,526 req/s, p99 2.6ms — Export() with 15 keys, source resolution + sensitive masking
+- [config/GET frozen] 83,619 req/s, p99 2.1ms — IsFrozen() atomic bool under RLock
+- [config/GET keys] 72,425 req/s, p99 2.6ms — Keys() sorted, 15 keys
+- [settings/GET list] 21,865 req/s, p99 5.6ms — paginated list on 500 rows
+- [settings/POST create] 66,750 req/s, p99 1.1ms — JSON bind + INSERT (conflict returns 409)
+- [memory] 37 MB RSS after 500+ writes and 35k+ load test requests
+- [race] No data races detected with -race flag on concurrent Export + frozen + keys + settings CRUD
+- [source tracking] data_dir → "env" (DATA_DIR set), settings.max_key_length → "env" (SETTINGS_MAX_KEY_LENGTH=512), all others → "default"
+- [sensitive masking] api.secret → "***" in Export, original value accessible via Get[string]("api.secret")
+- [freeze] POST /freeze-test → panic caught by Recover → 500 with "config: SetDefault called after config is frozen"
+
 ## Design Decisions
 
 <!-- Key decisions and rationale so future sessions don't reverse them. Format:
@@ -531,20 +543,27 @@ Session 28 (http revisit, bookmark manager with PaginationParams + embedded Bind
 - [middleware] writeErrorJSON(w, status, code, msg) is an unexported helper in error.go. Replaces 4 identical inline JSON blocks across auth.go, apitoken.go, recover.go, ratelimit.go. The circular import constraint (middleware can't import parent http) still applies — this is the middleware-internal equivalent of http.Error(). (Session 28)
 - [middleware] RateLimit's Retry-After header is set BEFORE writeErrorJSON — writeErrorJSON calls w.WriteHeader which flushes headers. This ordering is correct: set all headers, then write status+body. Previous code set Content-Type manually before WriteHeader, which also worked, but the consolidated helper handles Content-Type internally. (Session 28)
 
+- [config] Source tracking uses resolveWithSource(key) returning (any, Source, bool). resolve() delegates to it and drops the Source — no runtime cost for existing Get/GetOr/Has callers. Source is a named string type ("env"/"file"/"default") for JSON-friendly serialization. (Session 29)
+- [config] Export() snapshots sensitive set under RLock, releases, then resolves each key individually (resolveWithSource acquires its own RLock). Same snapshot-then-release pattern as Validate() — avoids holding the lock during env var lookups. Returns []Entry sorted by key — admin API can return this directly. (Session 29)
+- [config] MarkSensitive is a registration-phase function (like SetDefault/AddRule), not a per-call flag on Get. This means the sensitive set is fixed after boot — no runtime mutation, consistent with the frozen model. IsSensitive is the read-only accessor. (Session 29)
+- [config] Freeze/IsFrozen use the existing sync.RWMutex. Freeze sets frozen=true under write lock. SetDefault/SetDefaults/AddRule/MarkSensitive check frozen under write lock and panic if true. Validate() calls Freeze() at the end — any registration call after Validate is a bug. Load() resets frozen=false for test reuse. (Session 29)
+- [config] Environment-specific config files (config.{env}.json) were considered and rejected — Viper research confirmed env vars are the primary override mechanism for container-native deployments. Adding file variants would complicate the mental model without solving a real problem. (Session 29)
+- [config] Entry struct has JSON tags on all fields — ready for direct serialization in admin API responses. Value is `any` (not string) to preserve original types from SetDefault (int, bool, duration) in the JSON output. Env source values are always strings (from os.LookupEnv). (Session 29)
+
 ## Next Priorities
 
 <!-- What the last session thinks should come next, in order -->
 
-1. **Revisit `framework/config`** — last touched Session 16 (12 sessions ago). Config watching (detect file changes), environment-specific config files, config dump endpoint for admin
-2. **Revisit `framework/app`** — last touched Session 25 (3 sessions ago). Lifecycle hooks for plugins (pre-boot, post-boot callbacks), module dependency declaration, boot order optimization
+1. **Revisit `framework/app`** — last touched Session 25 (4 sessions ago). Lifecycle hooks for plugins (pre-boot, post-boot callbacks), module dependency declaration, boot order optimization
+2. **Revisit `framework/log`** — last touched Session 17 (12 sessions ago). Log sampling handler for high-traffic paths, mmap-based query for very large files (deferred — current linear scan is acceptable for admin viewer with daily rotation)
 3. **Revisit `framework/http/middleware`** — last touched Session 28 (error consolidation only). Auth flow ergonomics, middleware composition helpers, consider request context enrichment helpers
-4. **Revisit `framework/http`** — last touched Session 28. SSE broker/hub pattern (manages multiple connections, fan-out from event source, stats) — deferred from Session 28 in favor of higher-impact ergonomic improvements
-5. **Revisit `framework/log`** — log sampling handler for high-traffic paths, mmap-based query for very large files (deferred — current linear scan is acceptable for admin viewer with daily rotation)
-6. **Revisit `framework/sqlite`** — PRAGMA runtime reconfiguration (cache_size, mmap_size changes without restart), table-level size stats for admin dashboard
-7. **Revisit `framework/sqlite/migrate`** — migration versioning validation (detect gaps, detect orphaned DB records), checksum mismatch warnings in Up() log output, batch status queries
-8. **Revisit `framework/sqlite/driver`** — sqlite3_busy_handler (callback-based backoff), sqlite3_wal_hook (WAL monitoring), sqlite3_trace_v2 (statement tracing for debug), blob I/O for large objects
-9. **Revisit `framework/db`** — db package is now comprehensive. Consider: batch update/delete helpers (UpdateAll, DeleteAll for common patterns), query logging/tracing hook, prepared statement caching
-9. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
+4. **Revisit `framework/http`** — last touched Session 28. SSE broker/hub pattern (manages multiple connections, fan-out from event source, stats)
+5. **Revisit `framework/sqlite`** — last touched Session 18 (11 sessions ago). PRAGMA runtime reconfiguration (cache_size, mmap_size changes without restart), table-level size stats for admin dashboard
+6. **Revisit `framework/sqlite/migrate`** — last touched Session 19 (10 sessions ago). Migration versioning validation (detect gaps, detect orphaned DB records), checksum mismatch warnings in Up() log output, batch status queries
+7. **Revisit `framework/sqlite/driver`** — last touched Session 20 (9 sessions ago). sqlite3_busy_handler (callback-based backoff), sqlite3_wal_hook (WAL monitoring), sqlite3_trace_v2 (statement tracing for debug), blob I/O for large objects
+8. **Revisit `framework/db`** — db package is now comprehensive. Consider: batch update/delete helpers (UpdateAll, DeleteAll for common patterns), query logging/tracing hook, prepared statement caching
+9. **Revisit `framework/config`** — just revisited in Session 29. Future: config value change detection (compare Export snapshots), config documentation generator (list all keys with types/defaults/env names for docs)
+10. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
 
 ## In-Progress Work
 

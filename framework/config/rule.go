@@ -19,6 +19,10 @@ import (
 //	config.AddRule("log.level", config.OneOf("DEBUG", "INFO", "WARN", "ERROR"))
 func AddRule(key string, rules ...Rule) {
 	global.mu.Lock()
+	if global.frozen {
+		global.mu.Unlock()
+		panic(fmt.Sprintf("config: AddRule(%q) called after config is frozen", key))
+	}
 	global.rules[key] = append(global.rules[key], rules...)
 	global.mu.Unlock()
 }
@@ -59,6 +63,10 @@ func Validate() {
 		sort.Strings(errs)
 		panic(fmt.Sprintf("config: validation failed:\n%s", strings.Join(errs, "\n")))
 	}
+
+	// Freeze config after successful validation. No further SetDefault,
+	// SetDefaults, MarkSensitive, or AddRule calls are allowed.
+	Freeze()
 }
 
 // ---------------------------------------------------------------------------
