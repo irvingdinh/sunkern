@@ -8,7 +8,7 @@
 
 ## Current State
 
-**Last session**: 2026-03-25 — Session 37 (framework/container revisited — circular dep detection, dependency graph, Container.Reset)
+**Last session**: 2026-03-25 — Session 38 (framework/app revisited — module introspection, dependency validation, conditional modules)
 **Working tree**: clean
 **Branch**: with-experiment
 
@@ -16,7 +16,7 @@
 
 | Package | Maturity | Last Touched | Notes |
 |---------|----------|--------------|-------|
-| `framework/app` | **Maturing** | Session 30 | Revisited: PostBooter optional interface (PostBoot() after ALL modules Boot — data seeding, cache warm-up, cross-module workers), PreShutdowner optional interface (PreShutdown(ctx) before individual Shutdown — drain work, flush buffers), phase timing in startup log (boot_time_ms broken into register_ms/framework_ms/module_boot_ms/post_boot_ms/hooks_ms), ModuleGroup delegates PostBoot/PreShutdown to children, 8 new tests (21 total). Previous (Session 25): health check system, ReadyCh, Env/Version. Previous (Session 13): *App supplied to container, boot/shutdown timing. Previous: ModuleGroup boot rollback fix |
+| `framework/app` | **Maturing** | Session 38 | Revisited: Tagger optional interface ([]string tags for admin categorization), DependencyDeclarer optional interface (module-level dependency validation between register and boot), When(bool, Module) conditional wrapper (disabled modules skip lifecycle, preserve metadata for introspection), ModuleStatus/ModuleInfo types with JSON tags for admin API, App.ModuleInfo() returns all modules with status/tags/deps, duplicate module name validation in register phase, disabled modules excluded from dependency validation both directions, moduleNames() shows "(disabled)" suffix, 18 new tests (39 total). Load tested: ModuleInfo 67K req/s p99 2.7ms. Previous (Session 30): PostBooter, PreShutdowner, phase timing, ModuleGroup delegates. Previous (Session 25): health check system, ReadyCh, Env/Version. Previous (Session 13): *App supplied to container, boot/shutdown timing. Previous: ModuleGroup boot rollback fix |
 | `framework/container` | **Maturing** | Session 37 | Revisited: circular dependency detection (prevents deadlocks — panics with clear "A → B → A" chain message), automatic dependency tracking during provider resolution (recorded as sorted unique []string per service), DependencyGraph() adjacency-list method for admin dashboards, Deps field on ServiceInfo with JSON serialization, Container.Reset() instance method for non-global container test isolation, goID()-based per-goroutine resolution tracking (zero overhead on cached hits — fast path skips goID entirely), 11 new tests (48 total). Previous (Session 26): ServiceInfo enriched with Kind/Caller/ErrorText; HookReport with per-hook timing; caller tracking in Provide/Supply/Override. Previous (Session 13): introspection APIs (Keys, Inspect, Len), ServiceInfo/ServiceStatus types. Previous: Override/OverrideSupply, named hooks |
 | `framework/config` | **Maturing** | Session 29 | Revisited: Source tracking (resolveWithSource returns env/file/default per key), MarkSensitive/IsSensitive for masking secrets in Export, Export() returns []Entry with key/value/source/env_name sorted by key, Freeze/IsFrozen (auto-freeze after Validate, SetDefault/SetDefaults/AddRule/MarkSensitive panic if frozen), Load() resets frozen+sensitive for test reuse. Previous (Session 16): config validation (AddRule, Validate, 10 built-in rules). Previous (Session 7): Has, All, Keys, Sub, DataDir, EnvName, SetDefaults; Load creates data dir; improved panic messages |
 | `framework/log` | **Maturing** | Session 31 | Revisited: samplingHandler for per-level log volume control (atomic counters, DEBUG/INFO configurable via log.sample.debug/log.sample.info — 1.3M msg/s throughput), mergedHandler.Enabled optimization (skips Record allocation when both sinks filter level), Query now takes context.Context for cancellation (checks every 1024 lines), QueryResult struct replaces tuple return (adds Skipped count for malformed lines), date validation in Query (rejects invalid YYYY_MM_DD format), config defaults registered in Load() for discoverability (log.level, log.console.level, log.sample.debug, log.sample.info visible in config.Keys()), 8 new tests (47 total). Previous (Session 17): buffered file writer (64KB bufio.Writer + 200ms flush). Previous (Session 8): Separate console/file levels, log file management, JSONL entry parsing + querying |
@@ -423,6 +423,13 @@ Session 37 (container revisit, service registry app with 4 modules — 50 servic
 - [memory] 27 MB RSS after 250+ writes and 60K+ load test requests
 - [race] No data races detected with -race flag on concurrent introspection + CRUD + events writes
 
+Session 38 (app revisit, task tracker with 5 modules — admin, tasks, analytics, email (disabled), heartbeat, 6000+ rows):
+- [app/GET ModuleInfo] 67,490 req/s, p99 2.7ms — ModuleInfo() with 5 modules (4 active, 1 disabled), tags, deps
+- [app/GET health] 66,204 req/s, p99 2.7ms — CheckHealth with sqlite (consistent with Session 37)
+- [crud/POST create] 33,712 req/s, p99 2.6ms — JSON decode + INSERT with BaseModel auto-fill
+- [analytics/GET stats] 12,780 req/s, p99 10.3ms — 2x COUNT on 6000+ rows
+- [memory] 75 MB RSS after 6000+ writes and 40K+ load test requests
+
 ## Design Decisions
 
 <!-- Key decisions and rationale so future sessions don't reverse them. Format:
@@ -693,19 +700,27 @@ Session 37 (container revisit, service registry app with 4 modules — 50 servic
 - [container] DependencyGraph() returns map[string][]string — only includes built services with at least one dep. Each dep list is a copy (mutation-safe). Admin endpoints serialize this directly. The graph represents direct dependencies only (not transitive). (Session 37)
 - [container] Container.Reset() is an instance method that clears services, hooks, and resolving map in place. The global Reset() still replaces the pointer (global = New()) for backward compatibility — existing code holding a Global() pointer sees a stale-but-valid container. Instance Reset is for non-global containers in tests. (Session 37)
 
+- [app] Tagger and DependencyDeclarer are optional interfaces (type assertion at call site) — modules not implementing them are silently skipped. Chosen over registration-based approaches (a.AddTags(m, tags)) because interfaces are discoverable via Go docs, type-checked at compile time, and colocated with the module definition. Tags are free-form []string — no predefined taxonomy. (Session 38)
+- [app] DependencyDeclarer is validation-only — does NOT reorder modules. Registration order still determines boot order. Rationale: topological sort adds complexity and makes boot order non-obvious. Explicit ordering is Sunkern's philosophy. DependsOn catches misconfiguration (missing/disabled deps), not automates wiring. (Session 38)
+- [app] When(bool, Module) uses a bool, not func() bool. The condition is evaluated at Use() time (before Run). Config values from config.json aren't available yet, but env vars are (os.Getenv). This covers the primary use case — container deployments use env vars. For config-file-based conditions, restructure boot order or use env vars. (Session 38)
+- [app] disabledModule wraps the inner module and delegates Name() for log/introspection visibility. All lifecycle methods are no-ops. ModuleInfo() explicitly unwraps disabledModule to read Tagger/DependencyDeclarer from the inner module — preserving metadata even when disabled. (Session 38)
+- [app] ModuleStatus derived on-the-fly in ModuleInfo() from a.booted set + a.ready flag + isDisabled check. No mutable status map — avoids synchronization complexity. Status is: disabled (When wrapper), registered (not in booted set), booted (in booted set + ready=true), shutdown (in booted set + ready=false). (Session 38)
+- [app] Duplicate module name validation runs first in register() before any Register() call. Catches configuration errors early. Disabled modules count toward uniqueness — two modules can't share a name even if one is disabled. (Session 38)
+- [app] Disabled modules are excluded from dependency validation in both directions: they don't need their deps validated, and they don't satisfy other modules' deps. If module B depends on A and A is disabled, B gets a clear error — the fix is to also disable B or enable A. No cascading disable. (Session 38)
+
 ## Next Priorities
 
 <!-- What the last session thinks should come next, in order -->
 
-1. **Revisit `framework/app`** — last touched Session 30 (7 sessions ago, oldest). Future: module dependency declaration (explicit DependsOn for boot ordering — now can leverage container dep graph), module tags/labels for admin introspection, conditional modules (enabled/disabled via config)
-2. **Revisit `framework/config`** — last touched Session 29. Future: config value change detection (compare Export snapshots), config documentation generator
-3. **Revisit `framework/http`** — last touched Session 35. SSE broker/hub pattern (manages multiple connections, fan-out from event source, stats), response inspection helpers (exported ResponseRecorder or status getter)
-4. **Revisit `framework/http/middleware`** — last touched Session 35. Future: CSRF protection (double-submit cookie), conditional middleware by method (SkipMethods), request body caching for retry/inspection
-5. **Revisit `framework/log`** — last touched Session 31. Future: mmap-based query for very large files (deferred — current linear scan acceptable for admin viewer with daily rotation), log rotation callback (notify when file rotates), per-request sampling (sample by request_id hash for consistent traces)
-6. **Revisit `framework/db`** — last touched Session 36. Future: batch update helpers (CASE-based multi-row updates), query logging/tracing hook (can now leverage driver trace), prepared statement caching, consider UpdateByID convenience
-7. **Revisit `framework/sqlite/driver`** — last touched Session 34. Future: blob I/O (sqlite3_blob_open/read/write/close for incremental large object access), sqlite3_update_hook (row-level change notifications), WAL hook integration with maintenance goroutine (proactive checkpoint triggering instead of polling)
-8. **Revisit `framework/sqlite/migrate`** — last touched Session 33. Future: dry-run mode (validate SQL syntax without applying), migration locking (prevent concurrent Up() calls), migration hooks (pre/post callbacks)
-9. **Revisit `framework/container`** — last touched Session 37. Future: exported container-level generic functions (ProvideToContainer, MustMakeFromContainer) for isolated container testing, provider timeout (context-based deadline for lazy init), service health integration (register health checks from providers automatically)
+1. **Revisit `framework/config`** — last touched Session 29 (9 sessions ago, oldest). Future: config value change detection (compare Export snapshots), config documentation generator
+2. **Revisit `framework/log`** — last touched Session 31. Future: mmap-based query for very large files (deferred — current linear scan acceptable for admin viewer with daily rotation), log rotation callback (notify when file rotates), per-request sampling (sample by request_id hash for consistent traces)
+3. **Revisit `framework/sqlite/migrate`** — last touched Session 33. Future: dry-run mode (validate SQL syntax without applying), migration locking (prevent concurrent Up() calls), migration hooks (pre/post callbacks)
+4. **Revisit `framework/sqlite/driver`** — last touched Session 34. Future: blob I/O (sqlite3_blob_open/read/write/close for incremental large object access), sqlite3_update_hook (row-level change notifications), WAL hook integration with maintenance goroutine (proactive checkpoint triggering instead of polling)
+5. **Revisit `framework/http`** — last touched Session 35. SSE broker/hub pattern (manages multiple connections, fan-out from event source, stats), response inspection helpers (exported ResponseRecorder or status getter)
+6. **Revisit `framework/http/middleware`** — last touched Session 35. Future: CSRF protection (double-submit cookie), conditional middleware by method (SkipMethods), request body caching for retry/inspection
+7. **Revisit `framework/db`** — last touched Session 36. Future: batch update helpers (CASE-based multi-row updates), query logging/tracing hook (can now leverage driver trace), prepared statement caching, consider UpdateByID convenience
+8. **Revisit `framework/container`** — last touched Session 37. Future: exported container-level generic functions (ProvideToContainer, MustMakeFromContainer) for isolated container testing, provider timeout (context-based deadline for lazy init), service health integration (register health checks from providers automatically)
+9. **Revisit `framework/app`** — last touched Session 38. Future: module boot ordering via DependsOn (topological sort — currently validation only), ModuleGroup children introspection (nested ModuleInfo), module enable/disable at runtime via config change callback
 10. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
 
 ## In-Progress Work
