@@ -31,6 +31,11 @@ func (m *Module) Boot() error {
 
 	g := server.Group("/api/users")
 	g.HandleFunc("GET /", uc.list)
+	g.HandleFunc("POST /", uc.create)
+	g.HandleFunc("GET /{id}", uc.get)
+	g.HandleFunc("PATCH /{id}", uc.update)
+	g.HandleFunc("DELETE /{id}", uc.delete)
+	g.HandleFunc("POST /{id}/restore", uc.restore)
 
 	return nil
 }

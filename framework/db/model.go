@@ -18,6 +18,19 @@ type BaseModel struct {
 	DeletedAt *time.Time `db:"deleted_at" json:"deleted_at,omitempty"`
 }
 
+// NewBaseModel creates a BaseModel with a generated ID and timestamps set
+// to the current time. Use this when constructing new entities for insertion:
+//
+//	user := User{BaseModel: db.NewBaseModel(), Email: "a@b.com"}
+func NewBaseModel() BaseModel {
+	now := time.Now()
+	return BaseModel{
+		ID:        NewID(),
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+}
+
 // ---------------------------------------------------------------------------
 // ID generation — zero-dependency, time-sortable, 20-char alphanumeric
 // ---------------------------------------------------------------------------

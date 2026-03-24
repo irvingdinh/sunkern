@@ -262,6 +262,22 @@ func QueryOne[T any](ctx context.Context, q Querier, sb *SelectBuilder) (T, erro
 	return scanOne[T](rows)
 }
 
+// QueryVal executes the query and scans a single column from the first row
+// into T. Use for scalar results (e.g., MAX, single-column selects).
+// Returns ErrNotFound if no rows match.
+//
+//	maxAge, err := db.QueryVal[int64](ctx, readDB,
+//	    db.Select(&Users.TableInfo).Columns(db.Max(Users.Age, "")))
+func QueryVal[T any](ctx context.Context, q Querier, sb *SelectBuilder) (T, error) {
+	sqlStr, args := sb.Build()
+	rows, err := q.QueryContext(ctx, sqlStr, args...)
+	if err != nil {
+		var zero T
+		return zero, fmt.Errorf("db: query: %w", err)
+	}
+	return scanVal[T](rows)
+}
+
 // Count executes a SELECT COUNT(*) using the builder's FROM/WHERE/JOIN clauses.
 func Count(ctx context.Context, q Querier, sb *SelectBuilder) (int64, error) {
 	sql, args := sb.buildCount()

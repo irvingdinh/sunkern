@@ -47,12 +47,26 @@ func (b *InsertBuilder) OnConflict(cols ...column) *ConflictBuilder {
 	return &ConflictBuilder{insert: b, targets: cols}
 }
 
-// Model reads a struct's db tags to determine columns and values. It:
+// Model reads a struct's db tags to determine columns and values. When
+// a pointer is passed, it auto-fills empty BaseModel fields so the caller's
+// struct matches what gets inserted:
+//   - Generates a new ID if the "id" field is an empty string
 //   - Sets created_at and updated_at to time.Now() if they are zero values
 //   - Skips nil *time.Time fields (lets DB DEFAULT apply)
-//   - Formats time.Time values to the canonical SQLite format
+//
+// Usage:
+//
+//	user := User{BaseModel: db.NewBaseModel(), Email: "a@b.com"}
+//	db.Insert(&Users.TableInfo).Model(&user).Exec(ctx, writeDB)
+//
+// Or let Model auto-fill:
+//
+//	user := User{Email: "a@b.com"}
+//	db.Insert(&Users.TableInfo).Model(&user).Exec(ctx, writeDB)
+//	// user.ID, user.CreatedAt, user.UpdatedAt are now set
 func (b *InsertBuilder) Model(v any) *InsertBuilder {
 	rv := reflect.ValueOf(v)
+	canSet := rv.Kind() == reflect.Ptr
 	if rv.Kind() == reflect.Ptr {
 		rv = rv.Elem()
 	}
@@ -60,6 +74,25 @@ func (b *InsertBuilder) Model(v any) *InsertBuilder {
 
 	m := getMapping(rt)
 	now := time.Now()
+
+	// Auto-fill BaseModel fields when a pointer is passed, so the caller's
+	// struct stays in sync with what gets inserted.
+	if canSet {
+		if idIdx, ok := m.colToIndex["id"]; ok {
+			f := rv.FieldByIndex(idIdx)
+			if f.Kind() == reflect.String && f.String() == "" {
+				f.SetString(NewID())
+			}
+		}
+		for _, col := range []string{"created_at", "updated_at"} {
+			if idx, ok := m.colToIndex[col]; ok {
+				f := rv.FieldByIndex(idx)
+				if f.Type() == reflect.TypeOf(time.Time{}) && f.Interface().(time.Time).IsZero() {
+					f.Set(reflect.ValueOf(now))
+				}
+			}
+		}
+	}
 
 	var cols []column
 	var vals []any
@@ -81,6 +114,7 @@ func (b *InsertBuilder) Model(v any) *InsertBuilder {
 		}
 
 		// Handle time.Time: auto-set created_at/updated_at if zero.
+		// This covers the non-pointer path where canSet is false.
 		if fieldType == reflect.TypeOf(time.Time{}) {
 			t := val.(time.Time)
 			if t.IsZero() && (colName == "created_at" || colName == "updated_at") {
@@ -88,6 +122,13 @@ func (b *InsertBuilder) Model(v any) *InsertBuilder {
 			}
 			cols = append(cols, newSyntheticColumn(b.table.name, colName))
 			vals = append(vals, t)
+			continue
+		}
+
+		// Auto-generate ID for non-pointer path.
+		if colName == "id" && fieldType.Kind() == reflect.String && val.(string) == "" {
+			cols = append(cols, newSyntheticColumn(b.table.name, colName))
+			vals = append(vals, NewID())
 			continue
 		}
 

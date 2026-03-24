@@ -129,13 +129,30 @@ func (b *UpdateBuilder) Where(preds ...Expr) *UpdateBuilder {
 	return b
 }
 
-// Build generates the SQL string and args.
+// Build generates the SQL string and args. If no SET clause targets
+// "updated_at", one is auto-appended with the current time. This ensures
+// models that embed BaseModel always get their timestamp refreshed.
 func (b *UpdateBuilder) Build() (string, []any, error) {
 	if len(b.where) == 0 {
 		return "", nil, errors.New("db: UPDATE without WHERE is not allowed (use Where(Raw(\"1=1\")) to update all rows)")
 	}
 	if len(b.sets) == 0 {
 		return "", nil, errors.New("db: UPDATE with no SET clauses")
+	}
+
+	// Auto-set updated_at if not already present.
+	hasUpdatedAt := false
+	for _, s := range b.sets {
+		if s.col.columnName() == "updated_at" {
+			hasUpdatedAt = true
+			break
+		}
+	}
+	if !hasUpdatedAt {
+		b.sets = append(b.sets, setClause{
+			col: newSyntheticColumn(b.table.name, "updated_at"),
+			val: time.Now(),
+		})
 	}
 
 	var buf strings.Builder

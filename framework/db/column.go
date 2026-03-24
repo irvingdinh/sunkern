@@ -47,6 +47,10 @@ func String(t *TableInfo, name string) StringColumn {
 
 func (c StringColumn) Eq(val string) Expr        { return newComp(c, "=", val) }
 func (c StringColumn) Ne(val string) Expr        { return newComp(c, "<>", val) }
+func (c StringColumn) Gt(val string) Expr        { return newComp(c, ">", val) }
+func (c StringColumn) Lt(val string) Expr        { return newComp(c, "<", val) }
+func (c StringColumn) Gte(val string) Expr       { return newComp(c, ">=", val) }
+func (c StringColumn) Lte(val string) Expr       { return newComp(c, "<=", val) }
 func (c StringColumn) Like(val string) Expr      { return newComp(c, "LIKE", val) }
 func (c StringColumn) In(vals ...string) Expr    { return newIn(c, stringsToAny(vals), false) }
 func (c StringColumn) NotIn(vals ...string) Expr { return newIn(c, stringsToAny(vals), true) }
@@ -183,6 +187,63 @@ func (c NullTimeColumn) IsNull() Expr                     { return newNullCheck(
 func (c NullTimeColumn) IsNotNull() Expr                  { return newNullCheck(c, false) }
 func (c NullTimeColumn) Asc() OrderExpr                   { return OrderExpr{col: c, desc: false} }
 func (c NullTimeColumn) Desc() OrderExpr                  { return OrderExpr{col: c, desc: true} }
+
+// ===========================================================================
+// NullStringColumn
+// ===========================================================================
+
+// NullStringColumn represents a nullable TEXT column. Maps to *string in
+// model structs.
+type NullStringColumn struct{ columnRef }
+
+// NullString creates a NullStringColumn and registers it with the table.
+func NullString(t *TableInfo, name string) NullStringColumn {
+	c := NullStringColumn{columnRef{table: t.name, name: name}}
+	t.addColumn(c)
+	return c
+}
+
+func (c NullStringColumn) Eq(val string) Expr        { return newComp(c, "=", val) }
+func (c NullStringColumn) Ne(val string) Expr        { return newComp(c, "<>", val) }
+func (c NullStringColumn) Gt(val string) Expr        { return newComp(c, ">", val) }
+func (c NullStringColumn) Lt(val string) Expr        { return newComp(c, "<", val) }
+func (c NullStringColumn) Gte(val string) Expr       { return newComp(c, ">=", val) }
+func (c NullStringColumn) Lte(val string) Expr       { return newComp(c, "<=", val) }
+func (c NullStringColumn) Like(val string) Expr      { return newComp(c, "LIKE", val) }
+func (c NullStringColumn) In(vals ...string) Expr    { return newIn(c, stringsToAny(vals), false) }
+func (c NullStringColumn) NotIn(vals ...string) Expr { return newIn(c, stringsToAny(vals), true) }
+func (c NullStringColumn) IsNull() Expr              { return newNullCheck(c, true) }
+func (c NullStringColumn) IsNotNull() Expr           { return newNullCheck(c, false) }
+func (c NullStringColumn) Asc() OrderExpr            { return OrderExpr{col: c, desc: false} }
+func (c NullStringColumn) Desc() OrderExpr           { return OrderExpr{col: c, desc: true} }
+
+// ===========================================================================
+// NullIntColumn
+// ===========================================================================
+
+// NullIntColumn represents a nullable INTEGER column. Maps to *int64 in
+// model structs.
+type NullIntColumn struct{ columnRef }
+
+// NullInt creates a NullIntColumn and registers it with the table.
+func NullInt(t *TableInfo, name string) NullIntColumn {
+	c := NullIntColumn{columnRef{table: t.name, name: name}}
+	t.addColumn(c)
+	return c
+}
+
+func (c NullIntColumn) Eq(val int64) Expr            { return newComp(c, "=", val) }
+func (c NullIntColumn) Ne(val int64) Expr            { return newComp(c, "<>", val) }
+func (c NullIntColumn) Gt(val int64) Expr            { return newComp(c, ">", val) }
+func (c NullIntColumn) Lt(val int64) Expr            { return newComp(c, "<", val) }
+func (c NullIntColumn) Gte(val int64) Expr           { return newComp(c, ">=", val) }
+func (c NullIntColumn) Lte(val int64) Expr           { return newComp(c, "<=", val) }
+func (c NullIntColumn) In(vals ...int64) Expr        { return newIn(c, int64sToAny(vals), false) }
+func (c NullIntColumn) Between(low, high int64) Expr { return newBetween(c, low, high) }
+func (c NullIntColumn) IsNull() Expr                 { return newNullCheck(c, true) }
+func (c NullIntColumn) IsNotNull() Expr              { return newNullCheck(c, false) }
+func (c NullIntColumn) Asc() OrderExpr               { return OrderExpr{col: c, desc: false} }
+func (c NullIntColumn) Desc() OrderExpr              { return OrderExpr{col: c, desc: true} }
 
 // ===========================================================================
 // RawColumn — escape hatch for SELECT expressions

@@ -105,6 +105,27 @@ func scanAll[T any](rows *sql.Rows) ([]T, error) {
 	return result, nil
 }
 
+// scanVal scans a single column from the first row into T. Use for scalar
+// queries (COUNT, MAX, single column selects). Returns ErrNotFound if no rows.
+// Closes rows when done.
+func scanVal[T any](rows *sql.Rows) (T, error) {
+	defer rows.Close()
+
+	var zero T
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return zero, fmt.Errorf("db: rows: %w", err)
+		}
+		return zero, ErrNotFound
+	}
+
+	var val T
+	if err := rows.Scan(&val); err != nil {
+		return zero, fmt.Errorf("db: scan: %w", err)
+	}
+	return val, nil
+}
+
 // scanOne scans exactly one row into T. Returns ErrNotFound if no rows.
 // Closes rows when done.
 func scanOne[T any](rows *sql.Rows) (T, error) {
@@ -189,6 +210,18 @@ func setField(field reflect.Value, rawVal any) error {
 		}
 		field.Set(ptr)
 		return nil
+	}
+
+	// bool fields: SQLite stores booleans as INTEGER 0/1.
+	if fieldType.Kind() == reflect.Bool {
+		switch v := rawVal.(type) {
+		case int64:
+			field.SetBool(v != 0)
+			return nil
+		case bool:
+			field.SetBool(v)
+			return nil
+		}
 	}
 
 	// time.Time fields: the driver returns TEXT as string, parse it.

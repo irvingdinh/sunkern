@@ -37,6 +37,17 @@ func RawQueryOne[T any](ctx context.Context, q Querier, query string, args ...an
 	return scanOne[T](rows)
 }
 
+// RawQueryVal executes arbitrary SQL and scans a single column from the
+// first row into T. Returns ErrNotFound if no rows match.
+func RawQueryVal[T any](ctx context.Context, q Querier, query string, args ...any) (T, error) {
+	rows, err := q.QueryContext(ctx, query, args...)
+	if err != nil {
+		var zero T
+		return zero, fmt.Errorf("db: raw query: %w", err)
+	}
+	return scanVal[T](rows)
+}
+
 // RawCondition returns an Expr from raw SQL with optional args. Use it
 // inside typed queries when the column API cannot express the condition.
 //
