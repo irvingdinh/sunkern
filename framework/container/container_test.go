@@ -542,3 +542,198 @@ func TestConcurrentMake(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Introspection: Len, Keys, Inspect
+// ---------------------------------------------------------------------------
+
+func TestLen(t *testing.T) {
+	resetContainer(t)
+
+	if Len() != 0 {
+		t.Errorf("Len = %d, want 0", Len())
+	}
+
+	Supply(42)
+	Supply("hello")
+
+	if Len() != 2 {
+		t.Errorf("Len = %d, want 2", Len())
+	}
+}
+
+func TestKeys(t *testing.T) {
+	resetContainer(t)
+
+	type Alpha struct{}
+	type Beta struct{}
+
+	Supply(&Beta{})
+	Supply(&Alpha{})
+	Supply(42)
+
+	keys := Keys()
+	if len(keys) != 3 {
+		t.Fatalf("Keys count = %d, want 3", len(keys))
+	}
+	// Must be sorted.
+	for i := 1; i < len(keys); i++ {
+		if keys[i] < keys[i-1] {
+			t.Errorf("Keys not sorted: %v", keys)
+			break
+		}
+	}
+}
+
+func TestKeysEmpty(t *testing.T) {
+	resetContainer(t)
+
+	keys := Keys()
+	if len(keys) != 0 {
+		t.Errorf("Keys = %v, want empty", keys)
+	}
+}
+
+func TestInspectPending(t *testing.T) {
+	resetContainer(t)
+
+	type Svc struct{}
+	Provide(func() (*Svc, error) { return &Svc{}, nil })
+
+	infos := Inspect()
+	if len(infos) != 1 {
+		t.Fatalf("Inspect count = %d, want 1", len(infos))
+	}
+	if infos[0].Status != ServicePending {
+		t.Errorf("Status = %v, want Pending", infos[0].Status)
+	}
+	if infos[0].Error != nil {
+		t.Errorf("Error = %v, want nil", infos[0].Error)
+	}
+}
+
+func TestInspectBuilt(t *testing.T) {
+	resetContainer(t)
+
+	type Svc struct{}
+	Provide(func() (*Svc, error) { return &Svc{}, nil })
+	_ = MustMake[*Svc]() // trigger build
+
+	infos := Inspect()
+	if len(infos) != 1 {
+		t.Fatalf("Inspect count = %d, want 1", len(infos))
+	}
+	if infos[0].Status != ServiceBuilt {
+		t.Errorf("Status = %v, want Built", infos[0].Status)
+	}
+}
+
+func TestInspectFailed(t *testing.T) {
+	resetContainer(t)
+
+	type Broken struct{}
+	Provide(func() (*Broken, error) { return nil, errors.New("broken") })
+	_, _ = Make[*Broken]() // trigger build (and fail)
+
+	infos := Inspect()
+	if len(infos) != 1 {
+		t.Fatalf("Inspect count = %d, want 1", len(infos))
+	}
+	if infos[0].Status != ServiceFailed {
+		t.Errorf("Status = %v, want Failed", infos[0].Status)
+	}
+	if infos[0].Error == nil || !strings.Contains(infos[0].Error.Error(), "broken") {
+		t.Errorf("Error = %v, want 'broken'", infos[0].Error)
+	}
+}
+
+func TestInspectSorted(t *testing.T) {
+	resetContainer(t)
+
+	type Zebra struct{}
+	type Apple struct{}
+	Supply(&Zebra{})
+	Supply(&Apple{})
+
+	infos := Inspect()
+	if len(infos) != 2 {
+		t.Fatalf("Inspect count = %d, want 2", len(infos))
+	}
+	if infos[0].Name >= infos[1].Name {
+		t.Errorf("Inspect not sorted: [%s, %s]", infos[0].Name, infos[1].Name)
+	}
+}
+
+func TestInspectDoesNotTriggerBuild(t *testing.T) {
+	resetContainer(t)
+
+	var calls atomic.Int32
+	type Svc struct{}
+	Provide(func() (*Svc, error) {
+		calls.Add(1)
+		return &Svc{}, nil
+	})
+
+	_ = Inspect() // should not call provider
+
+	if calls.Load() != 0 {
+		t.Errorf("Inspect triggered provider (calls = %d)", calls.Load())
+	}
+}
+
+func TestServiceStatusString(t *testing.T) {
+	cases := []struct {
+		s    ServiceStatus
+		want string
+	}{
+		{ServicePending, "pending"},
+		{ServiceBuilt, "built"},
+		{ServiceFailed, "failed"},
+		{ServiceStatus(99), "unknown"},
+	}
+	for _, c := range cases {
+		if got := c.s.String(); got != c.want {
+			t.Errorf("ServiceStatus(%d).String() = %q, want %q", c.s, got, c.want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Hooks: Hooks() accessor
+// ---------------------------------------------------------------------------
+
+func TestHooksAccessor(t *testing.T) {
+	resetContainer(t)
+
+	AppendHook(Hook{Name: "a"})
+	AppendHook(Hook{Name: "b"})
+
+	hooks := global.Hooks()
+	if len(hooks) != 2 {
+		t.Fatalf("Hooks count = %d, want 2", len(hooks))
+	}
+	if hooks[0].Name != "a" || hooks[1].Name != "b" {
+		t.Errorf("Hooks = [%s, %s], want [a, b]", hooks[0].Name, hooks[1].Name)
+	}
+
+	// Returned slice must be a copy — mutating it shouldn't affect container.
+	hooks[0].Name = "mutated"
+	hooks2 := global.Hooks()
+	if hooks2[0].Name != "a" {
+		t.Error("Hooks returned a reference, not a copy")
+	}
+}
+
+func TestInspectSupplied(t *testing.T) {
+	resetContainer(t)
+
+	Supply(42)
+
+	infos := Inspect()
+	if len(infos) != 1 {
+		t.Fatalf("Inspect count = %d, want 1", len(infos))
+	}
+	if infos[0].Status != ServiceBuilt {
+		t.Errorf("Supplied service status = %v, want Built", infos[0].Status)
+	}
+}

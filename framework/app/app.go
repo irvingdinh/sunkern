@@ -121,10 +121,16 @@ func (a *App) run() error {
 		panic("app: Run called more than once")
 	}
 
+	bootStart := time.Now()
+
 	// Load config from file + env vars. The global container is already
 	// initialized by its package init — no Reset() needed here. Reset()
 	// exists solely for tests that need a clean container between cases.
 	config.Load()
+
+	// Supply the App itself so modules can resolve it from the container
+	// to access Ready() and ShuttingDown() without explicit passing.
+	container.Supply(a)
 
 	sunkernlog.Load()
 
@@ -137,12 +143,13 @@ func (a *App) run() error {
 	}
 
 	// Phase 2: Init framework services.
-
-	// Init SQLite.
+	t := time.Now()
 	sunkerndb.Load()
 	container.Supply[*sunkerndb.DB](sunkerndb.Global())
+	slog.Debug("framework service initialized", "service", "sqlite", "took", time.Since(t))
 
 	// Run migrations.
+	t = time.Now()
 	migrationEngine := migrate.NewEngine(sunkerndb.Global().WriteDB())
 	if err := migrationEngine.Collect(a.migrationSources...); err != nil {
 		return fmt.Errorf("collect migrations: %w", err)
@@ -150,15 +157,17 @@ func (a *App) run() error {
 	if n, err := migrationEngine.Up(context.Background()); err != nil {
 		return fmt.Errorf("run migrations: %w", err)
 	} else if n > 0 {
-		slog.Info("migrations applied", "count", n)
+		slog.Info("migrations applied", "count", n, "took", time.Since(t))
 	}
 
 	// TODO: init cache, event bus, cron, queue.
+	t = time.Now()
 	srv, err := sunkernhttp.NewServer()
 	if err != nil {
 		return fmt.Errorf("init http: %w", err)
 	}
 	container.Supply[sunkernhttp.Server](srv)
+	slog.Debug("framework service initialized", "service", "http", "took", time.Since(t))
 
 	// Phase 3: Boot all modules. Modules resolve services from the container
 	// and wire routes, event handlers, cron jobs, etc.
@@ -174,12 +183,18 @@ func (a *App) run() error {
 	}
 
 	a.ready.Store(true)
-	slog.Info("application started")
+	slog.Info("application started",
+		"boot_time", time.Since(bootStart),
+		"modules", len(a.modules),
+		"services", container.Len(),
+		"hooks", len(container.Global().Hooks()),
+	)
 
 	// Phase 5: Wait for shutdown signal.
 	a.waitForSignal()
 
 	// Phase 6: Graceful shutdown.
+	shutdownStart := time.Now()
 	slog.Info("shutting down")
 	a.shutdown.once.Do(func() { close(a.shutdown.ch) })
 	a.ready.Store(false)
@@ -195,6 +210,7 @@ func (a *App) run() error {
 		errs = append(errs, err)
 	}
 
+	slog.Info("shutdown complete", "took", time.Since(shutdownStart))
 	return errors.Join(errs...)
 }
 
@@ -214,12 +230,13 @@ func (a *App) register() error {
 
 func (a *App) boot() error {
 	for _, m := range a.modules {
-		slog.Debug("booting module", "module", m.Name())
+		t := time.Now()
 		if err := m.Boot(); err != nil {
 			// Rollback: shutdown modules that already booted.
 			_ = a.shutdownModules(context.Background())
 			return fmt.Errorf("boot %q: %w", m.Name(), err)
 		}
+		slog.Debug("module booted", "module", m.Name(), "took", time.Since(t))
 		a.booted = append(a.booted, m)
 	}
 	return nil
@@ -228,9 +245,11 @@ func (a *App) boot() error {
 func (a *App) shutdownModules(ctx context.Context) error {
 	var errs []error
 	for i := len(a.booted) - 1; i >= 0; i-- {
+		t := time.Now()
 		if err := a.booted[i].Shutdown(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("shutdown %q: %w", a.booted[i].Name(), err))
 		}
+		slog.Debug("module shut down", "module", a.booted[i].Name(), "took", time.Since(t))
 	}
 	return errors.Join(errs...)
 }

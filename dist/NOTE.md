@@ -8,7 +8,7 @@
 
 ## Current State
 
-**Last session**: 2026-03-24 — Session 12 (framework/db revisited — RETURNING clause, subqueries, CASE expressions)
+**Last session**: 2026-03-24 — Session 13 (framework/app + framework/container revisited — introspection, App-in-container, lifecycle timing)
 **Working tree**: clean
 **Branch**: with-experiment
 
@@ -16,8 +16,8 @@
 
 | Package | Maturity | Last Touched | Notes |
 |---------|----------|--------------|-------|
-| `framework/app` | **Growing** | Session 4 | ModuleGroup boot rollback fix, lifecycle logging, module name tracking |
-| `framework/container` | **Growing** | Session 4 | Override/OverrideSupply, named hooks, all framework hooks named |
+| `framework/app` | **Maturing** | Session 13 | Revisited: *App supplied to container (modules access Ready/ShuttingDown without explicit passing), boot/shutdown timing for modules and framework services, startup summary log (boot_time, module count, service count, hook count), shutdown timing. Previous: ModuleGroup boot rollback fix, lifecycle logging, module name tracking |
+| `framework/container` | **Maturing** | Session 13 | Revisited: introspection APIs (Keys, Inspect, Len), ServiceInfo/ServiceStatus types, Hooks() accessor. Previous: Override/OverrideSupply, named hooks, all framework hooks named |
 | `framework/config` | **Growing** | Session 7 | Added Has, All, Keys, Sub, DataDir, EnvName, SetDefaults; Load creates data dir; improved panic messages |
 | `framework/log` | **Growing** | Session 8 | Separate console/file levels (ConsoleLevel, FileLevel types), log file management (ListFiles, CleanOldFiles, OpenFile), JSONL entry parsing + querying (Entry, Query with level/search/user_id/request_id filter + pagination) |
 | `framework/http` | **Maturing** | Session 10 | Revisited: Bind/BindForm now detect http.MaxBytesError and return 413 instead of 400. Previous: file upload handling (FormFile, FormFiles, BindForm, SaveFile, ValidateFile, DetectFileType), all sentinels |
@@ -158,6 +158,17 @@ Session 12 (db revisit, task tracker with tags, 15k+ rows):
 - [memory] 94 MB RSS after 15k+ writes and 30k+ load test requests
 - [race] No data races detected with -race flag on concurrent RETURNING + subquery + CASE
 
+Session 13 (app+container revisit, system monitor with ModuleGroup + heartbeat worker, 5k+ rows):
+- [container/GET health] 60,161 req/s, p99 2.4ms — Keys() + Len() + App.Ready()
+- [container/GET services] 59,154 req/s, p99 2.6ms — Inspect() with 5 services
+- [container/GET hooks] ~64k req/s, p99 2.6ms — Hooks() returning 3 hooks
+- [heartbeat/GET status] 64,418 req/s, p99 2.6ms — atomic counter read
+- [notes/GET list] 16,785 req/s, p99 7.5ms — paginated list on 5k rows
+- [notes/POST create] ~32k req/s, p99 2.8ms — JSON bind + INSERT
+- [memory] 15 MB RSS after 100k+ requests, 34 MB with 5k+ rows under sustained load
+- [race] No data races detected with -race flag on concurrent introspection + writes + heartbeat
+- [shutdown] Heartbeat worker detected ShuttingDown() signal and terminated cleanly
+
 ## Design Decisions
 
 <!-- Key decisions and rationale so future sessions don't reverse them. Format:
@@ -236,18 +247,24 @@ Session 12 (db revisit, task tracker with tags, 15k+ rows):
 - [db] CaseBuilder implements Expr (not column) — it can appear in SELECT, WHERE, ORDER BY, SET, and anywhere else an expression is accepted. For SELECT with alias, combine with RawColumn or use WriteSQL() manually with fmt.Sprintf. (Session 12)
 - [db] toExpr() helper converts any to Expr — shared by CaseBuilder.When() and CaseBuilder.Else(). Simple type switch: Expr passthrough, everything else becomes Raw("?", v). (Session 12)
 
+- [app] *App supplied to container via container.Supply(a) early in run() — modules resolve via container.MustMake[*app.App]() to access Ready() and ShuttingDown(). No circular import: app imports container (already true), and modules import both app and container (already true). Eliminates need to pass App reference explicitly to modules that run background workers. (Session 13)
+- [app] Boot/shutdown timing logged at Debug level per module, startup summary at Info level with boot_time, module count, service count, hook count. Shutdown timing also at Info. Gives visibility into slow startups and shutdowns without cluttering normal operation logs. (Session 13)
+- [app] Framework service init timing (sqlite, http) logged at Debug level — helps diagnose slow DB opens or migration runs during startup. Uses local time variables (not global state) to avoid any overhead outside the boot path. (Session 13)
+- [container] Inspect() acquires per-service locks to read status, never triggers lazy init — safe for admin dashboards to call under load. Sorts by name for stable output. ServiceStatus is a named int type with String() for JSON-friendly serialization. (Session 13)
+- [container] Keys() and Len() use RLock on the container, not individual service locks — lightweight for frequent polling (60k+ req/s overhead-free). Keys() returns sorted for deterministic display. (Session 13)
+- [container] Hooks() returns a copy of the hooks slice — mutation-safe for iteration in admin endpoints. Same copy pattern as StartHooks/StopHooks internal snapshot. (Session 13)
+
 ## Next Priorities
 
 <!-- What the last session thinks should come next, in order -->
 
 1. **Revisit `framework/http`** — SSE support for real-time events (event bus → SSE endpoint pattern from IDEA.md Section 9)
 2. **Revisit `framework/http/middleware`** — request timeout middleware (context deadline for slow handlers), password hashing (bcrypt via stdlib crypto), API token middleware (separate from JWT — long-lived, revocable)
-3. **Revisit `framework/app` / `framework/container`** — now Growing, revisit after other packages evolve (last touch Session 4, 8 sessions ago)
-4. **Revisit `framework/config`** — consider config validation (type constraints, allowed values)
-5. **Revisit `framework/log`** — consider Query performance optimization (mmap/indexing), log sampling for high-traffic paths
-6. **Revisit `framework/db`** — JOINs with RETURNING (currently untested), raw RETURNING with db.Raw columns, COALESCE/IFNULL expressions, window functions
-7. **Revisit `framework/sqlite`** — consider: periodic auto-optimize (cron integration when cron package exists), connection pool health endpoint, PRAGMA runtime reconfiguration
-8. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
+3. **Revisit `framework/config`** — consider config validation (type constraints, allowed values)
+4. **Revisit `framework/log`** — consider Query performance optimization (mmap/indexing), log sampling for high-traffic paths
+5. **Revisit `framework/db`** — JOINs with RETURNING (currently untested), raw RETURNING with db.Raw columns, COALESCE/IFNULL expressions, window functions
+6. **Revisit `framework/sqlite`** — consider: periodic auto-optimize (cron integration when cron package exists), connection pool health endpoint, PRAGMA runtime reconfiguration
+7. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
 
 ## In-Progress Work
 

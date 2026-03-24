@@ -14,6 +14,15 @@ func (c *Container) AppendHook(h Hook) {
 	c.mu.Unlock()
 }
 
+// Hooks returns a copy of all registered lifecycle hooks.
+func (c *Container) Hooks() []Hook {
+	c.mu.RLock()
+	hooks := make([]Hook, len(c.hooks))
+	copy(hooks, c.hooks)
+	c.mu.RUnlock()
+	return hooks
+}
+
 // StartHooks calls OnStart on each hook in registration order. If a hook
 // fails, all previously-started hooks are stopped in reverse order before
 // the start error is returned.

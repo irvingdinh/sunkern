@@ -52,6 +52,23 @@ func Has[T any]() bool {
 	return hasInContainer[T](global)
 }
 
+// Len returns the number of registered services in the global container.
+func Len() int {
+	return global.Len()
+}
+
+// Keys returns the type names of all registered services in the global
+// container, sorted alphabetically.
+func Keys() []string {
+	return global.Keys()
+}
+
+// Inspect returns information about all registered services in the global
+// container, sorted by name. Does not trigger lazy initialization.
+func Inspect() []ServiceInfo {
+	return global.Inspect()
+}
+
 // AppendHook adds a lifecycle hook to the global container.
 func AppendHook(h Hook) {
 	global.AppendHook(h)
