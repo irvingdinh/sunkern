@@ -96,6 +96,18 @@ func Load() {
 	})
 }
 
+// Flush writes any buffered log data to the underlying file. Use this before
+// querying recent log entries to ensure they are visible on disk. Safe to call
+// concurrently; returns nil when no writer is active.
+func Flush() error {
+	global.mu.Lock()
+	defer global.mu.Unlock()
+	if global.writer != nil {
+		return global.writer.Flush()
+	}
+	return nil
+}
+
 // Close flushes and closes the file writer. Safe to call multiple times.
 // Normally called via the container shutdown hook; exported for early-abort
 // cleanup in the boot sequence.

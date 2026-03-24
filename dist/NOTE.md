@@ -8,7 +8,7 @@
 
 ## Current State
 
-**Last session**: 2026-03-24 — Session 16 (framework/config revisited — config validation rules)
+**Last session**: 2026-03-24 — Session 17 (framework/log revisited — buffered writer, query improvements)
 **Working tree**: clean
 **Branch**: with-experiment
 
@@ -19,7 +19,7 @@
 | `framework/app` | **Maturing** | Session 13 | Revisited: *App supplied to container (modules access Ready/ShuttingDown without explicit passing), boot/shutdown timing for modules and framework services, startup summary log (boot_time, module count, service count, hook count), shutdown timing. Previous: ModuleGroup boot rollback fix, lifecycle logging, module name tracking |
 | `framework/container` | **Maturing** | Session 13 | Revisited: introspection APIs (Keys, Inspect, Len), ServiceInfo/ServiceStatus types, Hooks() accessor. Previous: Override/OverrideSupply, named hooks, all framework hooks named |
 | `framework/config` | **Maturing** | Session 16 | Revisited: config validation (AddRule, Validate, 10 built-in rules: Required, NotEmpty, Positive, NonNegative, OneOf, Min, Max, Range, MinLen, MaxLen). Rule type is a function — composable, zero boilerplate. Validate() integrated into app lifecycle after framework init, before module Boot. Previous (Session 7): Has, All, Keys, Sub, DataDir, EnvName, SetDefaults; Load creates data dir; improved panic messages |
-| `framework/log` | **Growing** | Session 8 | Separate console/file levels (ConsoleLevel, FileLevel types), log file management (ListFiles, CleanOldFiles, OpenFile), JSONL entry parsing + querying (Entry, Query with level/search/user_id/request_id filter + pagination) |
+| `framework/log` | **Maturing** | Session 17 | Revisited: buffered file writer (64KB bufio.Writer + 200ms periodic flush goroutine — ~145k log writes/sec), Flush() export, Query improvements (Order desc/asc, After/Before time range, CountOnly mode). Previous (Session 8): Separate console/file levels, log file management, JSONL entry parsing + querying |
 | `framework/http` | **Maturing** | Session 14 | Revisited: SSE support (NewEventStream, SSEWriter with Send/SendJSON/Heartbeat/Retry/Done, LastEventID, write deadline extension via ResponseController, ErrStreamingNotSupported sentinel). Previous (Session 10): Bind/BindForm MaxBytesError → 413. Previous: file upload handling, all sentinels |
 | `framework/http/middleware` | **Maturing** | Session 15 | Revisited: Timeout (context deadline per route), PBKDF2-SHA256 password hashing (HashPassword/CheckPassword, 600k iterations, PHC format, stdlib-only), APIToken middleware (opaque bearer tokens with DB lookup via TokenLookup callback), GenerateToken (32-byte random hex). Previous (Session 10): JWT (HMAC-SHA256 sign/verify, Claims, context helpers), Auth (Bearer token + user_id logging), RequireRole (role-based 403), MaxBytes (body size limiter). Plus existing: RequestID, RequestLogger, Recover, CORS, RateLimit |
 | `framework/db` | **Maturing** | Session 12 | Revisited: RETURNING clause (INSERT/UPDATE/DELETE), subqueries (IN, NOT IN, EXISTS, NOT EXISTS), CASE expressions (searched + simple). Previous (Session 5): deterministic column order, generalized pointer handling, SetNull, ModelSlice batch insert, NullBoolColumn/NullFloatColumn, cursor pagination (After + HasMore) |
@@ -198,6 +198,19 @@ Session 16 (config validation, feature flag app with validated config, 500 flags
 - [race] No data races detected with -race flag on concurrent config reads + CRUD
 - [validation] Invalid config caught at boot: multi-error panic with key + env var name + violation per rule
 
+Session 17 (log revisit, log analytics app with 131k entries, 36MB log file):
+- [log/POST generate×200] 724 req/s, p99 65ms — 200 slog calls per request (~145k log writes/sec through buffered writer)
+- [log/GET query-asc] 76 req/s, p99 150ms — Query with limit=20 on 15k entries (5.4MB), asc order
+- [log/GET query-desc] 92 req/s, p99 135ms — Query with limit=20 on 15k entries, desc order
+- [log/GET query-asc-131k] 8 req/s, p99 629ms — Query with limit=20 on 131k entries (36MB), asc order
+- [log/GET query-desc-131k] 9 req/s, p99 620ms — Query with limit=20 on 131k entries, desc order
+- [log/GET count-131k] 8 req/s, p99 659ms — CountOnly on 131k entries (same IO, skips entry allocation)
+- [health] 67,808 req/s, p99 0.4ms — baseline
+- [memory] 996 MB RSS peak after 131k write burst + desc query on full file (Go not returning to OS; normal workload ~50MB)
+- [race] No data races detected with -race flag on all log package tests (35 tests)
+- [write scaling] Buffered writer batches ~100-300 entries per syscall (64KB buffer). Session 8 baseline was unbuffered.
+- [query scaling] Linear with file size: 15k entries → 76 req/s, 131k entries → 8 req/s (~12x, matches 12x data growth)
+
 ## Design Decisions
 
 <!-- Key decisions and rationale so future sessions don't reverse them. Format:
@@ -309,16 +322,25 @@ Session 16 (config validation, feature flag app with validated config, 500 flags
 - [config] Framework services (log, sqlite, http) do NOT register validation rules — they consume config before Validate() runs in the lifecycle. Framework packages handle their own validation (log panics on bad levels, sqlite uses GetOr fallbacks). Config validation is primarily for service modules whose Boot phase runs AFTER Validate(). (Session 16)
 - [config] Validate() placed in app lifecycle after framework init, before module Boot: config.Load() → modules Register() → framework init → config.Validate() → modules Boot(). This means service modules register defaults+rules in Register(), Validate() catches issues, then Boot() reads validated config safely. (Session 16)
 
+- [log] dailyFileWriter uses bufio.Writer (64KB buffer) + background goroutine flushing every 200ms. Batches small writes (~200-500 bytes per log line) into larger file.Write() calls. Trade-off: up to 200ms of data can be lost on crash, but console output (stdout) is the crash-safe path. Periodic flush ensures low-traffic periods don't leave stale buffered data. (Session 17)
+- [log] Flush() exported for callers who need to see their own recent log entries on disk (e.g., before querying). Query does NOT auto-flush — explicit is better than implicit, and auto-flushing under load would negate the buffering benefit. Playground handler calls Flush() before Query() to demonstrate the pattern. (Session 17)
+- [log] Query desc ordering collects all matching entries in memory then reverses + paginates. Asc ordering streams (keeps only limit entries in memory). Desc is inherently more expensive for large files — acceptable for admin viewer where file sizes are bounded by 7-day retention + daily rotation. (Session 17)
+- [log] Query After/Before use time.Time with half-open interval: After <= t < Before. Zero values mean "no bound". Checked before level/search/user_id filters — time range can short-circuit early for sorted files (though currently no early termination since JSONL may not be perfectly ordered). (Session 17)
+- [log] CountOnly skips entry allocation (no append to slice) but still parses every JSON line — the bottleneck is JSON parse, not entry allocation. CountOnly saves memory, not CPU. Useful for admin dashboard badges ("42 errors today") without loading entry data. (Session 17)
+- [log] flushLoop goroutine stopped via close(done) channel in Close(). Select on done/ticker ensures clean exit. The goroutine is created in newDailyFileWriter and lives until Close(). Container shutdown hook calls Close(), so no leak in production. Tests must call Close() or Flush() before reading file contents. (Session 17)
+
 ## Next Priorities
 
 <!-- What the last session thinks should come next, in order -->
 
-1. **Revisit `framework/log`** — Query performance optimization (mmap/indexing for large files), log sampling for high-traffic paths. Lowest maturity "Growing" package remaining
-2. **Revisit `framework/http`** — SSE broker/hub pattern as a higher-level abstraction (manages multiple connections, fan-out from event source, stats), once event bus exists
-3. **Revisit `framework/db`** — JOINs with RETURNING (currently untested), raw RETURNING with db.Raw columns, COALESCE/IFNULL expressions, window functions
-4. **Revisit `framework/sqlite`** — periodic auto-optimize (cron integration when cron package exists), connection pool health endpoint, PRAGMA runtime reconfiguration
-5. **Revisit `framework/app`** — consider: app lifecycle hooks for plugins (pre-boot, post-boot callbacks), health check endpoint integration
-6. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
+1. **Revisit `framework/sqlite`** — periodic auto-optimize, connection pool health endpoint, PRAGMA runtime reconfiguration. Still "Growing"
+2. **Revisit `framework/sqlite/driver`** — still "Growing", review blob/string binding, consider additional SQLite APIs
+3. **Revisit `framework/sqlite/migrate`** — still "Growing", consider migration rollback UI, admin-visible migration history
+4. **Revisit `framework/http`** — SSE broker/hub pattern as a higher-level abstraction (manages multiple connections, fan-out from event source, stats), once event bus exists
+5. **Revisit `framework/db`** — JOINs with RETURNING (currently untested), raw RETURNING with db.Raw columns, COALESCE/IFNULL expressions, window functions
+6. **Revisit `framework/app`** — consider: app lifecycle hooks for plugins (pre-boot, post-boot callbacks), health check endpoint integration
+7. **Revisit `framework/log`** — further: log sampling handler for high-traffic paths, mmap-based query for very large files (deferred — current linear scan is acceptable for admin viewer with daily rotation)
+8. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
 
 ## In-Progress Work
 

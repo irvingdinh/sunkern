@@ -67,6 +67,7 @@ func TestLoadSetsDefaultLogger(t *testing.T) {
 
 	// Logging should write to the file. Verify a file exists in DATA_DIR/logs.
 	slog.Info("test message")
+	Flush() // ensure buffered data reaches disk
 
 	logsDir := filepath.Join(config.DataDir(), "logs")
 	entries, _ := filepath.Glob(filepath.Join(logsDir, "*.log"))
@@ -364,7 +365,6 @@ func TestDailyFileWriterRotation(t *testing.T) {
 func TestDailyFileWriterConcurrent(t *testing.T) {
 	dir := t.TempDir()
 	w := newDailyFileWriter(dir)
-	defer w.Close()
 
 	var wg sync.WaitGroup
 	for i := 0; i < 100; i++ {
@@ -377,6 +377,10 @@ func TestDailyFileWriterConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 
+	// Flush buffered data before reading files.
+	_ = w.Flush()
+	_ = w.Close()
+
 	entries, _ := filepath.Glob(filepath.Join(dir, "*.log"))
 	totalLines := 0
 	for _, e := range entries {
@@ -385,6 +389,30 @@ func TestDailyFileWriterConcurrent(t *testing.T) {
 	}
 	if totalLines != 100 {
 		t.Fatalf("expected 100 lines, got %d", totalLines)
+	}
+}
+
+func TestDailyFileWriterFlush(t *testing.T) {
+	dir := t.TempDir()
+	w := newDailyFileWriter(dir)
+	defer w.Close()
+
+	_, _ = w.Write([]byte("buffered line\n"))
+
+	// Before flush, data may or may not be on disk (depending on buffer state).
+	// After explicit flush, it must be on disk.
+	if err := w.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	entries, _ := filepath.Glob(filepath.Join(dir, "*.log"))
+	if len(entries) == 0 {
+		t.Fatal("no log file after flush")
+	}
+
+	data, _ := os.ReadFile(entries[0])
+	if !strings.Contains(string(data), "buffered line") {
+		t.Errorf("flushed data not on disk: %q", string(data))
 	}
 }
 
@@ -422,6 +450,43 @@ func TestResetDiscardsOutput(t *testing.T) {
 	entries, _ := filepath.Glob(filepath.Join(tmpDir, "logs", "*.log"))
 	if len(entries) != 0 {
 		t.Fatalf("expected no log files after Reset, got %d", len(entries))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Flush (package-level)
+// ---------------------------------------------------------------------------
+
+func TestFlushPackageLevel(t *testing.T) {
+	setup(t)
+
+	Load()
+	defer Close()
+
+	slog.Info("flush test message")
+
+	if err := Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	logsDir := filepath.Join(config.DataDir(), "logs")
+	entries, _ := filepath.Glob(filepath.Join(logsDir, "*.log"))
+	if len(entries) == 0 {
+		t.Fatal("no log files after Flush")
+	}
+
+	data, _ := os.ReadFile(entries[0])
+	if !strings.Contains(string(data), "flush test message") {
+		t.Errorf("flushed message not on disk: %s", string(data))
+	}
+}
+
+func TestFlushWhenNoWriter(t *testing.T) {
+	setup(t)
+
+	// No Load(), so no writer. Flush should return nil.
+	if err := Flush(); err != nil {
+		t.Fatalf("Flush with no writer: %v", err)
 	}
 }
 
@@ -754,23 +819,28 @@ func TestEntryMarshalJSON(t *testing.T) {
 // Query
 // ---------------------------------------------------------------------------
 
-func TestQuery(t *testing.T) {
-	setup(t)
-
+// writeTestEntries creates a JSONL log file with synthetic entries for testing.
+func writeTestEntries(t *testing.T, date string, count int) {
+	t.Helper()
 	logsDir := filepath.Join(config.DataDir(), "logs")
 	os.MkdirAll(logsDir, 0o755)
 
-	// Write synthetic JSONL entries.
 	var lines []string
-	for i := 0; i < 50; i++ {
+	for i := 0; i < count; i++ {
 		level := "INFO"
 		if i%5 == 0 {
 			level = "ERROR"
 		}
-		line := fmt.Sprintf(`{"time":"2025-03-15T10:%02d:00Z","level":"%s","msg":"event %d","request_id":"req-%d"}`, i, level, i, i%10)
+		ts := fmt.Sprintf("2025-03-15T10:%02d:%02dZ", i/60, i%60)
+		line := fmt.Sprintf(`{"time":"%s","level":"%s","msg":"event %d","request_id":"req-%d","user_id":"user-%d"}`, ts, level, i, i%10, i%3)
 		lines = append(lines, line)
 	}
-	os.WriteFile(filepath.Join(logsDir, "2025_03_15.log"), []byte(strings.Join(lines, "\n")+"\n"), 0o644)
+	os.WriteFile(filepath.Join(logsDir, date+".log"), []byte(strings.Join(lines, "\n")+"\n"), 0o644)
+}
+
+func TestQuery(t *testing.T) {
+	setup(t)
+	writeTestEntries(t, "2025_03_15", 50)
 
 	// All entries.
 	entries, total, err := Query("2025_03_15", QueryOptions{})
@@ -815,6 +885,136 @@ func TestQuery(t *testing.T) {
 	}
 	if entries[0].Message != "event 10" {
 		t.Errorf("first entry = %q, want 'event 10'", entries[0].Message)
+	}
+}
+
+func TestQueryDescOrder(t *testing.T) {
+	setup(t)
+	writeTestEntries(t, "2025_03_15", 50)
+
+	// Desc order — newest first.
+	entries, total, err := Query("2025_03_15", QueryOptions{Order: "desc"})
+	if err != nil {
+		t.Fatalf("Query desc: %v", err)
+	}
+	if total != 50 {
+		t.Errorf("total = %d, want 50", total)
+	}
+	if len(entries) != 50 {
+		t.Errorf("entries = %d, want 50", len(entries))
+	}
+	// First entry should be the last one written (event 49).
+	if entries[0].Message != "event 49" {
+		t.Errorf("first desc entry = %q, want 'event 49'", entries[0].Message)
+	}
+	// Last entry should be the first one written (event 0).
+	if entries[49].Message != "event 0" {
+		t.Errorf("last desc entry = %q, want 'event 0'", entries[49].Message)
+	}
+
+	// Desc with pagination.
+	entries, total, _ = Query("2025_03_15", QueryOptions{Order: "desc", Limit: 5, Offset: 0})
+	if total != 50 {
+		t.Errorf("paginated desc total = %d, want 50", total)
+	}
+	if len(entries) != 5 {
+		t.Errorf("paginated desc entries = %d, want 5", len(entries))
+	}
+	// First page of desc: events 49, 48, 47, 46, 45.
+	if entries[0].Message != "event 49" {
+		t.Errorf("first desc page entry = %q, want 'event 49'", entries[0].Message)
+	}
+	if entries[4].Message != "event 45" {
+		t.Errorf("last desc page entry = %q, want 'event 45'", entries[4].Message)
+	}
+
+	// Desc page 2.
+	entries, _, _ = Query("2025_03_15", QueryOptions{Order: "desc", Limit: 5, Offset: 5})
+	if entries[0].Message != "event 44" {
+		t.Errorf("desc page 2 first = %q, want 'event 44'", entries[0].Message)
+	}
+}
+
+func TestQueryTimeRange(t *testing.T) {
+	setup(t)
+	writeTestEntries(t, "2025_03_15", 50)
+
+	// After: entries at or after 10:00:30 (events 30-49).
+	after := time.Date(2025, 3, 15, 10, 0, 30, 0, time.UTC)
+	entries, total, err := Query("2025_03_15", QueryOptions{After: after})
+	if err != nil {
+		t.Fatalf("Query after: %v", err)
+	}
+	if total != 20 {
+		t.Errorf("after total = %d, want 20", total)
+	}
+	if len(entries) != 20 {
+		t.Errorf("after entries = %d, want 20", len(entries))
+	}
+
+	// Before: entries strictly before 10:00:10 (events 0-9).
+	before := time.Date(2025, 3, 15, 10, 0, 10, 0, time.UTC)
+	entries, total, _ = Query("2025_03_15", QueryOptions{Before: before})
+	if total != 10 {
+		t.Errorf("before total = %d, want 10", total)
+	}
+
+	// Combined range: 10:00:10 <= t < 10:00:20 (events 10-19).
+	entries, total, _ = Query("2025_03_15", QueryOptions{
+		After:  time.Date(2025, 3, 15, 10, 0, 10, 0, time.UTC),
+		Before: time.Date(2025, 3, 15, 10, 0, 20, 0, time.UTC),
+	})
+	if total != 10 {
+		t.Errorf("range total = %d, want 10", total)
+	}
+	if len(entries) != 10 {
+		t.Errorf("range entries = %d, want 10", len(entries))
+	}
+}
+
+func TestQueryCountOnly(t *testing.T) {
+	setup(t)
+	writeTestEntries(t, "2025_03_15", 50)
+
+	// CountOnly: total is computed, entries is nil.
+	entries, total, err := Query("2025_03_15", QueryOptions{CountOnly: true})
+	if err != nil {
+		t.Fatalf("Query countOnly: %v", err)
+	}
+	if total != 50 {
+		t.Errorf("countOnly total = %d, want 50", total)
+	}
+	if len(entries) != 0 {
+		t.Errorf("countOnly entries = %d, want 0", len(entries))
+	}
+
+	// CountOnly with level filter.
+	_, total, _ = Query("2025_03_15", QueryOptions{CountOnly: true, Level: "ERROR"})
+	if total != 10 {
+		t.Errorf("countOnly ERROR total = %d, want 10", total)
+	}
+
+	// CountOnly with user_id filter.
+	_, total, _ = Query("2025_03_15", QueryOptions{CountOnly: true, UserID: "user-0"})
+	if total != 17 {
+		t.Errorf("countOnly user-0 total = %d, want 17", total)
+	}
+}
+
+func TestQueryUserIDFilter(t *testing.T) {
+	setup(t)
+	writeTestEntries(t, "2025_03_15", 50)
+
+	entries, total, err := Query("2025_03_15", QueryOptions{UserID: "user-0"})
+	if err != nil {
+		t.Fatalf("Query user_id: %v", err)
+	}
+	// user-0 = indices 0,3,6,9,12,...,48 → 17 entries (i%3==0).
+	if total != 17 {
+		t.Errorf("user_id total = %d, want 17", total)
+	}
+	if len(entries) != 17 {
+		t.Errorf("user_id entries = %d, want 17", len(entries))
 	}
 }
 

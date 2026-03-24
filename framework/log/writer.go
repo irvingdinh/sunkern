@@ -1,6 +1,7 @@
 package log
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -33,28 +34,55 @@ func (w *prettyWriter) Write(p []byte) (int, error) {
 
 // dailyFileWriter is the file sink behind the JSON file handler: a
 // thread-safe io.WriteCloser that appends bytes to one JSONL file per calendar
-// day (YYYY_MM_DD.log) under a fixed directory. It is created when [Load] runs;
-// write errors (including rotation failures) propagate to slog.
+// day (YYYY_MM_DD.log) under a fixed directory. Writes are buffered (64 KB)
+// and flushed periodically (every 200 ms) to batch syscalls while keeping log
+// entries visible with low latency.
 //
 // Rotation happens on the first write after the date changes; the mutex
-// serializes writes and protects the current file handle and date string.
+// serializes writes and protects the current file handle, buffer, and date.
 type dailyFileWriter struct {
 	mu    sync.Mutex
 	dir   string
 	date  string
 	file  *os.File
+	buf   *bufio.Writer
 	nowFn func() time.Time // injectable for testing
+	done  chan struct{}
 }
 
 func newDailyFileWriter(dir string) *dailyFileWriter {
-	return &dailyFileWriter{
+	w := &dailyFileWriter{
 		dir:   dir,
 		nowFn: time.Now,
+		done:  make(chan struct{}),
+	}
+	go w.flushLoop()
+	return w
+}
+
+// flushLoop runs in a background goroutine, flushing the buffer every 200 ms.
+// This ensures log entries reach disk promptly even during low-traffic periods,
+// while still batching writes under sustained load.
+func (w *dailyFileWriter) flushLoop() {
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			w.mu.Lock()
+			if w.buf != nil {
+				_ = w.buf.Flush()
+			}
+			w.mu.Unlock()
+		case <-w.done:
+			return
+		}
 	}
 }
 
 // Write appends p to today's log file, rotating to a new file when the
-// calendar day changes (under mu).
+// calendar day changes (under mu). Data is buffered; call [Flush] to force
+// pending bytes to disk.
 func (w *dailyFileWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -65,11 +93,15 @@ func (w *dailyFileWriter) Write(p []byte) (int, error) {
 			return 0, fmt.Errorf("log: rotate: %w", err)
 		}
 	}
-	return w.file.Write(p)
+	return w.buf.Write(p)
 }
 
-// rotate closes the previous file (if any) and opens path for append in dir.
+// rotate flushes the current buffer, closes the previous file (if any), and
+// opens a new file for the given date.
 func (w *dailyFileWriter) rotate(date string) error {
+	if w.buf != nil {
+		_ = w.buf.Flush()
+	}
 	if w.file != nil {
 		_ = w.file.Close()
 	}
@@ -79,15 +111,40 @@ func (w *dailyFileWriter) rotate(date string) error {
 		return err
 	}
 	w.file = f
+	w.buf = bufio.NewWriterSize(f, 64*1024) // 64 KB write buffer
 	w.date = date
 	return nil
 }
 
-// Close flushes and closes the current file handle. Safe to call multiple
-// times — subsequent calls return nil.
+// Flush writes any buffered data to the underlying file. Safe to call
+// concurrently.
+func (w *dailyFileWriter) Flush() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.buf != nil {
+		return w.buf.Flush()
+	}
+	return nil
+}
+
+// Close stops the background flush goroutine, flushes remaining data, and
+// closes the file handle. Safe to call multiple times — subsequent calls
+// return nil.
 func (w *dailyFileWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	select {
+	case <-w.done:
+		// already stopped
+	default:
+		close(w.done)
+	}
+
+	if w.buf != nil {
+		_ = w.buf.Flush()
+		w.buf = nil
+	}
 	if w.file != nil {
 		err := w.file.Close()
 		w.file = nil

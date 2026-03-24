@@ -12,13 +12,13 @@ import (
 // fields (time, level, msg, source, request_id, user_id) are promoted to
 // typed struct fields; everything else lives in [Entry.Extra].
 type Entry struct {
-	Time      time.Time       `json:"time"`
-	Level     string          `json:"level"`
-	Message   string          `json:"msg"`
-	Source    *EntrySource    `json:"source,omitempty"`
-	RequestID string          `json:"request_id,omitempty"`
-	UserID    string          `json:"user_id,omitempty"`
-	Extra     map[string]any  `json:"extra,omitempty"`
+	Time      time.Time      `json:"time"`
+	Level     string         `json:"level"`
+	Message   string         `json:"msg"`
+	Source    *EntrySource   `json:"source,omitempty"`
+	RequestID string         `json:"request_id,omitempty"`
+	UserID    string         `json:"user_id,omitempty"`
+	Extra     map[string]any `json:"extra,omitempty"`
 }
 
 // EntrySource is the source code location recorded by slog when AddSource is
@@ -113,12 +113,16 @@ func parseEntry(line []byte) (Entry, error) {
 
 // QueryOptions configures log entry filtering and pagination for [Query].
 type QueryOptions struct {
-	Level     string // minimum level: "DEBUG", "INFO", "WARN", "ERROR" (empty = all)
-	Search    string // case-insensitive substring match against the message
-	RequestID string // exact match on request_id
-	UserID    string // exact match on user_id
-	Limit     int    // max entries to return (0 = unlimited)
-	Offset    int    // skip first N matching entries
+	Level     string    // minimum level: "DEBUG", "INFO", "WARN", "ERROR" (empty = all)
+	Search    string    // case-insensitive substring match against the message
+	RequestID string    // exact match on request_id
+	UserID    string    // exact match on user_id
+	Limit     int       // max entries to return (0 = unlimited)
+	Offset    int       // skip first N matching entries
+	After     time.Time // include only entries at or after this time (zero = no lower bound)
+	Before    time.Time // include only entries strictly before this time (zero = no upper bound)
+	Order     string    // "asc" (default, oldest first) or "desc" (newest first)
+	CountOnly bool      // return only the total count; entry slice will be nil
 }
 
 // levelRank maps level strings to ordered integers for comparison. Unknown
@@ -140,6 +144,12 @@ func levelRank(s string) int {
 
 // matchesFilter returns true when entry e satisfies all criteria in opts.
 func matchesFilter(e Entry, opts QueryOptions) bool {
+	if !opts.After.IsZero() && e.Time.Before(opts.After) {
+		return false
+	}
+	if !opts.Before.IsZero() && !e.Time.Before(opts.Before) {
+		return false
+	}
 	if opts.Level != "" {
 		if levelRank(e.Level) < levelRank(opts.Level) {
 			return false
@@ -160,9 +170,15 @@ func matchesFilter(e Entry, opts QueryOptions) bool {
 }
 
 // Query reads log entries from the file for the given date (e.g.
-// "2025_03_15") and returns those matching opts. Entries are returned in
-// chronological order (oldest first). The second return value is the total
-// count of matching entries before Limit/Offset are applied.
+// "2025_03_15") and returns those matching opts. The second return value is
+// the total count of matching entries before Limit/Offset are applied.
+//
+// By default entries are returned in chronological order (oldest first). Set
+// Order to "desc" for reverse chronological order (newest first). When
+// CountOnly is true, only the total is computed and the entry slice is nil.
+//
+// Call [Flush] before querying if you need to see entries logged in the
+// current process.
 func Query(date string, opts QueryOptions) ([]Entry, int, error) {
 	f, err := OpenFile(date)
 	if err != nil {
@@ -172,6 +188,8 @@ func Query(date string, opts QueryOptions) ([]Entry, int, error) {
 
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024) // up to 1 MB per line
+
+	desc := strings.EqualFold(opts.Order, "desc")
 
 	var entries []Entry
 	total := 0
@@ -193,12 +211,19 @@ func Query(date string, opts QueryOptions) ([]Entry, int, error) {
 
 		total++
 
-		if opts.Offset > 0 && total <= opts.Offset {
+		if opts.CountOnly {
 			continue
 		}
 
-		if opts.Limit > 0 && len(entries) >= opts.Limit {
-			continue // keep counting for total
+		// For ascending order, apply streaming pagination (memory-efficient).
+		// For descending order, collect all matches — paginate after reversal.
+		if !desc {
+			if opts.Offset > 0 && total <= opts.Offset {
+				continue
+			}
+			if opts.Limit > 0 && len(entries) >= opts.Limit {
+				continue // keep counting for total
+			}
 		}
 
 		entries = append(entries, entry)
@@ -206,6 +231,26 @@ func Query(date string, opts QueryOptions) ([]Entry, int, error) {
 
 	if err := scanner.Err(); err != nil {
 		return entries, total, fmt.Errorf("log: scan %s: %w", date, err)
+	}
+
+	if opts.CountOnly || len(entries) == 0 {
+		return entries, total, nil
+	}
+
+	// Descending: reverse then paginate.
+	if desc {
+		for i, j := 0, len(entries)-1; i < j; i, j = i+1, j-1 {
+			entries[i], entries[j] = entries[j], entries[i]
+		}
+		start := opts.Offset
+		if start > len(entries) {
+			start = len(entries)
+		}
+		end := len(entries)
+		if opts.Limit > 0 && start+opts.Limit < end {
+			end = start + opts.Limit
+		}
+		entries = entries[start:end]
 	}
 
 	return entries, total, nil
