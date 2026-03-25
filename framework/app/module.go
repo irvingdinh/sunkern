@@ -161,12 +161,30 @@ type Tagger interface {
 // other modules being registered. The app validates all declared
 // dependencies between the register and boot phases — if any named
 // dependency is not registered (or is disabled), boot fails with a
-// clear error.
+// clear error. Additionally, each dependency must be registered before
+// the dependent module (registration order = boot order).
 //
 // This is a validation-only mechanism — it does NOT reorder modules.
 // Registration order still determines boot order.
 type DependencyDeclarer interface {
 	DependsOn() []string
+}
+
+// HealthCheckProvider is optionally implemented by modules that want to
+// register health checks automatically during boot. The app calls
+// HealthChecks() after a module successfully boots and registers all
+// returned checkers.
+//
+// This avoids the need for modules to resolve *App from the container
+// just to call AddHealthCheck.
+//
+//	func (m *CacheModule) HealthChecks() []app.HealthChecker {
+//	    return []app.HealthChecker{
+//	        app.CheckFunc{CheckerName: "cache", Fn: m.cache.Ping},
+//	    }
+//	}
+type HealthCheckProvider interface {
+	HealthChecks() []HealthChecker
 }
 
 // ---------------------------------------------------------------------------

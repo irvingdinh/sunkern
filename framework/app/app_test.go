@@ -1231,6 +1231,321 @@ func TestDisabledModulesNotInDependencyValidation(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// ModuleInfo children introspection
+// ---------------------------------------------------------------------------
+
+func TestModuleInfoGroupChildren(t *testing.T) {
+	a := newTestApp(t)
+	a.Use(&ModuleGroup{
+		GroupName: "admin",
+		Modules: []Module{
+			&testModule{BaseModule: BaseModule{ModuleName: "auth"}},
+			&testModule{BaseModule: BaseModule{ModuleName: "users"}},
+		},
+	})
+
+	if err := a.run(); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	infos := a.ModuleInfo()
+	if len(infos) != 1 {
+		t.Fatalf("ModuleInfo() returned %d entries, want 1", len(infos))
+	}
+	if infos[0].Name != "admin" {
+		t.Errorf("Name = %q, want %q", infos[0].Name, "admin")
+	}
+	if len(infos[0].Children) != 2 {
+		t.Fatalf("Children count = %d, want 2", len(infos[0].Children))
+	}
+	if infos[0].Children[0].Name != "auth" || infos[0].Children[1].Name != "users" {
+		t.Errorf("Children names = [%q, %q], want [auth, users]",
+			infos[0].Children[0].Name, infos[0].Children[1].Name)
+	}
+	// After run(), status is shutdown (ready=false, but booted).
+	if infos[0].Children[0].Status != ModuleStatusShutdown {
+		t.Errorf("child status = %q, want %q", infos[0].Children[0].Status, ModuleStatusShutdown)
+	}
+}
+
+func TestModuleInfoGroupChildrenBooted(t *testing.T) {
+	// Capture ModuleInfo during running phase (inside PostBoot).
+	a := newTestApp(t)
+
+	var capturedInfo []ModuleInfo
+	a.Use(&ModuleGroup{
+		GroupName: "admin",
+		Modules: []Module{
+			&testModuleWithPostBoot{
+				testModule: testModule{BaseModule: BaseModule{ModuleName: "auth"}},
+				postBootFn: func() error {
+					capturedInfo = a.ModuleInfo()
+					return nil
+				},
+			},
+			&testModule{BaseModule: BaseModule{ModuleName: "users"}},
+		},
+	})
+
+	if err := a.run(); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	// During PostBoot, ready=false, but children are in group's booted set.
+	// Group itself is in app's booted set. Since ready=false → shutdown status.
+	// But children are in group's booted → they use group's bootedSet, appReady=false → shutdown.
+	// Actually during postBoot, ready=false and modules are booted → status is shutdown.
+	// This is the transient state — the important test is the Children exist.
+	if len(capturedInfo) != 1 {
+		t.Fatalf("captured %d entries, want 1", len(capturedInfo))
+	}
+	if len(capturedInfo[0].Children) != 2 {
+		t.Fatalf("Children count = %d, want 2", len(capturedInfo[0].Children))
+	}
+}
+
+func TestModuleInfoDisabledGroupPreservesChildren(t *testing.T) {
+	a := newTestApp(t)
+	a.Use(When(false, &ModuleGroup{
+		GroupName: "admin",
+		Modules: []Module{
+			&testModuleWithTags{
+				testModule: testModule{BaseModule: BaseModule{ModuleName: "auth"}},
+				tags:       []string{"builtin"},
+			},
+			&testModule{BaseModule: BaseModule{ModuleName: "users"}},
+		},
+	}))
+
+	if err := a.run(); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	infos := a.ModuleInfo()
+	if len(infos) != 1 {
+		t.Fatalf("ModuleInfo() returned %d entries, want 1", len(infos))
+	}
+	if infos[0].Status != ModuleStatusDisabled {
+		t.Errorf("group Status = %q, want %q", infos[0].Status, ModuleStatusDisabled)
+	}
+	if len(infos[0].Children) != 2 {
+		t.Fatalf("Children count = %d, want 2", len(infos[0].Children))
+	}
+	// Children of disabled group inherit disabled status.
+	if infos[0].Children[0].Status != ModuleStatusDisabled {
+		t.Errorf("child Status = %q, want %q", infos[0].Children[0].Status, ModuleStatusDisabled)
+	}
+	// Child metadata preserved even though group is disabled.
+	if len(infos[0].Children[0].Tags) != 1 || infos[0].Children[0].Tags[0] != "builtin" {
+		t.Errorf("child Tags = %v, want [builtin]", infos[0].Children[0].Tags)
+	}
+}
+
+func TestModuleInfoNestedGroups(t *testing.T) {
+	a := newTestApp(t)
+	a.Use(&ModuleGroup{
+		GroupName: "admin",
+		Modules: []Module{
+			&testModule{BaseModule: BaseModule{ModuleName: "auth"}},
+			&ModuleGroup{
+				GroupName: "management",
+				Modules: []Module{
+					&testModule{BaseModule: BaseModule{ModuleName: "user-mgmt"}},
+					&testModule{BaseModule: BaseModule{ModuleName: "log-mgmt"}},
+				},
+			},
+		},
+	})
+
+	if err := a.run(); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	infos := a.ModuleInfo()
+	if len(infos) != 1 || infos[0].Name != "admin" {
+		t.Fatalf("top-level = %v, want [admin]", infos)
+	}
+	if len(infos[0].Children) != 2 {
+		t.Fatalf("admin children = %d, want 2", len(infos[0].Children))
+	}
+
+	mgmt := infos[0].Children[1]
+	if mgmt.Name != "management" {
+		t.Errorf("nested group name = %q, want %q", mgmt.Name, "management")
+	}
+	if len(mgmt.Children) != 2 {
+		t.Fatalf("management children = %d, want 2", len(mgmt.Children))
+	}
+	if mgmt.Children[0].Name != "user-mgmt" || mgmt.Children[1].Name != "log-mgmt" {
+		t.Errorf("nested children = [%q, %q], want [user-mgmt, log-mgmt]",
+			mgmt.Children[0].Name, mgmt.Children[1].Name)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Boot-order validation
+// ---------------------------------------------------------------------------
+
+func TestDependencyValidationBootOrder(t *testing.T) {
+	// Module "users" depends on "auth", but "users" is registered first.
+	a := newTestApp(t)
+	a.Use(&testModuleWithDeps{
+		testModule: testModule{BaseModule: BaseModule{ModuleName: "users"}},
+		deps:       []string{"auth"},
+	})
+	a.Use(&testModule{BaseModule: BaseModule{ModuleName: "auth"}})
+
+	err := a.run()
+	if err == nil {
+		t.Fatal("expected boot-order error, got nil")
+	}
+	if !strings.Contains(err.Error(), "registered after") {
+		t.Errorf("error = %q, want substring 'registered after'", err.Error())
+	}
+}
+
+func TestDependencyValidationBootOrderCorrect(t *testing.T) {
+	// Correct order: auth before users.
+	a := newTestApp(t)
+	a.Use(&testModule{BaseModule: BaseModule{ModuleName: "auth"}})
+	a.Use(&testModuleWithDeps{
+		testModule: testModule{BaseModule: BaseModule{ModuleName: "users"}},
+		deps:       []string{"auth"},
+	})
+
+	if err := a.run(); err != nil {
+		t.Fatalf("correct order should succeed: %v", err)
+	}
+}
+
+func TestDependencyValidationBootOrderMultiple(t *testing.T) {
+	// Module "dashboard" depends on "auth" and "db". "db" is registered after dashboard.
+	a := newTestApp(t)
+	a.Use(&testModule{BaseModule: BaseModule{ModuleName: "auth"}})
+	a.Use(&testModuleWithDeps{
+		testModule: testModule{BaseModule: BaseModule{ModuleName: "dashboard"}},
+		deps:       []string{"auth", "db"},
+	})
+	a.Use(&testModule{BaseModule: BaseModule{ModuleName: "db"}})
+
+	err := a.run()
+	if err == nil {
+		t.Fatal("expected boot-order error for 'db', got nil")
+	}
+	if !strings.Contains(err.Error(), "db") || !strings.Contains(err.Error(), "registered after") {
+		t.Errorf("error = %q, want mention of 'db' and 'registered after'", err.Error())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// HealthCheckProvider
+// ---------------------------------------------------------------------------
+
+type testModuleWithHealthChecks struct {
+	testModule
+	checkers []HealthChecker
+}
+
+func (m *testModuleWithHealthChecks) HealthChecks() []HealthChecker {
+	return m.checkers
+}
+
+func TestHealthCheckProviderAutoRegistered(t *testing.T) {
+	a := newTestApp(t)
+
+	pingCalled := false
+	a.Use(&testModuleWithHealthChecks{
+		testModule: testModule{BaseModule: BaseModule{ModuleName: "cache"}},
+		checkers: []HealthChecker{
+			CheckFunc{CheckerName: "cache-ping", Fn: func(_ context.Context) error {
+				pingCalled = true
+				return nil
+			}},
+		},
+	})
+
+	if err := a.run(); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	report := a.CheckHealth(context.Background())
+	if !pingCalled {
+		t.Fatal("health check from HealthCheckProvider was not called")
+	}
+
+	// Should have sqlite (framework) + cache-ping (module).
+	found := false
+	for _, c := range report.Components {
+		if c.Name == "cache-ping" {
+			found = true
+			if !c.Healthy {
+				t.Errorf("cache-ping unhealthy: %s", c.Error)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("cache-ping not found in health report components: %v", report.Components)
+	}
+}
+
+func TestHealthCheckProviderInGroup(t *testing.T) {
+	a := newTestApp(t)
+
+	a.Use(&ModuleGroup{
+		GroupName: "infra",
+		Modules: []Module{
+			&testModuleWithHealthChecks{
+				testModule: testModule{BaseModule: BaseModule{ModuleName: "queue"}},
+				checkers: []HealthChecker{
+					CheckFunc{CheckerName: "queue-depth", Fn: func(_ context.Context) error {
+						return nil
+					}},
+				},
+			},
+		},
+	})
+
+	if err := a.run(); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	report := a.CheckHealth(context.Background())
+	found := false
+	for _, c := range report.Components {
+		if c.Name == "queue-depth" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("queue-depth not found in health report; group children should auto-register health checks")
+	}
+}
+
+func TestHealthCheckProviderDisabledModuleSkipped(t *testing.T) {
+	a := newTestApp(t)
+
+	a.Use(When(false, &testModuleWithHealthChecks{
+		testModule: testModule{BaseModule: BaseModule{ModuleName: "cache"}},
+		checkers: []HealthChecker{
+			CheckFunc{CheckerName: "should-not-exist", Fn: func(_ context.Context) error {
+				return nil
+			}},
+		},
+	}))
+
+	if err := a.run(); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	report := a.CheckHealth(context.Background())
+	for _, c := range report.Components {
+		if c.Name == "should-not-exist" {
+			t.Fatal("disabled module's health checks should not be registered")
+		}
+	}
+}
+
 // Ensure DATA_DIR is always set for tests that call config.Load via Run.
 func TestMain(m *testing.M) {
 	if os.Getenv("DATA_DIR") == "" {

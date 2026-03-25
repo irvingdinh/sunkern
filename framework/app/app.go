@@ -96,12 +96,14 @@ const (
 )
 
 // ModuleInfo describes a module for admin introspection. Serialize
-// directly to JSON for admin API responses.
+// directly to JSON for admin API responses. For ModuleGroup modules,
+// Children contains recursive info about each child module.
 type ModuleInfo struct {
 	Name         string       `json:"name"`
 	Status       ModuleStatus `json:"status"`
 	Tags         []string     `json:"tags,omitempty"`
 	Dependencies []string     `json:"dependencies,omitempty"`
+	Children     []ModuleInfo `json:"children,omitempty"`
 }
 
 // Use adds modules to the application. Modules are registered and booted
@@ -156,48 +158,74 @@ func (a *App) Env() string {
 }
 
 // ModuleInfo returns metadata about all registered modules, including
-// disabled ones. Status reflects the current lifecycle position. Safe
-// to call from HTTP handlers during the running phase.
+// disabled ones. Status reflects the current lifecycle position.
+// ModuleGroup modules include recursive Children info. Safe to call
+// from HTTP handlers during the running phase.
 func (a *App) ModuleInfo() []ModuleInfo {
 	bootedSet := make(map[string]bool, len(a.booted))
 	for _, m := range a.booted {
 		bootedSet[m.Name()] = true
 	}
 
+	appReady := a.ready.Load()
 	infos := make([]ModuleInfo, len(a.modules))
 	for i, m := range a.modules {
-		var status ModuleStatus
-		switch {
-		case isDisabled(m):
-			status = ModuleStatusDisabled
-		case !bootedSet[m.Name()]:
-			status = ModuleStatusRegistered
-		case a.ready.Load():
-			status = ModuleStatusBooted
-		default:
-			status = ModuleStatusShutdown
-		}
-
-		info := ModuleInfo{
-			Name:   m.Name(),
-			Status: status,
-		}
-
-		// For disabled wrappers, read metadata from the inner module.
-		target := m
-		if d, ok := m.(*disabledModule); ok {
-			target = d.inner
-		}
-		if t, ok := target.(Tagger); ok {
-			info.Tags = t.Tags()
-		}
-		if dd, ok := target.(DependencyDeclarer); ok {
-			info.Dependencies = dd.DependsOn()
-		}
-
-		infos[i] = info
+		infos[i] = buildModuleInfo(m, bootedSet, appReady, false)
 	}
 	return infos
+}
+
+// buildModuleInfo constructs a ModuleInfo for a single module, recursively
+// expanding ModuleGroup children. parentDisabled propagates the disabled
+// state from a disabled group to all its children.
+func buildModuleInfo(m Module, bootedSet map[string]bool, appReady bool, parentDisabled bool) ModuleInfo {
+	// Unwrap disabled wrapper to access inner module metadata.
+	target := m
+	disabled := parentDisabled || isDisabled(m)
+	if d, ok := m.(*disabledModule); ok {
+		target = d.inner
+	}
+
+	// Determine status.
+	var status ModuleStatus
+	switch {
+	case disabled:
+		status = ModuleStatusDisabled
+	case !bootedSet[m.Name()]:
+		status = ModuleStatusRegistered
+	case appReady:
+		status = ModuleStatusBooted
+	default:
+		status = ModuleStatusShutdown
+	}
+
+	info := ModuleInfo{
+		Name:   m.Name(),
+		Status: status,
+	}
+
+	// Extract optional metadata from target (inner module for disabled).
+	if t, ok := target.(Tagger); ok {
+		info.Tags = t.Tags()
+	}
+	if dd, ok := target.(DependencyDeclarer); ok {
+		info.Dependencies = dd.DependsOn()
+	}
+
+	// Expand ModuleGroup children recursively.
+	if g, ok := target.(*ModuleGroup); ok {
+		childBootedSet := make(map[string]bool, len(g.booted))
+		for _, c := range g.booted {
+			childBootedSet[c.Name()] = true
+		}
+		children := make([]ModuleInfo, len(g.Modules))
+		for i, child := range g.Modules {
+			children[i] = buildModuleInfo(child, childBootedSet, appReady && !disabled, disabled)
+		}
+		info.Children = children
+	}
+
+	return info
 }
 
 // Run executes the full application lifecycle. It blocks until a shutdown
@@ -454,8 +482,28 @@ func (a *App) boot() error {
 		}
 		slog.Debug("module booted", "module", m.Name(), "took", time.Since(t))
 		a.booted = append(a.booted, m)
+
+		// Auto-register health checks from modules that provide them.
+		a.registerModuleHealthChecks(m)
 	}
 	return nil
+}
+
+// registerModuleHealthChecks checks if a module (or its children, for
+// ModuleGroups) implements HealthCheckProvider and registers all
+// returned health checkers.
+func (a *App) registerModuleHealthChecks(m Module) {
+	if hp, ok := m.(HealthCheckProvider); ok {
+		for _, hc := range hp.HealthChecks() {
+			a.AddHealthCheck(hc)
+		}
+	}
+	// For ModuleGroups, also check children (they boot through the group).
+	if g, ok := m.(*ModuleGroup); ok {
+		for _, child := range g.booted {
+			a.registerModuleHealthChecks(child)
+		}
+	}
 }
 
 func (a *App) postBoot() error {
@@ -503,10 +551,11 @@ func (a *App) shutdownModules(ctx context.Context) error {
 }
 
 func (a *App) validateDependencies() error {
-	registered := make(map[string]bool, len(a.modules))
-	for _, m := range a.modules {
+	// Build position index: name → registration index. Earlier index = boots first.
+	position := make(map[string]int, len(a.modules))
+	for i, m := range a.modules {
 		if !isDisabled(m) {
-			registered[m.Name()] = true
+			position[m.Name()] = i
 		}
 	}
 	for _, m := range a.modules {
@@ -517,9 +566,16 @@ func (a *App) validateDependencies() error {
 		if !ok {
 			continue
 		}
+		modPos := position[m.Name()]
 		for _, dep := range dd.DependsOn() {
-			if !registered[dep] {
+			depPos, exists := position[dep]
+			if !exists {
 				return fmt.Errorf("module %q depends on %q, which is not registered or is disabled", m.Name(), dep)
+			}
+			// Dependency must be registered before the dependent module
+			// so it boots first. Registration order = boot order.
+			if depPos > modPos {
+				return fmt.Errorf("module %q depends on %q, but %q is registered after %q (dependencies must be registered first)", m.Name(), dep, dep, m.Name())
 			}
 		}
 	}
