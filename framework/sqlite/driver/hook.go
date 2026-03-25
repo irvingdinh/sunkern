@@ -10,6 +10,7 @@ package driver
 extern void sunkern_install_trace(sqlite3 *db, unsigned int mask, void *ctx);
 extern void sunkern_install_busy(sqlite3 *db, void *ctx);
 extern void sunkern_install_wal(sqlite3 *db, void *ctx);
+extern void sunkern_install_update(sqlite3 *db, void *ctx);
 */
 import "C"
 
@@ -67,6 +68,54 @@ type BusyFunc func(count int) bool
 // number of frames in the WAL file after the commit. It runs synchronously
 // in the committing goroutine — keep it fast.
 type WALFunc func(dbName string, pages int)
+
+// UpdateAction identifies the type of row change that triggered an update hook.
+type UpdateAction int
+
+const (
+	// ActionInsert indicates a row was inserted.
+	ActionInsert UpdateAction = 18 // SQLITE_INSERT
+	// ActionDelete indicates a row was deleted.
+	ActionDelete UpdateAction = 9 // SQLITE_DELETE
+	// ActionUpdate indicates a row was updated.
+	ActionUpdate UpdateAction = 23 // SQLITE_UPDATE
+)
+
+// String returns a human-readable label for the action ("insert", "delete",
+// or "update").
+func (a UpdateAction) String() string {
+	switch a {
+	case ActionInsert:
+		return "insert"
+	case ActionDelete:
+		return "delete"
+	case ActionUpdate:
+		return "update"
+	default:
+		return "unknown"
+	}
+}
+
+// UpdateInfo describes a single row change event.
+type UpdateInfo struct {
+	// Action is the type of change (insert, delete, or update).
+	Action UpdateAction
+	// DBName is the database name (usually "main").
+	DBName string
+	// Table is the name of the table that changed.
+	Table string
+	// RowID is the ROWID of the affected row. For WITHOUT ROWID tables,
+	// this value is undefined.
+	RowID int64
+}
+
+// UpdateFunc is called for every row INSERT, UPDATE, or DELETE on the
+// connection. It runs synchronously in the goroutine executing the statement
+// — keep it fast to avoid adding latency to every write.
+//
+// The callback fires before the statement completes, so the row is already
+// visible within the same transaction but may not be committed yet.
+type UpdateFunc func(UpdateInfo)
 
 // DefaultBusyHandler returns a [BusyFunc] implementing exponential backoff.
 // Delays start at 1ms and double each retry up to 50ms, then stay flat.
@@ -128,6 +177,17 @@ func (c *Connector) SetWALHook(fn WALFunc) {
 	c.mu.Unlock()
 }
 
+// SetUpdateHook registers a row-change notification hook for connections
+// created by this Connector. The callback fires for every INSERT, UPDATE,
+// and DELETE on the connection. Pass nil to disable.
+//
+// Only affects future connections. Existing pooled connections are unchanged.
+func (c *Connector) SetUpdateHook(fn UpdateFunc) {
+	c.mu.Lock()
+	c.update = fn
+	c.mu.Unlock()
+}
+
 // ---------------------------------------------------------------------------
 // Internal: hook handle and installation
 // ---------------------------------------------------------------------------
@@ -135,9 +195,10 @@ func (c *Connector) SetWALHook(fn WALFunc) {
 // connHooks holds the Go callbacks for a single database connection. Stored
 // via cgo.Handle so C callbacks can retrieve them safely.
 type connHooks struct {
-	trace TraceFunc
-	busy  BusyFunc
-	wal   WALFunc
+	trace  TraceFunc
+	busy   BusyFunc
+	wal    WALFunc
+	update UpdateFunc
 }
 
 // installHooks registers C-level callbacks on the connection, using handle
@@ -153,6 +214,9 @@ func (cn *conn) installHooks(h *connHooks, mask TraceMask, handle cgo.Handle) {
 	}
 	if h.wal != nil {
 		C.sunkern_install_wal(cn.db, ctx)
+	}
+	if h.update != nil {
+		C.sunkern_install_update(cn.db, ctx)
 	}
 }
 
@@ -223,4 +287,19 @@ func sunkernWALCallback(ctx unsafe.Pointer, _ unsafe.Pointer, name *C.char, page
 	}
 	hooks.wal(C.GoString(name), int(pages))
 	return 0
+}
+
+//export sunkernUpdateCallback
+func sunkernUpdateCallback(ctx unsafe.Pointer, action C.int, db *C.char, table *C.char, rowid C.sqlite3_int64) {
+	h := cgo.Handle(ctx)
+	hooks, ok := h.Value().(*connHooks)
+	if !ok || hooks.update == nil {
+		return
+	}
+	hooks.update(UpdateInfo{
+		Action: UpdateAction(action),
+		DBName: C.GoString(db),
+		Table:  C.GoString(table),
+		RowID:  int64(rowid),
+	})
 }

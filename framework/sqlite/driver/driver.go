@@ -157,6 +157,7 @@ type Connector struct {
 	traceMask TraceMask         // events to trace (TraceStmt, TraceProfile)
 	busy      BusyFunc          // busy handler (nil = use PRAGMA busy_timeout)
 	wal       WALFunc           // WAL commit hook (nil = disabled)
+	update    UpdateFunc        // row-change notification hook (nil = disabled)
 	drv       *Driver
 }
 
@@ -206,6 +207,7 @@ func (c *Connector) Connect(_ context.Context) (driver.Conn, error) {
 	traceMask := c.traceMask
 	busyFn := c.busy
 	walFn := c.wal
+	updateFn := c.update
 	c.mu.RUnlock()
 
 	// Apply init PRAGMAs in sorted order for deterministic execution.
@@ -218,11 +220,12 @@ func (c *Connector) Connect(_ context.Context) (driver.Conn, error) {
 
 	// Install hooks if any are configured. The cgo.Handle lets C callbacks
 	// reach the Go functions without passing Go pointers through C.
-	if traceFn != nil || busyFn != nil || walFn != nil {
+	if traceFn != nil || busyFn != nil || walFn != nil || updateFn != nil {
 		hooks := &connHooks{
-			trace: traceFn,
-			busy:  busyFn,
-			wal:   walFn,
+			trace:  traceFn,
+			busy:   busyFn,
+			wal:    walFn,
+			update: updateFn,
 		}
 		cn.handle = cgo.NewHandle(hooks)
 		cn.installHooks(hooks, traceMask, cn.handle)

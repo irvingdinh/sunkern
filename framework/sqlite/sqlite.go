@@ -30,6 +30,7 @@ type DB struct {
 	path      string
 	writeConn *driver.Connector
 	readConn  *driver.Connector
+	maint     *maintenance
 }
 
 // WriteDB returns the write-only connection pool (MaxOpenConns=1).
@@ -40,6 +41,24 @@ func (db *DB) ReadDB() *sql.DB { return db.read }
 
 // Path returns the database file path.
 func (db *DB) Path() string { return db.path }
+
+// SetUpdateHook registers a row-change notification callback on the write
+// pool. The callback fires for every INSERT, UPDATE, and DELETE. Pass nil
+// to disable.
+//
+// The hook is set on the write connector and takes effect on the next
+// connection created by the pool. To apply immediately, idle connections
+// are recycled so the pool creates a fresh connection with the hook
+// installed.
+func (db *DB) SetUpdateHook(fn driver.UpdateFunc) {
+	db.writeConn.SetUpdateHook(fn)
+	// Force the write pool to drop idle connections. The next query
+	// gets a new connection from the connector (which now has the hook).
+	// Write pool has MaxOpenConns=1, so this recycles the single idle
+	// connection.
+	db.write.SetMaxIdleConns(0)
+	db.write.SetMaxIdleConns(1)
+}
 
 var global struct {
 	mu sync.Mutex
@@ -172,9 +191,31 @@ func Load() {
 	optimizeInterval := config.GetOr[time.Duration]("db.optimize_interval", time.Hour)
 	walCheckpointThreshold := int64(config.GetOr[int]("db.wal_checkpoint_threshold", 104857600))
 
+	// Derive WAL page limit for proactive checkpointing. The WAL hook
+	// reports frame count (not bytes), so we convert the byte threshold
+	// to pages using the configured page size (default 4096).
+	pageSize := config.GetOr[int]("db.page_size", 4096)
+	walPageLimit := 0
+	if walCheckpointThreshold > 0 && pageSize > 0 {
+		walPageLimit = int(walCheckpointThreshold / int64(pageSize))
+	}
+
 	var maint *maintenance
 	if optimizeInterval > 0 {
-		maint = newMaintenance(global.db, optimizeInterval, walCheckpointThreshold)
+		maint = newMaintenance(global.db, optimizeInterval, walCheckpointThreshold, walPageLimit)
+		global.db.maint = maint
+
+		// Install WAL hook on the write connector for proactive checkpoint
+		// triggering. When a commit pushes the WAL past the page threshold,
+		// the hook signals the maintenance goroutine to checkpoint
+		// immediately instead of waiting for the next tick.
+		if walPageLimit > 0 {
+			writeConn.SetWALHook(func(_ string, pages int) {
+				if pages >= walPageLimit {
+					maint.notifyWAL()
+				}
+			})
+		}
 	}
 
 	container.AppendHook(container.Hook{
@@ -185,6 +226,7 @@ func Load() {
 				slog.Debug("sqlite: maintenance started",
 					"optimize_interval", maint.interval,
 					"wal_checkpoint_threshold", maint.walLimit,
+					"wal_page_limit", maint.walPageLimit,
 				)
 			}
 			return nil
