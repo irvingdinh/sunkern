@@ -264,8 +264,6 @@ func (a *App) run() error {
 	// config.Keys() and config.All(). Must be after Load() which resets
 	// all defaults.
 	config.SetDefault("app.env", "development")
-	config.Describe("app.env", "Application environment (development, staging, production)")
-	config.Describe("data_dir", "Root directory for all application data (database, logs, uploads)")
 
 	// Resolve environment after config loads.
 	a.env = config.GetOr[string]("app.env", "development")

@@ -1,238 +1,241 @@
 ---
 title: Framework Configuration Package
 impact: HIGH
-impactDescription: incorrect config usage causes panics at boot or silent misconfiguration at runtime
-tags: config, configuration, environment, defaults, coercion
+impactDescription: incorrect config usage causes panics at boot or silent fallback behavior at runtime
+tags: config, configuration, environment, defaults, validation, coercion
 ---
 
 ## Framework Configuration Package
 
 **Package:** `sunkern.local/framework/config`
 
-The config package provides a three-layer, boot-time configuration system. Config is static — set before or at application start, never changed at runtime. The framework calls `config.Load()` automatically during app startup; modules only interact with defaults and reads.
+The config package provides a three-layer, boot-time configuration system.
+Configuration is loaded once during startup, then read throughout the app. The
+framework owns `config.Load()`; modules should define defaults, add rules, and
+read typed values.
 
----
-
-### API Reference
+### API Surface
 
 ```go
-// Set a default value (lowest priority). Call in module Register phase.
+// Register one default value. Call during Register.
 config.SetDefault(key string, value any)
 
-// Read a value, panic if missing or coercion fails. Use for required config.
+// Register many defaults at once from a flat map.
+config.SetDefaults(config.Values{
+    "http.addr": ":19110",
+})
+
+// Read a required value. Panics on missing key or invalid coercion.
 config.Get[T any](key string) T
 
-// Read a value, return fallback if missing or coercion fails. Never panics.
+// Read an optional value. Returns fallback on missing key or invalid coercion.
 config.GetOr[T any](key string, defaultVal T) T
 
-// Validate that all keys exist in any layer. Panics listing missing env var names.
+// Check that required keys exist in any layer.
 config.Ensure(keys ...string)
 
-// Load is called by the framework — never call it from module code.
-config.Load()
-```
+// Register validation rules during Register.
+config.AddRule(key string, rules ...config.Rule)
 
----
+// Validate all rules and freeze the config package.
+config.Validate()
+```
 
 ### Resolution Order
 
-Values are resolved highest-priority-first. The first match wins:
+Values resolve in this order:
 
-1. **Environment variable** — `os.LookupEnv(KEY_NAME)` (always checked first)
-2. **Config file** — `{DATA_DIR}/config.json` (flattened dot-notation)
-3. **Registered default** — from `config.SetDefault()` calls (lowest priority)
+1. environment variable
+2. `{DATA_DIR}/config.json`
+3. registered default
 
----
+The first match wins.
 
-### Key Naming Convention
+### Key Naming
 
-Config keys use **dot-notation**. They map to **UPPER_SNAKE_CASE** environment variables:
+Config keys use dot notation and map to upper snake case environment variables:
 
 | Config Key | Environment Variable |
-|------------|---------------------|
+|------------|----------------------|
 | `http.addr` | `HTTP_ADDR` |
-| `log.level` | `LOG_LEVEL` |
 | `db.busy_timeout` | `DB_BUSY_TIMEOUT` |
-| `data_dir` | `DATA_DIR` |
 | `jwt.secret` | `JWT_SECRET` |
+| `data_dir` | `DATA_DIR` |
 
-Transformation: uppercase, replace `.` with `_`.
-
----
+Use `config.EnvName("jwt.secret")` when code needs the env var name.
 
 ### Correct Usage Patterns
 
-**Setting defaults in a module's Register phase:**
+**Register defaults during Register:**
 
 ```go
 func (m *PaymentModule) Register() {
-    config.SetDefault("payment.timeout", "30s")
-    config.SetDefault("payment.max_retries", 3)
-    config.SetDefault("payment.currency", "USD")
+    config.SetDefaults(config.Values{
+        "payment.timeout":     "30s",
+        "payment.max_retries": 3,
+        "payment.currency":    "USD",
+    })
+
+    config.AddRule("payment.max_retries", config.NonNegative)
 }
 ```
 
-**Reading required config (panics if missing):**
+**Read required config with `Get`:**
 
 ```go
 func (m *PaymentModule) Boot(ctx context.Context) error {
-    secret := config.Get[string]("payment.api_key")
-    // Use secret — if PAYMENT_API_KEY env var is not set and no default
-    // or config.json entry exists, this panics immediately.
+    apiKey := config.Get[string]("payment.api_key")
+    _ = apiKey
+    return nil
 }
 ```
 
-**Reading optional config with fallback:**
+**Read optional config with `GetOr`:**
 
 ```go
 func (m *PaymentModule) Boot(ctx context.Context) error {
     timeout := config.GetOr[time.Duration]("payment.timeout", 30*time.Second)
     retries := config.GetOr[int]("payment.max_retries", 3)
+    _, _ = timeout, retries
+    return nil
 }
 ```
 
-**Validating required keys at boot:**
+**Fail fast on required keys:**
 
 ```go
 func (m *PaymentModule) Boot(ctx context.Context) error {
-    // Panics with: "config: required values not set: PAYMENT_API_KEY, PAYMENT_WEBHOOK_SECRET"
     config.Ensure("payment.api_key", "payment.webhook_secret")
+    return nil
 }
 ```
-
----
 
 ### Incorrect Usage Patterns
 
-**Calling SetDefault outside of Register phase:**
+**Do not call `Load()` from modules:**
 
 ```go
-// WRONG: SetDefault in Boot is too late — other modules may have already
-// read this key during their Boot phase.
-func (m *PaymentModule) Boot(ctx context.Context) error {
-    config.SetDefault("payment.timeout", "30s") // too late
-}
-```
-
-**Calling config.Load() from module code:**
-
-```go
-// WRONG: Load() resets ALL state (values and defaults). The framework
-// calls it once during app startup. Calling it again wipes everything.
 func (m *PaymentModule) Register() {
-    config.Load() // destroys all previously registered defaults
+    config.Load() // WRONG: resets all config state
 }
 ```
 
-**Using Get[T] for optional config:**
+**Do not register defaults in Boot:**
 
 ```go
-// WRONG: panics if the key doesn't exist.
-port := config.Get[int]("optional.debug.port")
+func (m *PaymentModule) Boot(ctx context.Context) error {
+    config.SetDefault("payment.timeout", "30s") // WRONG: too late
+    return nil
+}
+```
 
-// CORRECT: use GetOr with a sensible fallback.
+**Do not use `Get` for optional config:**
+
+```go
+port := config.Get[int]("optional.debug.port") // WRONG: may panic
+```
+
+Use:
+
+```go
 port := config.GetOr[int]("optional.debug.port", 0)
 ```
 
-**Relying on string type for everything:**
+**Do not parse durations manually after reading strings:**
 
 ```go
-// WRONG: reading as string then parsing manually.
-timeoutStr := config.Get[string]("payment.timeout")
+timeoutStr := config.Get[string]("payment.timeout") // WRONG
 timeout, _ := time.ParseDuration(timeoutStr)
+```
 
-// CORRECT: let the coercion system handle it.
+Use:
+
+```go
 timeout := config.Get[time.Duration]("payment.timeout")
 ```
 
----
+### Type Coercion Rules
 
-### Supported Type Coercions
+The package supports typed reads for:
 
-The generic type parameter in `Get[T]` and `GetOr[T]` supports:
+- `string`
+- `bool`
+- `int`, `int32`, `int64`
+- `uint`, `uint8`, `uint16`, `uint32`, `uint64`
+- `float64`
+- `time.Time`
+- `time.Duration`
+- `[]int`
+- `[]string`
+- `map[string]any`
+- `map[string]string`
+- `map[string][]string`
 
-| Type | Coerces from | Notes |
-|------|-------------|-------|
-| `string` | anything | Uses `fmt.Sprintf("%v", raw)` |
-| `bool` | string, int, float64 | Strings: "true", "1", "yes", "on", "t" (case-insensitive) and inverses |
-| `int` | int, int64, float64, string, bool | Overflow-checked against `math.MaxInt` |
-| `int32` | int, int32, int64, float64, string, bool | Overflow-checked |
-| `int64` | int, int32, int64, float64, string, bool | Overflow-checked |
-| `uint` | uint, int, int64, float64, string, bool | Rejects negative values |
-| `uint8` | uint8, int, int64, float64, string, bool | Range [0, 255] |
-| `uint16` | uint16, int, int64, float64, string, bool | Range [0, 65535] |
-| `uint32` | uint32, int, int64, float64, string, bool | Range checked |
-| `uint64` | uint64, uint, int, int64, float64, string, bool | Rejects negative |
-| `float64` | float64, int, int64, string, bool | Overflow-checked |
-| `time.Time` | time.Time, string | Tries: RFC3339, RFC3339Nano, "2006-01-02", "2006-01-02 15:04:05" |
-| `time.Duration` | duration, string, int, int64, float64 | String: Go format ("15m", "2h30m") or bare nanoseconds |
-| `[]int` | []int, []any, string | String: comma-separated ("1, 2, 3") |
-| `[]string` | []string, []any, string | String: comma-separated ("a, b, c") |
-| `map[string]any` | map[string]any | Direct cast only |
-| `map[string]string` | map[string]string, map[string]any | Values coerced to string |
-| `map[string][]string` | map[string][]string, map[string]any | Values coerced to string slices |
+Important behavior:
 
-Environment variables are always strings. The coercion layer handles `"8080"` (string) to `int(8080)` automatically.
+- environment variables always arrive as strings
+- `Get` panics on invalid coercion
+- `GetOr` falls back on invalid coercion
+- integer targets reject fractional JSON numbers
+- `time.Duration` accepts duration strings such as `"15s"` or `"1h30m"`
+- `time.Duration` does not accept bare numeric strings or JSON numbers
 
----
+If you want a duration, store it as a duration string in config and env. Do
+not rely on implicit nanosecond parsing.
 
-### Config File Format
+### Validation And Freeze
 
-The config file is **JSON** at `{DATA_DIR}/config.json`. Nested objects are flattened to dot-notation:
+`AddRule` registers boot-time validation. `Validate()` checks all rules and then
+freezes the package.
 
-```json
-{
-  "http": {
-    "addr": ":8080"
-  },
-  "log": {
-    "level": "DEBUG"
-  },
-  "payment": {
-    "timeout": "30s",
-    "max_retries": 3
-  }
-}
-```
+After validation, these calls are no longer allowed:
 
-This flattens to keys: `http.addr`, `log.level`, `payment.timeout`, `payment.max_retries`.
+- `SetDefault`
+- `SetDefaults`
+- `AddRule`
 
-Missing file is silently ignored (config works with env vars and defaults alone). Malformed JSON causes a panic at boot.
+Any of them will panic after freeze.
 
----
+### Introspection Helpers
+
+The package keeps a small introspection layer:
+
+- `All()` returns the effective value of every known key
+- `Keys()` returns the sorted list of known keys
+- `Sub("db")` returns keys under a namespace with the prefix removed
+- `Sub("db.")` is also accepted
+
+Known-key boundary:
+
+- defaults and `config.json` define known keys
+- env overrides are reflected for known keys
+- env-only undeclared keys are readable via `Get` and `Has`
+- env-only undeclared keys are not listed by `All`, `Keys`, or `Sub`
+
+This is intentional. Generic tooling should reflect the application's declared
+config surface, not arbitrary host environment variables.
+
+### Removed / Unsupported Concepts
+
+Do not design against config metadata or admin-snapshot APIs. The current
+package does not expose:
+
+- config descriptions
+- sensitive-key masking metadata
+- exported config entry snapshots
+- config diffs
+
+If code or docs mention `Describe`, `MarkSensitive`, `Export`, or `Diff`,
+assume that guidance is stale.
 
 ### Data Directory Isolation
 
-**For testing and development**, always set `DATA_DIR` to an isolated directory:
+Always run Sunkern apps with an isolated `DATA_DIR`, especially in tests and
+local development:
 
 ```bash
 export DATA_DIR=/tmp/sunkern_data_$(date +%s)
 ```
 
-**Never use the default** `~/.standalone` when multiple Sunkern projects may run concurrently — it causes data collisions.
-
-The `data_dir` key is automatically available after `config.Load()`:
-
-```go
-dataDir := config.Get[string]("data_dir")
-```
-
----
-
-### Thread Safety
-
-- `Get[T]` and `GetOr[T]` are concurrent-read safe (RWMutex read lock)
-- `SetDefault` acquires an exclusive write lock
-- `Load()` acquires an exclusive write lock and resets all state
-- Safe to call `Get`/`GetOr` from any goroutine after boot
-
----
-
-### Error Behavior Summary
-
-| Function | Key missing | Coercion fails | Returns |
-|----------|------------|----------------|---------|
-| `Get[T]` | panic | panic | T |
-| `GetOr[T]` | returns fallback | returns fallback | T |
-| `Ensure` | panic (lists all missing) | n/a | void |
-| `SetDefault` | n/a | n/a | void |
+Never rely on `~/.standalone` when multiple local projects may run on the same
+machine.

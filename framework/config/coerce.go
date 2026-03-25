@@ -175,6 +175,9 @@ func toInt(raw any) (int, bool) {
 		if v > float64(math.MaxInt) || v < float64(math.MinInt) {
 			return 0, false
 		}
+		if math.Trunc(v) != v {
+			return 0, false
+		}
 		return int(v), true
 	case string:
 		n, err := strconv.ParseInt(v, 10, 64)
@@ -213,6 +216,9 @@ func toInt32(raw any) (int32, bool) {
 		if v > math.MaxInt32 || v < math.MinInt32 {
 			return 0, false
 		}
+		if math.Trunc(v) != v {
+			return 0, false
+		}
 		return int32(v), true
 	case string:
 		n, err := strconv.ParseInt(v, 10, 32)
@@ -240,6 +246,9 @@ func toInt64(raw any) (int64, bool) {
 		return int64(v), true
 	case float64:
 		if v > float64(math.MaxInt64) || v < float64(math.MinInt64) {
+			return 0, false
+		}
+		if math.Trunc(v) != v {
 			return 0, false
 		}
 		return int64(v), true
@@ -277,6 +286,9 @@ func toUint(raw any) (uint, bool) {
 		if v < 0 || v > float64(math.MaxUint) {
 			return 0, false
 		}
+		if math.Trunc(v) != v {
+			return 0, false
+		}
 		return uint(v), true
 	case string:
 		n, err := strconv.ParseUint(v, 10, 64)
@@ -312,6 +324,9 @@ func toUint8(raw any) (uint8, bool) {
 		if v < 0 || v > math.MaxUint8 {
 			return 0, false
 		}
+		if math.Trunc(v) != v {
+			return 0, false
+		}
 		return uint8(v), true
 	case string:
 		n, err := strconv.ParseUint(v, 10, 8)
@@ -345,6 +360,9 @@ func toUint16(raw any) (uint16, bool) {
 		return uint16(v), true
 	case float64:
 		if v < 0 || v > math.MaxUint16 {
+			return 0, false
+		}
+		if math.Trunc(v) != v {
 			return 0, false
 		}
 		return uint16(v), true
@@ -388,6 +406,9 @@ func toUint32(raw any) (uint32, bool) {
 		if v < 0 || v > math.MaxUint32 {
 			return 0, false
 		}
+		if math.Trunc(v) != v {
+			return 0, false
+		}
 		return uint32(v), true
 	case string:
 		n, err := strconv.ParseUint(v, 10, 32)
@@ -423,6 +444,9 @@ func toUint64(raw any) (uint64, bool) {
 		return uint64(v), true
 	case float64:
 		if v < 0 {
+			return 0, false
+		}
+		if math.Trunc(v) != v {
 			return 0, false
 		}
 		return uint64(v), true
@@ -495,20 +519,9 @@ func toDuration(raw any) (time.Duration, bool) {
 	case string:
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			// Try parsing as a bare number (nanoseconds).
-			n, err := strconv.ParseInt(v, 10, 64)
-			if err != nil {
-				return 0, false
-			}
-			return time.Duration(n), true
+			return 0, false
 		}
 		return d, true
-	case int:
-		return time.Duration(v), true
-	case int64:
-		return time.Duration(v), true
-	case float64:
-		return time.Duration(int64(v)), true
 	default:
 		return 0, false
 	}

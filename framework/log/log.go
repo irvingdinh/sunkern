@@ -51,17 +51,12 @@ var global state
 // [*FileLevel] for runtime adjustment. A shutdown hook is registered to
 // flush and close the file writer during graceful shutdown.
 func Load() {
-	config.SetDefaults(map[string]any{
+	config.SetDefaults(config.Values{
 		"log.level":         "INFO",
 		"log.console.level": "",
 		"log.sample.debug":  0,
 		"log.sample.info":   0,
 	})
-
-	config.Describe("log.level", "Minimum log level for file output (DEBUG, INFO, WARN, ERROR)")
-	config.Describe("log.console.level", "Minimum log level for console output (inherits log.level if empty)")
-	config.Describe("log.sample.debug", "Sample 1-in-N DEBUG logs (0 = no sampling)")
-	config.Describe("log.sample.info", "Sample 1-in-N INFO logs (0 = no sampling)")
 
 	fileLevelStr := config.GetOr[string]("log.level", "INFO")
 	var fileLevel FileLevel

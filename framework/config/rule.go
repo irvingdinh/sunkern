@@ -61,7 +61,7 @@ func Validate() {
 	}
 
 	// Freeze config after successful validation. No further SetDefault,
-	// SetDefaults, MarkSensitive, Describe, or AddRule calls are allowed.
+	// SetDefaults, or AddRule calls are allowed.
 	Freeze()
 }
 

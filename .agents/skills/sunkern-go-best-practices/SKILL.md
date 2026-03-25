@@ -50,12 +50,15 @@ Reference these guidelines when:
 ### Configuration (HIGH)
 
 - `config-resolution-order` - Priority: env var > config.json > SetDefault (highest to lowest)
-- `config-set-default` - Call SetDefault in module Register phase; lowest priority, last call wins
+- `config-set-default` - Register defaults only during Register; use SetDefaults(config.Values{...}) for grouped flat keys
 - `config-get-required` - Get[T] panics if key missing or coercion fails; use for required config
 - `config-get-optional` - GetOr[T] returns fallback on missing key or coercion failure; never panics
+- `config-validate-freeze` - AddRule + Validate define boot-time validation; after Validate the package is frozen
 - `config-ensure` - Ensure(keys...) validates required keys exist at boot; panics with env var names
 - `config-key-naming` - Dot-notation keys map to UPPER_SNAKE env vars: "db.host" -> DB_HOST
-- `config-type-coercion` - Supports all Go scalar types, time.Time, time.Duration, slices, maps
+- `config-type-coercion` - Supports scalar types, time.Time, string-based time.Duration, slices, and maps
+- `config-introspection` - All/Keys/Sub expose known keys for CLI tooling; env-only undeclared keys are excluded
+- `config-no-metadata-layer` - Do not use or invent Describe/MarkSensitive/Export/Diff style APIs
 - `config-data-dir` - Always set DATA_DIR to an isolated temp directory; never use default ~/.standalone
 
 ### Logging (HIGH)
