@@ -129,3 +129,18 @@ func RestoreByID(ctx context.Context, q Querier, table *TableInfo, id string) (s
 		Where(newComp(newSyntheticColumn(table.name, "id"), "=", id)).
 		Exec(ctx, q)
 }
+
+// UpdateByID returns an UpdateBuilder pre-configured with WHERE id = ? AND
+// deleted_at IS NULL. Chain .Set() calls to specify what to update, then call
+// .Exec() to execute.
+//
+//	result, err := db.UpdateByID(&Users.TableInfo, id).
+//	    Set(Users.Name, "Alice").
+//	    Set(Users.Email, "alice@example.com").
+//	    Exec(ctx, writeDB)
+func UpdateByID(table *TableInfo, id string) *UpdateBuilder {
+	return Update(table).Where(
+		newComp(newSyntheticColumn(table.name, "id"), "=", id),
+		newNullCheck(newSyntheticColumn(table.name, "deleted_at"), true),
+	)
+}

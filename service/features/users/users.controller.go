@@ -120,7 +120,7 @@ func (c *usersController) update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ub := db.Update(&Users.TableInfo).Where(Users.ID.Eq(id), Users.DeletedAt.IsNull())
+	ub := db.UpdateByID(&Users.TableInfo, id)
 
 	if req.Email != "" {
 		ub = ub.Set(Users.Email, req.Email)
