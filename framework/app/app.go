@@ -227,14 +227,17 @@ func (a *App) run() error {
 
 	bootStart := time.Now()
 
-	// Register app-level config defaults for discoverability via
-	// config.Keys() and config.All().
-	config.SetDefault("app.env", "development")
-
 	// Load config from file + env vars. The global container is already
 	// initialized by its package init — no Reset() needed here. Reset()
 	// exists solely for tests that need a clean container between cases.
 	config.Load()
+
+	// Register app-level config defaults for discoverability via
+	// config.Keys() and config.All(). Must be after Load() which resets
+	// all defaults.
+	config.SetDefault("app.env", "development")
+	config.Describe("app.env", "Application environment (development, staging, production)")
+	config.Describe("data_dir", "Root directory for all application data (database, logs, uploads)")
 
 	// Resolve environment after config loads.
 	a.env = config.GetOr[string]("app.env", "development")

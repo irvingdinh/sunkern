@@ -71,6 +71,15 @@ func Load() {
 	config.SetDefault("db.wal_checkpoint_threshold", 104857600) // 100 MB
 	config.SetDefault("db.trace", false)
 
+	config.Describe("db.busy_timeout", "Milliseconds to wait for locks before returning SQLITE_BUSY")
+	config.Describe("db.cache_size", "Page cache size (negative = KB, e.g. -16000 = 16MB)")
+	config.Describe("db.mmap_size", "Memory-mapped I/O limit in bytes (0 to disable)")
+	config.Describe("db.wal_autocheckpoint", "Auto-checkpoint threshold in WAL pages")
+	config.Describe("db.journal_size_limit", "Max WAL file size after checkpoint in bytes")
+	config.Describe("db.optimize_interval", "Interval between PRAGMA optimize runs")
+	config.Describe("db.wal_checkpoint_threshold", "WAL size in bytes that triggers proactive checkpoint")
+	config.Describe("db.trace", "Enable SQL tracing to slog.Debug (expanded SQL + timing)")
+
 	// Read tuning parameters from config.
 	busyTimeout := config.GetOr[int]("db.busy_timeout", 5000)
 	cacheSize := config.GetOr[int]("db.cache_size", -16000)

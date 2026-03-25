@@ -45,10 +45,6 @@ func Validate() {
 	}
 	global.mu.RUnlock()
 
-	if len(snapshot) == 0 {
-		return
-	}
-
 	var errs []string
 	for key, rules := range snapshot {
 		val, exists := resolve(key)
@@ -65,7 +61,7 @@ func Validate() {
 	}
 
 	// Freeze config after successful validation. No further SetDefault,
-	// SetDefaults, MarkSensitive, or AddRule calls are allowed.
+	// SetDefaults, MarkSensitive, Describe, or AddRule calls are allowed.
 	Freeze()
 }
 

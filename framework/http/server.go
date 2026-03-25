@@ -50,6 +50,11 @@ func NewServer() (Server, error) {
 	config.SetDefault("http.write_timeout", DefaultWriteTimeout.String())
 	config.SetDefault("http.idle_timeout", DefaultIdleTimeout.String())
 
+	config.Describe("http.addr", "HTTP server listen address (host:port)")
+	config.Describe("http.read_timeout", "Max duration for reading request headers and body")
+	config.Describe("http.write_timeout", "Max duration for writing the response")
+	config.Describe("http.idle_timeout", "Max duration for keep-alive connections to stay idle")
+
 	addr := config.GetOr[string]("http.addr", DefaultAddr)
 	readTimeout := config.GetOr[time.Duration]("http.read_timeout", DefaultReadTimeout)
 	writeTimeout := config.GetOr[time.Duration]("http.write_timeout", DefaultWriteTimeout)

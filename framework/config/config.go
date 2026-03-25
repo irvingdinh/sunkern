@@ -32,26 +32,31 @@ const (
 // Entry represents a single config key with resolution metadata. Used by
 // Export for admin dashboard display.
 type Entry struct {
-	Key     string `json:"key"`
-	Value   any    `json:"value"`
-	Source  Source `json:"source"`
-	EnvName string `json:"env_name"`
+	Key          string `json:"key"`
+	Value        any    `json:"value"`
+	Source       Source `json:"source"`
+	EnvName      string `json:"env_name"`
+	Description  string `json:"description,omitempty"`
+	DefaultValue any    `json:"default_value,omitempty"`
+	Overridden   bool   `json:"overridden"`
 }
 
 type state struct {
-	mu        sync.RWMutex
-	frozen    bool
-	values    map[string]any       // from JSON file (flattened)
-	defaults  map[string]any       // from SetDefault calls
-	rules     map[string][]Rule    // from AddRule calls
-	sensitive map[string]struct{}  // keys whose values are masked in Export
+	mu           sync.RWMutex
+	frozen       bool
+	values       map[string]any            // from JSON file (flattened)
+	defaults     map[string]any            // from SetDefault calls
+	rules        map[string][]Rule         // from AddRule calls
+	sensitive    map[string]struct{}       // keys whose values are masked in Export
+	descriptions map[string]string         // human-readable key descriptions
 }
 
 var global = state{
-	values:    make(map[string]any),
-	defaults:  make(map[string]any),
-	rules:     make(map[string][]Rule),
-	sensitive: make(map[string]struct{}),
+	values:       make(map[string]any),
+	defaults:     make(map[string]any),
+	rules:        make(map[string][]Rule),
+	sensitive:    make(map[string]struct{}),
+	descriptions: make(map[string]string),
 }
 
 // Load resolves the data directory, creates it if needed, loads
@@ -107,6 +112,7 @@ func Load() {
 	global.defaults = defaults
 	global.rules = make(map[string][]Rule)
 	global.sensitive = make(map[string]struct{})
+	global.descriptions = make(map[string]string)
 	global.mu.Unlock()
 }
 
@@ -344,11 +350,43 @@ func IsSensitive(key string) bool {
 	return ok
 }
 
+// Describe attaches a human-readable description to a config key. The
+// description is included in Export output, making config self-documenting
+// for admin dashboards. Called during the registration phase alongside
+// SetDefault and MarkSensitive.
+//
+//	config.SetDefault("db.busy_timeout", 5000)
+//	config.Describe("db.busy_timeout", "SQLite busy timeout in milliseconds")
+//
+// Panics if the config has been frozen (after Validate).
+func Describe(key, description string) {
+	global.mu.Lock()
+	if global.frozen {
+		global.mu.Unlock()
+		panic(fmt.Sprintf("config: Describe(%q) called after config is frozen", key))
+	}
+	global.descriptions[key] = description
+	global.mu.Unlock()
+}
+
+// Description returns the description for a key, or empty string if none
+// has been registered.
+func Description(key string) string {
+	global.mu.RLock()
+	desc := global.descriptions[key]
+	global.mu.RUnlock()
+	return desc
+}
+
 // Export returns all known config entries with their resolved values, source
-// attribution, and environment variable names. Entries are sorted by key.
+// attribution, environment variable names, descriptions, and default values.
+// Entries are sorted by key.
 //
 // Sensitive keys have their values replaced with "***". This makes Export
 // safe to return directly from admin API endpoints without leaking secrets.
+//
+// The Overridden field is true when the resolved value comes from a higher-
+// priority layer than the registered default (env var or config file).
 //
 // The returned slice is a copy and safe to modify.
 func Export() []Entry {
@@ -363,10 +401,18 @@ func Export() []Entry {
 		seen[k] = struct{}{}
 	}
 
-	// Snapshot sensitive set under the same lock.
+	// Snapshot sensitive set, descriptions, and defaults under the same lock.
 	sensitiveSnapshot := make(map[string]struct{}, len(global.sensitive))
 	for k := range global.sensitive {
 		sensitiveSnapshot[k] = struct{}{}
+	}
+	descSnapshot := make(map[string]string, len(global.descriptions))
+	for k, v := range global.descriptions {
+		descSnapshot[k] = v
+	}
+	defaultsSnapshot := make(map[string]any, len(global.defaults))
+	for k, v := range global.defaults {
+		defaultsSnapshot[k] = v
 	}
 
 	global.mu.RUnlock()
@@ -386,24 +432,102 @@ func Export() []Entry {
 			continue
 		}
 
-		// Mask sensitive values.
-		if _, sensitive := sensitiveSnapshot[key]; sensitive {
-			val = "***"
+		isSensitive := false
+		if _, ok := sensitiveSnapshot[key]; ok {
+			isSensitive = true
 		}
 
-		entries = append(entries, Entry{
-			Key:     key,
-			Value:   val,
-			Source:  source,
-			EnvName: keyToEnvVar(key),
-		})
+		// Mask sensitive values.
+		displayVal := val
+		if isSensitive {
+			displayVal = "***"
+		}
+
+		defVal, hasDefault := defaultsSnapshot[key]
+		if isSensitive && hasDefault {
+			defVal = "***"
+		}
+
+		entry := Entry{
+			Key:        key,
+			Value:      displayVal,
+			Source:     source,
+			EnvName:    keyToEnvVar(key),
+			Overridden: hasDefault && source != SourceDefault,
+		}
+		if desc, ok := descSnapshot[key]; ok {
+			entry.Description = desc
+		}
+		if hasDefault {
+			entry.DefaultValue = defVal
+		}
+
+		entries = append(entries, entry)
 	}
 
 	return entries
 }
 
-// Freeze prevents further SetDefault, SetDefaults, MarkSensitive, and
-// AddRule calls. Called automatically at the end of Validate. Can also be
+// Change represents a single config entry that differs between two Export
+// snapshots.
+type Change struct {
+	Key      string `json:"key"`
+	OldValue any    `json:"old_value,omitempty"`
+	NewValue any    `json:"new_value,omitempty"`
+	Kind     string `json:"kind"` // "added", "removed", or "changed"
+}
+
+// Diff compares two Export snapshots and returns the differences. Useful for
+// admin dashboards that need to show what changed between two points in time
+// (e.g., comparing current config against a boot-time snapshot).
+//
+// Sensitive values appear as "***" in both old and new — the diff reports
+// that a sensitive key changed, but not the actual values.
+func Diff(before, after []Entry) []Change {
+	oldMap := make(map[string]any, len(before))
+	for _, e := range before {
+		oldMap[e.Key] = e.Value
+	}
+	newMap := make(map[string]any, len(after))
+	for _, e := range after {
+		newMap[e.Key] = e.Value
+	}
+
+	// Collect all keys from both snapshots.
+	allKeys := make(map[string]struct{}, len(before)+len(after))
+	for _, e := range before {
+		allKeys[e.Key] = struct{}{}
+	}
+	for _, e := range after {
+		allKeys[e.Key] = struct{}{}
+	}
+
+	sorted := make([]string, 0, len(allKeys))
+	for k := range allKeys {
+		sorted = append(sorted, k)
+	}
+	sort.Strings(sorted)
+
+	var changes []Change
+	for _, key := range sorted {
+		oldVal, inOld := oldMap[key]
+		newVal, inNew := newMap[key]
+
+		switch {
+		case !inOld && inNew:
+			changes = append(changes, Change{Key: key, NewValue: newVal, Kind: "added"})
+		case inOld && !inNew:
+			changes = append(changes, Change{Key: key, OldValue: oldVal, Kind: "removed"})
+		case inOld && inNew && fmt.Sprintf("%v", oldVal) != fmt.Sprintf("%v", newVal):
+			changes = append(changes, Change{Key: key, OldValue: oldVal, NewValue: newVal, Kind: "changed"})
+		}
+	}
+
+	return changes
+}
+
+// Freeze prevents further SetDefault, SetDefaults, MarkSensitive, Describe,
+// and AddRule calls. Called automatically at the end of Validate. Can also be
 // called manually to freeze config earlier.
 //
 // Freeze is idempotent — calling it multiple times is safe.

@@ -1040,3 +1040,274 @@ func TestGetCoercionPanicIncludesRawValue(t *testing.T) {
 		Get[int]("port")
 	})
 }
+
+// ---------------------------------------------------------------------------
+// Describe
+// ---------------------------------------------------------------------------
+
+func TestDescribe(t *testing.T) {
+	loadEmpty(t)
+	Describe("db.host", "Database server hostname")
+	if got := Description("db.host"); got != "Database server hostname" {
+		t.Errorf("Description(db.host) = %q, want %q", got, "Database server hostname")
+	}
+}
+
+func TestDescribeMissing(t *testing.T) {
+	loadEmpty(t)
+	if got := Description("nonexistent"); got != "" {
+		t.Errorf("Description(nonexistent) = %q, want empty", got)
+	}
+}
+
+func TestDescribeOverwrites(t *testing.T) {
+	loadEmpty(t)
+	Describe("key", "first")
+	Describe("key", "second")
+	if got := Description("key"); got != "second" {
+		t.Errorf("Description = %q, want %q (last write wins)", got, "second")
+	}
+}
+
+func TestDescribePanicsWhenFrozen(t *testing.T) {
+	loadEmpty(t)
+	Freeze()
+	mustPanic(t, "Describe", func() {
+		Describe("key", "desc")
+	})
+}
+
+func TestDescribeResetByLoad(t *testing.T) {
+	loadEmpty(t)
+	Describe("key", "desc")
+	loadEmpty(t) // reset
+	if got := Description("key"); got != "" {
+		t.Errorf("Description after reset = %q, want empty", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Export — enriched fields
+// ---------------------------------------------------------------------------
+
+func TestExportIncludesDescription(t *testing.T) {
+	loadEmpty(t)
+	SetDefault("db.host", "localhost")
+	Describe("db.host", "Database server hostname")
+
+	entries := Export()
+	for _, e := range entries {
+		if e.Key == "db.host" {
+			if e.Description != "Database server hostname" {
+				t.Errorf("Description = %q, want %q", e.Description, "Database server hostname")
+			}
+			return
+		}
+	}
+	t.Error("Export() missing db.host entry")
+}
+
+func TestExportIncludesDefaultValue(t *testing.T) {
+	loadEmpty(t)
+	SetDefault("port", 19110)
+	t.Setenv("PORT", "443")
+
+	entries := Export()
+	for _, e := range entries {
+		if e.Key == "port" {
+			if e.DefaultValue != 19110 {
+				t.Errorf("DefaultValue = %v, want 19110", e.DefaultValue)
+			}
+			if !e.Overridden {
+				t.Error("Overridden = false, want true (env overrides default)")
+			}
+			if e.Source != SourceEnv {
+				t.Errorf("Source = %q, want %q", e.Source, SourceEnv)
+			}
+			return
+		}
+	}
+	t.Error("Export() missing port entry")
+}
+
+func TestExportNotOverriddenWhenDefault(t *testing.T) {
+	loadEmpty(t)
+	SetDefault("port", 19110)
+
+	entries := Export()
+	for _, e := range entries {
+		if e.Key == "port" {
+			if e.Overridden {
+				t.Error("Overridden = true, want false (using default)")
+			}
+			return
+		}
+	}
+	t.Error("Export() missing port entry")
+}
+
+func TestExportOverriddenByFile(t *testing.T) {
+	loadWithJSON(t, `{"port": 8080}`)
+	SetDefault("port", 19110)
+
+	entries := Export()
+	for _, e := range entries {
+		if e.Key == "port" {
+			if !e.Overridden {
+				t.Error("Overridden = false, want true (file overrides default)")
+			}
+			if e.Source != SourceFile {
+				t.Errorf("Source = %q, want %q", e.Source, SourceFile)
+			}
+			return
+		}
+	}
+	t.Error("Export() missing port entry")
+}
+
+func TestExportSensitiveMasksDefaultValue(t *testing.T) {
+	loadEmpty(t)
+	SetDefault("jwt.secret", "super-secret")
+	MarkSensitive("jwt.secret")
+
+	entries := Export()
+	for _, e := range entries {
+		if e.Key == "jwt.secret" {
+			if e.Value != "***" {
+				t.Errorf("Value = %v, want ***", e.Value)
+			}
+			if e.DefaultValue != "***" {
+				t.Errorf("DefaultValue = %v, want *** (sensitive default masked)", e.DefaultValue)
+			}
+			return
+		}
+	}
+	t.Error("Export() missing jwt.secret entry")
+}
+
+func TestExportFileOnlyKeyNoDefault(t *testing.T) {
+	loadWithJSON(t, `{"custom.key": "value"}`)
+
+	entries := Export()
+	for _, e := range entries {
+		if e.Key == "custom.key" {
+			if e.DefaultValue != nil {
+				t.Errorf("DefaultValue = %v, want nil (no default registered)", e.DefaultValue)
+			}
+			if e.Overridden {
+				t.Error("Overridden = true, want false (no default to override)")
+			}
+			return
+		}
+	}
+	t.Error("Export() missing custom.key entry")
+}
+
+// ---------------------------------------------------------------------------
+// Diff
+// ---------------------------------------------------------------------------
+
+func TestDiffDetectsAdded(t *testing.T) {
+	before := []Entry{{Key: "a", Value: "1"}}
+	after := []Entry{{Key: "a", Value: "1"}, {Key: "b", Value: "2"}}
+
+	changes := Diff(before, after)
+	if len(changes) != 1 {
+		t.Fatalf("len(changes) = %d, want 1", len(changes))
+	}
+	if changes[0].Kind != "added" || changes[0].Key != "b" {
+		t.Errorf("change = %+v, want added b", changes[0])
+	}
+}
+
+func TestDiffDetectsRemoved(t *testing.T) {
+	before := []Entry{{Key: "a", Value: "1"}, {Key: "b", Value: "2"}}
+	after := []Entry{{Key: "a", Value: "1"}}
+
+	changes := Diff(before, after)
+	if len(changes) != 1 {
+		t.Fatalf("len(changes) = %d, want 1", len(changes))
+	}
+	if changes[0].Kind != "removed" || changes[0].Key != "b" {
+		t.Errorf("change = %+v, want removed b", changes[0])
+	}
+}
+
+func TestDiffDetectsChanged(t *testing.T) {
+	before := []Entry{{Key: "port", Value: 8080}}
+	after := []Entry{{Key: "port", Value: 9090}}
+
+	changes := Diff(before, after)
+	if len(changes) != 1 {
+		t.Fatalf("len(changes) = %d, want 1", len(changes))
+	}
+	c := changes[0]
+	if c.Kind != "changed" || c.Key != "port" {
+		t.Errorf("change = %+v, want changed port", c)
+	}
+	if fmt.Sprint(c.OldValue) != "8080" || fmt.Sprint(c.NewValue) != "9090" {
+		t.Errorf("values: old=%v new=%v, want 8080/9090", c.OldValue, c.NewValue)
+	}
+}
+
+func TestDiffNoDifferences(t *testing.T) {
+	snapshot := []Entry{{Key: "a", Value: "1"}, {Key: "b", Value: "2"}}
+	changes := Diff(snapshot, snapshot)
+	if len(changes) != 0 {
+		t.Errorf("len(changes) = %d, want 0 (identical snapshots)", len(changes))
+	}
+}
+
+func TestDiffSortedByKey(t *testing.T) {
+	before := []Entry{}
+	after := []Entry{{Key: "z", Value: "1"}, {Key: "a", Value: "2"}, {Key: "m", Value: "3"}}
+
+	changes := Diff(before, after)
+	if len(changes) != 3 {
+		t.Fatalf("len(changes) = %d, want 3", len(changes))
+	}
+	if changes[0].Key != "a" || changes[1].Key != "m" || changes[2].Key != "z" {
+		t.Errorf("changes not sorted: %s, %s, %s", changes[0].Key, changes[1].Key, changes[2].Key)
+	}
+}
+
+func TestDiffMixed(t *testing.T) {
+	before := []Entry{
+		{Key: "a", Value: "1"},
+		{Key: "b", Value: "2"},
+		{Key: "c", Value: "3"},
+	}
+	after := []Entry{
+		{Key: "a", Value: "1"},  // unchanged
+		{Key: "b", Value: "99"}, // changed
+		{Key: "d", Value: "4"},  // added
+	}
+
+	changes := Diff(before, after)
+	if len(changes) != 3 {
+		t.Fatalf("len(changes) = %d, want 3", len(changes))
+	}
+	// Sorted: b (changed), c (removed), d (added)
+	if changes[0].Key != "b" || changes[0].Kind != "changed" {
+		t.Errorf("changes[0] = %+v, want changed b", changes[0])
+	}
+	if changes[1].Key != "c" || changes[1].Kind != "removed" {
+		t.Errorf("changes[1] = %+v, want removed c", changes[1])
+	}
+	if changes[2].Key != "d" || changes[2].Kind != "added" {
+		t.Errorf("changes[2] = %+v, want added d", changes[2])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Validate always freezes
+// ---------------------------------------------------------------------------
+
+func TestValidateFreezesWithNoRules(t *testing.T) {
+	loadEmpty(t)
+	// No rules registered — Validate should still freeze.
+	Validate()
+	if !IsFrozen() {
+		t.Error("IsFrozen() = false after Validate() with no rules")
+	}
+}

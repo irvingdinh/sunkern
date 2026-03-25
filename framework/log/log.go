@@ -58,6 +58,11 @@ func Load() {
 		"log.sample.info":   0,
 	})
 
+	config.Describe("log.level", "Minimum log level for file output (DEBUG, INFO, WARN, ERROR)")
+	config.Describe("log.console.level", "Minimum log level for console output (inherits log.level if empty)")
+	config.Describe("log.sample.debug", "Sample 1-in-N DEBUG logs (0 = no sampling)")
+	config.Describe("log.sample.info", "Sample 1-in-N INFO logs (0 = no sampling)")
+
 	fileLevelStr := config.GetOr[string]("log.level", "INFO")
 	var fileLevel FileLevel
 	if err := parseLevel(&fileLevel.LevelVar, fileLevelStr); err != nil {
