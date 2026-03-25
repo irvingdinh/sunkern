@@ -1,10 +1,5 @@
 package container
 
-import (
-	"fmt"
-	"runtime"
-)
-
 // global is the package-level singleton container. All exported generic
 // functions operate on this instance. Call Reset to clear state between
 // tests — the same pattern as config.Load.
@@ -80,6 +75,12 @@ func DependencyGraph() map[string][]string {
 	return global.DependencyGraph()
 }
 
+// BuildAll eagerly resolves all pending providers in the global container.
+// See Container.BuildAll for details.
+func BuildAll() error {
+	return global.BuildAll()
+}
+
 // AppendHook adds a lifecycle hook to the global container.
 func AppendHook(h Hook) {
 	global.AppendHook(h)
@@ -120,17 +121,6 @@ func Global() *Container {
 //
 // it returns "external.go:15".
 func captureCallerOf() string {
-	// skip: 0=captureCallerOf, 1=facade (Provide/Supply/etc), 2=external caller
-	_, file, line, ok := runtime.Caller(2)
-	if !ok {
-		return "unknown"
-	}
-	// Shorten to filename only for readability.
-	for i := len(file) - 1; i >= 0; i-- {
-		if file[i] == '/' {
-			file = file[i+1:]
-			break
-		}
-	}
-	return fmt.Sprintf("%s:%d", file, line)
+	// skip=2: captureCallerOf → facade → external caller
+	return captureCallerAt(2)
 }

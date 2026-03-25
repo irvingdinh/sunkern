@@ -1,11 +1,30 @@
 package container
 
 import (
+	"errors"
 	"fmt"
 	"runtime"
 	"sort"
 	"strings"
 )
+
+// MakeFrom resolves type T from a specific container. This is the non-global
+// equivalent of Make — use it with isolated containers in tests.
+func MakeFrom[T any](c *Container) (T, error) {
+	return makeFromContainer[T](c)
+}
+
+// MustMakeFrom resolves type T from a specific container or panics. This is
+// the non-global equivalent of MustMake.
+func MustMakeFrom[T any](c *Container) T {
+	return mustMakeFromContainer[T](c)
+}
+
+// HasIn reports whether type T is registered in a specific container. This
+// is the non-global equivalent of Has.
+func HasIn[T any](c *Container) bool {
+	return hasInContainer[T](c)
+}
 
 // makeFromContainer resolves type T from the container. On first call the
 // provider runs and the result is cached; subsequent calls return the
@@ -52,6 +71,21 @@ func makeFromContainer[T any](c *Container) (T, error) {
 	}
 
 	// Slow path: first resolution — run provider.
+	if err := c.runProvider(svc, name); err != nil {
+		return zero, fmt.Errorf("container: creating %s: %w", name, err)
+	}
+
+	return svc.instance.(T), nil
+}
+
+// runProvider executes the provider for a service that has not yet been built.
+// The caller MUST hold svc.mu and MUST have verified svc.built == false.
+// On success, svc.instance and svc.built are set. On failure, svc.err and
+// svc.built are set (the provider is never retried).
+//
+// Dependencies are tracked: if this provider resolves other services via
+// Make/MustMake, those are recorded as direct dependencies of name.
+func (c *Container) runProvider(svc *service, name string) error {
 	gid := goID()
 	c.recordDep(gid, name)
 	c.pushResolve(gid, name)
@@ -73,13 +107,12 @@ func makeFromContainer[T any](c *Container) (T, error) {
 		// considered permanently failed — the app should restart to retry.
 		svc.err = err
 		svc.built = true
-		return zero, fmt.Errorf("container: creating %s: %w", name, err)
+		return err
 	}
 
 	svc.instance = instance
 	svc.built = true
-
-	return instance.(T), nil
+	return nil
 }
 
 // mustMakeFromContainer resolves type T or panics. Use inside providers
@@ -99,6 +132,72 @@ func hasInContainer[T any](c *Container) bool {
 	_, exists := c.services[name]
 	c.mu.RUnlock()
 	return exists
+}
+
+// buildByName resolves a service by its string name. Used by BuildAll where
+// the concrete Go type is not known at compile time. Applies circular
+// detection and dependency tracking identically to makeFromContainer.
+func (c *Container) buildByName(name string) error {
+	c.mu.RLock()
+	svc, exists := c.services[name]
+	c.mu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("container: service not found: %s", name)
+	}
+
+	if cycle := c.checkCircularIfResolving(name); cycle != "" {
+		panic(fmt.Sprintf("container: circular dependency: %s", cycle))
+	}
+
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
+
+	if svc.built {
+		if svc.err != nil {
+			return fmt.Errorf("container: creating %s: %w", name, svc.err)
+		}
+		c.recordDepIfResolving(name)
+		return nil
+	}
+
+	return c.runProvider(svc, name)
+}
+
+// BuildAll eagerly resolves all pending (unbuilt) providers in the container.
+// Services are built in alphabetical order by type name for deterministic
+// behavior. If a provider resolves other services internally (via Make or
+// MustMake), those are built on demand as usual — BuildAll simply ensures
+// nothing is left pending.
+//
+// Returns an error (via errors.Join) if any providers fail. Failed services
+// have their errors cached as usual — they are not retried on subsequent
+// Make calls. Services that were already built (including supplied values)
+// are skipped.
+//
+// Use BuildAll at the end of the boot phase to fail fast on provider errors
+// instead of discovering them lazily at first request time.
+func (c *Container) BuildAll() error {
+	c.mu.RLock()
+	var pending []string
+	for name, svc := range c.services {
+		svc.mu.Lock()
+		if !svc.built {
+			pending = append(pending, name)
+		}
+		svc.mu.Unlock()
+	}
+	c.mu.RUnlock()
+
+	sort.Strings(pending)
+
+	var errs []error
+	for _, name := range pending {
+		if err := c.buildByName(name); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // ---------------------------------------------------------------------------

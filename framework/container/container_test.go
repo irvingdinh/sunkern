@@ -1301,3 +1301,428 @@ func TestDependencyTrackingJSON(t *testing.T) {
 	}
 	t.Fatal("Svc not found in Inspect()")
 }
+
+// ---------------------------------------------------------------------------
+// Exported generic functions for *Container (ProvideTo, SupplyTo, etc.)
+// ---------------------------------------------------------------------------
+
+func TestProvideToAndMakeFrom(t *testing.T) {
+	c := New()
+
+	type Greeting struct{ Text string }
+
+	ProvideTo(c, func() (*Greeting, error) {
+		return &Greeting{Text: "hello"}, nil
+	})
+
+	got, err := MakeFrom[*Greeting](c)
+	if err != nil {
+		t.Fatalf("MakeFrom failed: %v", err)
+	}
+	if got.Text != "hello" {
+		t.Errorf("got %q, want %q", got.Text, "hello")
+	}
+}
+
+func TestSupplyToAndMakeFrom(t *testing.T) {
+	c := New()
+
+	type Config struct{ Port int }
+	cfg := &Config{Port: 8080}
+	SupplyTo(c, cfg)
+
+	got := MustMakeFrom[*Config](c)
+	if got != cfg {
+		t.Error("expected same pointer from SupplyTo")
+	}
+	if got.Port != 8080 {
+		t.Errorf("port = %d, want 8080", got.Port)
+	}
+}
+
+func TestHasIn(t *testing.T) {
+	c := New()
+
+	type Svc struct{}
+	if HasIn[*Svc](c) {
+		t.Error("HasIn should return false before registration")
+	}
+
+	SupplyTo(c, &Svc{})
+	if !HasIn[*Svc](c) {
+		t.Error("HasIn should return true after registration")
+	}
+}
+
+func TestOverrideIn(t *testing.T) {
+	c := New()
+
+	type Svc struct{ V int }
+	ProvideTo(c, func() (*Svc, error) {
+		return &Svc{V: 1}, nil
+	})
+
+	a := MustMakeFrom[*Svc](c)
+	if a.V != 1 {
+		t.Fatalf("got V=%d, want 1", a.V)
+	}
+
+	OverrideIn(c, func() (*Svc, error) {
+		return &Svc{V: 2}, nil
+	})
+
+	b := MustMakeFrom[*Svc](c)
+	if b.V != 2 {
+		t.Fatalf("after override V=%d, want 2", b.V)
+	}
+	if a == b {
+		t.Error("expected different instances after override")
+	}
+}
+
+func TestOverrideSupplyIn(t *testing.T) {
+	c := New()
+
+	type Svc struct{ V int }
+	ProvideTo(c, func() (*Svc, error) {
+		return &Svc{V: 1}, nil
+	})
+	_ = MustMakeFrom[*Svc](c)
+
+	replacement := &Svc{V: 99}
+	OverrideSupplyIn(c, replacement)
+
+	got := MustMakeFrom[*Svc](c)
+	if got != replacement {
+		t.Error("expected exact replacement pointer")
+	}
+}
+
+func TestIsolatedContainersDoNotInterfere(t *testing.T) {
+	c1 := New()
+	c2 := New()
+
+	type Svc struct{ ID string }
+	ProvideTo(c1, func() (*Svc, error) {
+		return &Svc{ID: "c1"}, nil
+	})
+	ProvideTo(c2, func() (*Svc, error) {
+		return &Svc{ID: "c2"}, nil
+	})
+
+	s1 := MustMakeFrom[*Svc](c1)
+	s2 := MustMakeFrom[*Svc](c2)
+
+	if s1.ID != "c1" || s2.ID != "c2" {
+		t.Errorf("containers interfered: s1=%q, s2=%q", s1.ID, s2.ID)
+	}
+}
+
+func TestMakeFromSingleton(t *testing.T) {
+	c := New()
+
+	var calls atomic.Int32
+	type Svc struct{ ID int }
+	ProvideTo(c, func() (*Svc, error) {
+		n := calls.Add(1)
+		return &Svc{ID: int(n)}, nil
+	})
+
+	a := MustMakeFrom[*Svc](c)
+	b := MustMakeFrom[*Svc](c)
+
+	if a != b {
+		t.Error("expected same instance (singleton)")
+	}
+	if calls.Load() != 1 {
+		t.Errorf("provider called %d times, want 1", calls.Load())
+	}
+}
+
+func TestMakeFromError(t *testing.T) {
+	c := New()
+
+	type Svc struct{}
+	_, err := MakeFrom[*Svc](c)
+	if err == nil {
+		t.Fatal("expected error for unregistered service")
+	}
+	if !strings.Contains(err.Error(), "service not found") {
+		t.Errorf("error = %q, want 'service not found' substring", err)
+	}
+}
+
+func TestMustMakeFromPanics(t *testing.T) {
+	c := New()
+	type Svc struct{}
+	mustPanic(t, "service not found", func() {
+		MustMakeFrom[*Svc](c)
+	})
+}
+
+func TestProvideToCircularDetection(t *testing.T) {
+	c := New()
+
+	type A struct{}
+	type B struct{}
+
+	ProvideTo(c, func() (*A, error) {
+		MustMakeFrom[*B](c)
+		return &A{}, nil
+	})
+	ProvideTo(c, func() (*B, error) {
+		MustMakeFrom[*A](c)
+		return &B{}, nil
+	})
+
+	mustPanic(t, "circular dependency", func() {
+		MustMakeFrom[*A](c)
+	})
+}
+
+func TestProvideToDuplicatePanics(t *testing.T) {
+	c := New()
+	type Svc struct{}
+	ProvideTo(c, func() (*Svc, error) { return &Svc{}, nil })
+	mustPanic(t, "duplicate provider", func() {
+		ProvideTo(c, func() (*Svc, error) { return &Svc{}, nil })
+	})
+}
+
+func TestContainerDependencyTracking(t *testing.T) {
+	c := New()
+
+	type DB struct{}
+	type Cache struct{}
+	type App struct{}
+
+	ProvideTo(c, func() (*DB, error) { return &DB{}, nil })
+	ProvideTo(c, func() (*Cache, error) { return &Cache{}, nil })
+	ProvideTo(c, func() (*App, error) {
+		MustMakeFrom[*DB](c)
+		MustMakeFrom[*Cache](c)
+		return &App{}, nil
+	})
+
+	_ = MustMakeFrom[*App](c)
+
+	graph := c.DependencyGraph()
+	appDeps, ok := graph["*container.App"]
+	if !ok {
+		t.Fatal("App not in dependency graph")
+	}
+	if len(appDeps) != 2 {
+		t.Fatalf("App has %d deps, want 2", len(appDeps))
+	}
+	if appDeps[0] != "*container.Cache" || appDeps[1] != "*container.DB" {
+		t.Errorf("deps = %v, want [*container.Cache, *container.DB]", appDeps)
+	}
+}
+
+func TestContainerConcurrentMakeFrom(t *testing.T) {
+	c := New()
+
+	var calls atomic.Int32
+	type Svc struct{ ID int }
+	ProvideTo(c, func() (*Svc, error) {
+		n := calls.Add(1)
+		return &Svc{ID: int(n)}, nil
+	})
+
+	var wg sync.WaitGroup
+	results := make([]*Svc, 100)
+	for i := range results {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			results[idx] = MustMakeFrom[*Svc](c)
+		}(i)
+	}
+	wg.Wait()
+
+	if calls.Load() != 1 {
+		t.Errorf("provider called %d times, want 1", calls.Load())
+	}
+	for i := 1; i < len(results); i++ {
+		if results[i] != results[0] {
+			t.Fatal("not all goroutines got the same singleton")
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// BuildAll
+// ---------------------------------------------------------------------------
+
+func TestBuildAllSuccess(t *testing.T) {
+	c := New()
+
+	var order []string
+	var mu sync.Mutex
+	record := func(name string) {
+		mu.Lock()
+		order = append(order, name)
+		mu.Unlock()
+	}
+
+	type A struct{}
+	type B struct{}
+	type C struct{}
+
+	ProvideTo(c, func() (*A, error) { record("A"); return &A{}, nil })
+	ProvideTo(c, func() (*B, error) { record("B"); return &B{}, nil })
+	ProvideTo(c, func() (*C, error) { record("C"); return &C{}, nil })
+
+	// Supply a pre-built value — should be skipped by BuildAll
+	type D struct{}
+	SupplyTo(c, &D{})
+
+	if err := c.BuildAll(); err != nil {
+		t.Fatalf("BuildAll failed: %v", err)
+	}
+
+	// All providers should have run
+	if len(order) != 3 {
+		t.Fatalf("expected 3 providers to run, got %d", len(order))
+	}
+
+	// Alphabetical order: *container.A, *container.B, *container.C
+	if order[0] != "A" || order[1] != "B" || order[2] != "C" {
+		t.Errorf("build order = %v, want [A B C]", order)
+	}
+
+	// All should now be built — MakeFrom returns cached instances
+	if _, err := MakeFrom[*A](c); err != nil {
+		t.Errorf("A not built: %v", err)
+	}
+	if _, err := MakeFrom[*B](c); err != nil {
+		t.Errorf("B not built: %v", err)
+	}
+	if _, err := MakeFrom[*C](c); err != nil {
+		t.Errorf("C not built: %v", err)
+	}
+}
+
+func TestBuildAllWithErrors(t *testing.T) {
+	c := New()
+
+	type Good struct{}
+	type Bad struct{}
+	type AlsoBad struct{}
+
+	ProvideTo(c, func() (*Good, error) { return &Good{}, nil })
+	ProvideTo(c, func() (*Bad, error) { return nil, errors.New("bad provider") })
+	ProvideTo(c, func() (*AlsoBad, error) { return nil, errors.New("also bad") })
+
+	err := c.BuildAll()
+	if err == nil {
+		t.Fatal("expected error from BuildAll")
+	}
+
+	// Both errors should be present (errors.Join)
+	errStr := err.Error()
+	if !strings.Contains(errStr, "bad provider") {
+		t.Errorf("error missing 'bad provider': %v", err)
+	}
+	if !strings.Contains(errStr, "also bad") {
+		t.Errorf("error missing 'also bad': %v", err)
+	}
+
+	// Good service should still be built successfully
+	if _, err := MakeFrom[*Good](c); err != nil {
+		t.Errorf("Good should be built: %v", err)
+	}
+
+	// Bad services return cached errors
+	if _, err := MakeFrom[*Bad](c); err == nil {
+		t.Error("Bad should return cached error")
+	}
+}
+
+func TestBuildAllNoPending(t *testing.T) {
+	c := New()
+
+	type Svc struct{}
+	SupplyTo(c, &Svc{})
+
+	if err := c.BuildAll(); err != nil {
+		t.Fatalf("BuildAll on all-supplied container: %v", err)
+	}
+}
+
+func TestBuildAllEmpty(t *testing.T) {
+	c := New()
+	if err := c.BuildAll(); err != nil {
+		t.Fatalf("BuildAll on empty container: %v", err)
+	}
+}
+
+func TestBuildAllWithDependencies(t *testing.T) {
+	c := New()
+
+	type DB struct{}
+	type Cache struct{}
+	type App struct{}
+
+	ProvideTo(c, func() (*DB, error) { return &DB{}, nil })
+	ProvideTo(c, func() (*Cache, error) { return &Cache{}, nil })
+	ProvideTo(c, func() (*App, error) {
+		MustMakeFrom[*DB](c)
+		MustMakeFrom[*Cache](c)
+		return &App{}, nil
+	})
+
+	if err := c.BuildAll(); err != nil {
+		t.Fatalf("BuildAll with deps: %v", err)
+	}
+
+	// Verify dependency graph was tracked
+	graph := c.DependencyGraph()
+	appDeps := graph["*container.App"]
+	if len(appDeps) != 2 {
+		t.Errorf("App deps = %v, want 2 entries", appDeps)
+	}
+}
+
+func TestBuildAllSkipsAlreadyBuilt(t *testing.T) {
+	c := New()
+
+	var calls atomic.Int32
+	type Svc struct{}
+	ProvideTo(c, func() (*Svc, error) {
+		calls.Add(1)
+		return &Svc{}, nil
+	})
+
+	// Build manually first
+	_ = MustMakeFrom[*Svc](c)
+	if calls.Load() != 1 {
+		t.Fatal("provider should have been called once")
+	}
+
+	// BuildAll should skip already-built
+	if err := c.BuildAll(); err != nil {
+		t.Fatalf("BuildAll: %v", err)
+	}
+	if calls.Load() != 1 {
+		t.Errorf("provider called %d times, want 1 (should skip built)", calls.Load())
+	}
+}
+
+func TestBuildAllGlobal(t *testing.T) {
+	resetContainer(t)
+
+	type Svc struct{ V int }
+	Provide(func() (*Svc, error) {
+		return &Svc{V: 42}, nil
+	})
+
+	if err := BuildAll(); err != nil {
+		t.Fatalf("global BuildAll: %v", err)
+	}
+
+	got := MustMake[*Svc]()
+	if got.V != 42 {
+		t.Errorf("V = %d, want 42", got.V)
+	}
+}

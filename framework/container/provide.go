@@ -1,6 +1,52 @@
 package container
 
-import "fmt"
+import (
+	"fmt"
+	"runtime"
+)
+
+// ProvideTo registers a lazy singleton provider for type T on a specific
+// container. This is the non-global equivalent of Provide — use it with
+// isolated containers in tests or when multiple containers are needed.
+func ProvideTo[T any](c *Container, provider func() (T, error)) {
+	provideToContainer[T](c, provider, captureCallerAt(1))
+}
+
+// SupplyTo registers a pre-built value for type T on a specific container.
+// This is the non-global equivalent of Supply.
+func SupplyTo[T any](c *Container, value T) {
+	supplyToContainer[T](c, value, captureCallerAt(1))
+}
+
+// OverrideIn replaces the registration for type T on a specific container
+// with a new lazy provider. This is the non-global equivalent of Override.
+func OverrideIn[T any](c *Container, provider func() (T, error)) {
+	overrideToContainer[T](c, provider, captureCallerAt(1))
+}
+
+// OverrideSupplyIn replaces the registration for type T on a specific
+// container with a pre-built value. This is the non-global equivalent of
+// OverrideSupply.
+func OverrideSupplyIn[T any](c *Container, value T) {
+	overrideSupplyToContainer[T](c, value, captureCallerAt(1))
+}
+
+// captureCallerAt returns the file:line of the caller at the given skip
+// depth above the caller of captureCallerAt itself. skip=1 means the
+// caller's caller (the typical exported→internal chain).
+func captureCallerAt(skip int) string {
+	_, file, line, ok := runtime.Caller(skip + 1)
+	if !ok {
+		return "unknown"
+	}
+	for i := len(file) - 1; i >= 0; i-- {
+		if file[i] == '/' {
+			file = file[i+1:]
+			break
+		}
+	}
+	return fmt.Sprintf("%s:%d", file, line)
+}
 
 // provideToContainer registers a lazy singleton provider for type T.
 // The provider is not called until the first Make or MustMake for T.
