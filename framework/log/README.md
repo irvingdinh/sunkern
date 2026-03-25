@@ -2,8 +2,7 @@
 
 ## Introduction
 
-The `framework/log` package provides process-wide structured logging for a
-Sunkern application.
+The `framework/log` package provides process-wide structured logging for a Sunkern application.
 
 It is responsible for:
 
@@ -11,7 +10,7 @@ It is responsible for:
 - writing every log entry to both console and file outputs
 - injecting `request_id` and `user_id` from `context.Context`
 - rotating file output daily under `{DATA_DIR}/logs`
-- exposing one shared runtime log level through the container
+- resolving one shared log level from config at boot
 
 The package is intentionally narrow. It is a write-only logging package. It
 does not own log querying, log browsing, log retention commands, sampling, or
@@ -24,10 +23,11 @@ Sunkern writes each log entry to two sinks:
 1. Console output
 2. File output
 
-Console output is pretty-printed JSON for human readability during local
-development.
+Console format depends on `log.format`. By default it writes compact
+single-line JSON suitable for log aggregators. Set `LOG_FORMAT=json-pretty`
+for 2-space indented JSON during local development.
 
-File output is compact JSONL for durable machine-readable logs.
+File output is always compact JSONL regardless of `log.format`.
 
 Both outputs contain the same structured fields. Only formatting differs.
 
@@ -36,14 +36,13 @@ Both outputs contain the same structured fields. Only formatting differs.
 Log files live under:
 
 ```text
-{DATA_DIR}/logs/
-  YYYY_MM_DD.log
+{DATA_DIR}/logs/YYYY_MM_DD.log
 ```
 
 For example:
 
 ```text
-/tmp/sunkern_data_xxx/logs/2026_03_25.log
+/.standalone/logs/2026_03_25.log
 ```
 
 The file rotates lazily on the first write after midnight.
@@ -59,8 +58,7 @@ Logging is initialized by calling `Load()`.
 3. creates the console and file handlers
 4. replaces the package-local writer state
 5. sets the global `slog` default logger
-6. supplies `*log.Level` into the container
-7. ensures a shutdown hook exists to close the writer
+6. ensures a shutdown hook exists to close the writer
 
 Application code normally does not call `Load()` directly. The framework boot
 sequence does that for you.
@@ -70,13 +68,13 @@ matching the mental model used by `framework/config`.
 
 ## Configuration
 
-The package uses one configuration key:
+| Key          | Env Var      | Default  | Description                                          |
+| ------------ | ------------ | -------- | ---------------------------------------------------- |
+| `log.level`  | `LOG_LEVEL`  | `"INFO"` | Shared minimum level for both console and file sinks |
+| `log.format` | `LOG_FORMAT` | `"json"` | Console output format: `json` (compact) or `json-pretty` (indented) |
 
-| Key | Env Var | Default | Description |
-|-----|---------|---------|-------------|
-| `log.level` | `LOG_LEVEL` | `"INFO"` | Shared minimum level for both console and file sinks |
-
-There is no separate console-only or file-only level.
+There is no separate console-only or file-only level. File output is always
+compact JSONL regardless of `log.format`.
 
 ## Log Levels
 
@@ -139,20 +137,6 @@ slog.ErrorContext(ctx, "order creation failed", "error", err)
 ```
 
 If you log without context, those fields are simply omitted.
-
-## Runtime Level Changes
-
-The shared log level is available through the container as `*log.Level`.
-
-Example:
-
-```go
-lv := container.MustMake[*log.Level]()
-lv.Set(slog.LevelDebug)
-```
-
-This updates both console and file logging because the package uses one shared
-level variable.
 
 ## Shutdown And Flushing
 

@@ -84,32 +84,29 @@ func TestLoadWithCustomLevel(t *testing.T) {
 	Load()
 	defer Close()
 
-	lv, err := container.Make[*Level]()
+	// ERROR level should suppress INFO messages — verify by checking the
+	// log file contains no INFO entry.
+	slog.Info("should be filtered")
+	slog.Error("should appear")
+	if err := Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	logsDir := filepath.Join(config.DataDir(), "logs")
+	entries, _ := filepath.Glob(filepath.Join(logsDir, "*.log"))
+	if len(entries) == 0 {
+		t.Fatal("expected at least one log file")
+	}
+
+	data, err := os.ReadFile(entries[0])
 	if err != nil {
-		t.Fatalf("resolve Level: %v", err)
+		t.Fatalf("reading log file: %v", err)
 	}
-	if lv.Level() != slog.LevelError {
-		t.Errorf("level = %v, want ERROR", lv.Level())
+	if strings.Contains(string(data), "should be filtered") {
+		t.Error("INFO message should have been filtered at ERROR level")
 	}
-}
-
-func TestLevelVarInContainer(t *testing.T) {
-	setup(t)
-
-	Load()
-	defer Close()
-
-	lv, err := container.Make[*Level]()
-	if err != nil {
-		t.Fatalf("resolve Level: %v", err)
-	}
-	if lv.Level() != slog.LevelInfo {
-		t.Errorf("initial level = %v, want INFO", lv.Level())
-	}
-
-	lv.Set(slog.LevelError)
-	if lv.Level() != slog.LevelError {
-		t.Errorf("changed level = %v, want ERROR", lv.Level())
+	if !strings.Contains(string(data), "should appear") {
+		t.Error("ERROR message should appear in log file")
 	}
 }
 
@@ -126,6 +123,39 @@ func TestLoadPanicsOnInvalidLogLevel(t *testing.T) {
 	Load()
 }
 
+func TestConsoleFormatJsonIsCompact(t *testing.T) {
+	setup(t)
+
+	// Default format is "json" — console should write compact single-line JSON.
+	// We test indirectly through the consoleWriter helper.
+	w := consoleWriter("json")
+	if _, ok := w.(*prettyWriter); ok {
+		t.Fatal("json format should not use prettyWriter")
+	}
+}
+
+func TestConsoleFormatJsonPrettyUsesIndent(t *testing.T) {
+	setup(t)
+
+	w := consoleWriter("json-pretty")
+	if _, ok := w.(*prettyWriter); !ok {
+		t.Fatal("json-pretty format should use prettyWriter")
+	}
+}
+
+func TestLoadPanicsOnInvalidFormat(t *testing.T) {
+	setup(t)
+	t.Setenv("LOG_FORMAT", "yaml")
+	config.Load()
+
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic for invalid LOG_FORMAT")
+		}
+	}()
+	Load()
+}
+
 func TestLoadReloadsWithoutReset(t *testing.T) {
 	setup(t)
 
@@ -136,12 +166,28 @@ func TestLoadReloadsWithoutReset(t *testing.T) {
 	Load()
 	defer Close()
 
-	lv, err := container.Make[*Level]()
-	if err != nil {
-		t.Fatalf("resolve Level: %v", err)
+	// After reload with ERROR level, INFO should be filtered.
+	slog.Info("filtered after reload")
+	slog.Error("visible after reload")
+	if err := Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
 	}
-	if lv.Level() != slog.LevelError {
-		t.Errorf("level after reload = %v, want ERROR", lv.Level())
+
+	logsDir := filepath.Join(config.DataDir(), "logs")
+	entries, _ := filepath.Glob(filepath.Join(logsDir, "*.log"))
+	if len(entries) == 0 {
+		t.Fatal("expected at least one log file")
+	}
+
+	data, err := os.ReadFile(entries[0])
+	if err != nil {
+		t.Fatalf("reading log file: %v", err)
+	}
+	if strings.Contains(string(data), "filtered after reload") {
+		t.Error("INFO message should have been filtered after reload to ERROR level")
+	}
+	if !strings.Contains(string(data), "visible after reload") {
+		t.Error("ERROR message should appear after reload")
 	}
 
 	logHooks := 0

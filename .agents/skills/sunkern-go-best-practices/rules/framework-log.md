@@ -34,11 +34,12 @@ contextHandler     -- injects request_id, user_id from context
 mergedHandler      -- fans out to both sinks
   |         |
   v         v
-console    file
-(pretty)   (compact JSONL)
+console              file
+(json or json-pretty)  (compact JSONL)
 ```
 
-**Console** (`os.Stdout`): Pretty JSON with 2-space indentation for humans.
+**Console** (`os.Stdout`): Compact JSON by default; set `LOG_FORMAT=json-pretty`
+for 2-space indented JSON during local development.
 
 **File** (`{DATA_DIR}/logs/YYYY_MM_DD.log`): Compact JSONL, one line per entry,
 rotated on first write after midnight.
@@ -61,8 +62,6 @@ log.Load()        // creates handlers, sets slog default
 log.Flush() error // flushes buffered file output
 log.Close() error // flushes and closes file writer
 
-// Runtime level handle.
-type Level struct{ slog.LevelVar }
 ```
 
 All logging is done through **stdlib `log/slog`**. Do not wrap or re-export
@@ -75,8 +74,10 @@ logging functions from this package.
 | Key | Env Var | Default | Description |
 |-----|---------|---------|-------------|
 | `log.level` | `LOG_LEVEL` | `"INFO"` | Shared minimum level for both console and file sinks |
+| `log.format` | `LOG_FORMAT` | `"json"` | Console output format: `json` (compact) or `json-pretty` (indented) |
 
-There is no separate `log.console.level`.
+There is no separate `log.console.level`. File output is always compact JSONL
+regardless of `log.format`.
 
 ---
 
@@ -110,13 +111,6 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 ctx := log.WithRequestID(r.Context(), requestID)
 ctx = log.WithUserID(ctx, userID)
 r = r.WithContext(ctx)
-```
-
-**Changing the shared level at runtime:**
-
-```go
-lv := container.MustMake[*log.Level]()
-lv.Set(slog.LevelDebug)
 ```
 
 ---

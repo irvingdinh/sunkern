@@ -3,6 +3,7 @@ package log
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -12,10 +13,6 @@ import (
 	"sunkern.local/framework/config"
 	"sunkern.local/framework/container"
 )
-
-// Level wraps [slog.LevelVar] for the process-global logger. Resolve it from
-// the container to inspect or change the shared log level at runtime.
-type Level struct{ slog.LevelVar }
 
 type state struct {
 	mu     sync.Mutex
@@ -27,11 +24,14 @@ var global state
 // Load creates the dual-output structured logger and sets it as the slog
 // default. It must be called after [config.Load].
 //
-// One log level controls both sinks:
+// Configuration keys:
 //
-//   - "log.level" (env LOG_LEVEL) — minimum level for both sinks
-//     (default "INFO"). Console output is pretty-printed JSON for readability.
-//     File output is compact JSONL for machine consumption.
+//   - "log.level" (env LOG_LEVEL, default "INFO") — minimum level for both
+//     console and file sinks.
+//   - "log.format" (env LOG_FORMAT, default "json") — console output format.
+//     "json" writes compact single-line JSON (production-friendly).
+//     "json-pretty" writes 2-space indented JSON (development-friendly).
+//     File output is always compact JSONL regardless of this setting.
 //
 // Both sinks include source location and produce the same JSON structure; only
 // formatting differs. On invalid config the function panics.
@@ -42,15 +42,17 @@ var global state
 // the file writer during graceful shutdown.
 func Load() {
 	config.SetDefault("log.level", "INFO")
+	config.SetDefault("log.format", "json")
 
 	levelStr := config.GetOr[string]("log.level", "INFO")
-	var level Level
-	if err := parseLevel(&level.LevelVar, levelStr); err != nil {
+	var level slog.LevelVar
+	if err := parseLevel(&level, levelStr); err != nil {
 		panic(fmt.Sprintf("log: %v", err))
 	}
 
-	consoleHandler := slog.NewJSONHandler(&prettyWriter{out: os.Stdout}, &slog.HandlerOptions{
-		Level:     &level.LevelVar,
+	consoleOut := consoleWriter(config.GetOr[string]("log.format", "json"))
+	consoleHandler := slog.NewJSONHandler(consoleOut, &slog.HandlerOptions{
+		Level:     &level,
 		AddSource: true,
 	})
 
@@ -65,14 +67,13 @@ func Load() {
 	}
 
 	fileHandler := slog.NewJSONHandler(writer, &slog.HandlerOptions{
-		Level:     &level.LevelVar,
+		Level:     &level,
 		AddSource: true,
 	})
 
 	root := newContextHandler(newMergedHandler(consoleHandler, fileHandler))
 	slog.SetDefault(slog.New(root))
 
-	container.OverrideSupply[*Level](&level)
 	ensureHook()
 }
 
@@ -126,6 +127,19 @@ func ensureHook() {
 			return Close()
 		},
 	})
+}
+
+// consoleWriter returns the io.Writer for the console sink based on the
+// configured format. Panics on unrecognized values.
+func consoleWriter(format string) io.Writer {
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "json":
+		return os.Stdout
+	case "json-pretty":
+		return &prettyWriter{out: os.Stdout}
+	default:
+		panic(fmt.Sprintf("log: unknown format %q (expected \"json\" or \"json-pretty\")", format))
+	}
 }
 
 // parseLevel sets lv from a string like "DEBUG", "INFO", "WARN", "ERROR".
