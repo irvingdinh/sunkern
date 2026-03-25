@@ -68,9 +68,11 @@ Reference these guidelines when:
 - `log-structured-attrs` - Use key-value pairs or slog.Attr, never string interpolation in messages
 - `log-level-semantics` - DEBUG=trace, INFO=normal ops, WARN=degraded, ERROR=needs attention
 - `log-dual-output` - Console: pretty JSON (2-space indent); File: compact JSONL. Both have source location and identical structure
+- `log-single-level` - Use one shared `log.level` for both console and file output; do not invent split sink levels
 - `log-request-id` - log.WithRequestID(ctx, id) stores ID; contextHandler auto-injects into all logs
 - `log-user-id` - log.WithUserID(ctx, id) stores ID; auto-injected same as request_id
-- `log-dynamic-level` - Resolve *slog.LevelVar from container to change level at runtime
+- `log-dynamic-level` - Resolve `*log.Level` from the container to change the shared level at runtime
+- `log-write-only-surface` - Keep `framework/log` write-only; do not add query, file-management, sampling, or admin APIs
 
 ## How to Use
 

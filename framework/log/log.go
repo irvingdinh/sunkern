@@ -3,7 +3,6 @@ package log
 import (
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -14,16 +13,9 @@ import (
 	"sunkern.local/framework/container"
 )
 
-
-// ConsoleLevel wraps [slog.LevelVar] for the console (stdout) output sink.
-// Resolve it from the container to inspect or change the console log level at
-// runtime without restarting the application.
-type ConsoleLevel struct{ slog.LevelVar }
-
-// FileLevel wraps [slog.LevelVar] for the file (JSONL) output sink. Resolve
-// it from the container to inspect or change the file log level at runtime
-// without restarting the application.
-type FileLevel struct{ slog.LevelVar }
+// Level wraps [slog.LevelVar] for the process-global logger. Resolve it from
+// the container to inspect or change the shared log level at runtime.
+type Level struct{ slog.LevelVar }
 
 type state struct {
 	mu     sync.Mutex
@@ -35,46 +27,30 @@ var global state
 // Load creates the dual-output structured logger and sets it as the slog
 // default. It must be called after [config.Load].
 //
-// Two independent log levels control output verbosity:
+// One log level controls both sinks:
 //
-//   - "log.level" (env LOG_LEVEL) — minimum level for the file sink
-//     (default "INFO"). File output is compact JSONL for machine consumption.
-//   - "log.console.level" (env LOG_CONSOLE_LEVEL) — minimum level for the
-//     console sink. Defaults to the value of "log.level" when not set
-//     explicitly. Console output is pretty-printed JSON for readability.
+//   - "log.level" (env LOG_LEVEL) — minimum level for both sinks
+//     (default "INFO"). Console output is pretty-printed JSON for readability.
+//     File output is compact JSONL for machine consumption.
 //
-// Both sinks include source location and produce identical JSON structure;
-// only formatting and level filtering differ. On invalid config the function
-// panics (same spirit as [config.Load]).
+// Both sinks include source location and produce the same JSON structure; only
+// formatting differs. On invalid config the function panics.
 //
-// The two levels are supplied to the container as [*ConsoleLevel] and
-// [*FileLevel] for runtime adjustment. A shutdown hook is registered to
-// flush and close the file writer during graceful shutdown.
+// Application boot calls Load once. Tests may call Load again after reloading
+// config to replace the package-local logger state, matching the model used by
+// [config.Load]. The shutdown hook is registered once per container and closes
+// the file writer during graceful shutdown.
 func Load() {
-	config.SetDefaults(config.Values{
-		"log.level":         "INFO",
-		"log.console.level": "",
-		"log.sample.debug":  0,
-		"log.sample.info":   0,
-	})
+	config.SetDefault("log.level", "INFO")
 
-	fileLevelStr := config.GetOr[string]("log.level", "INFO")
-	var fileLevel FileLevel
-	if err := parseLevel(&fileLevel.LevelVar, fileLevelStr); err != nil {
-		panic(fmt.Sprintf("log: %v", err))
-	}
-
-	consoleLevelStr := config.GetOr[string]("log.console.level", "")
-	if consoleLevelStr == "" {
-		consoleLevelStr = fileLevelStr // inherit from log.level when not set
-	}
-	var consoleLevel ConsoleLevel
-	if err := parseLevel(&consoleLevel.LevelVar, consoleLevelStr); err != nil {
+	levelStr := config.GetOr[string]("log.level", "INFO")
+	var level Level
+	if err := parseLevel(&level.LevelVar, levelStr); err != nil {
 		panic(fmt.Sprintf("log: %v", err))
 	}
 
 	consoleHandler := slog.NewJSONHandler(&prettyWriter{out: os.Stdout}, &slog.HandlerOptions{
-		Level:     &consoleLevel.LevelVar,
+		Level:     &level.LevelVar,
 		AddSource: true,
 	})
 
@@ -83,48 +59,31 @@ func Load() {
 		panic(fmt.Sprintf("log: creating logs directory: %v", err))
 	}
 
-	global.mu.Lock()
-	global.writer = newDailyFileWriter(logsDir)
-	global.mu.Unlock()
+	writer := newDailyFileWriter(logsDir)
+	if prev := swapWriter(writer); prev != nil {
+		_ = prev.Close()
+	}
 
-	fileHandler := slog.NewJSONHandler(global.writer, &slog.HandlerOptions{
-		Level:     &fileLevel.LevelVar,
+	fileHandler := slog.NewJSONHandler(writer, &slog.HandlerOptions{
+		Level:     &level.LevelVar,
 		AddSource: true,
 	})
 
-	merged := newMergedHandler(consoleHandler, fileHandler)
-
-	// Apply per-level sampling when configured. Sampling drops a fraction
-	// of DEBUG/INFO records before they reach either sink, reducing log
-	// volume on high-traffic paths without losing WARN/ERROR visibility.
-	rate := SamplingRate{
-		Debug: config.GetOr[int]("log.sample.debug", 0),
-		Info:  config.GetOr[int]("log.sample.info", 0),
-	}
-	sampled := newSamplingHandler(merged, rate)
-
-	root := newContextHandler(sampled)
+	root := newContextHandler(newMergedHandler(consoleHandler, fileHandler))
 	slog.SetDefault(slog.New(root))
 
-	container.Supply[*ConsoleLevel](&consoleLevel)
-	container.Supply[*FileLevel](&fileLevel)
-
-	container.AppendHook(container.Hook{
-		Name: "log",
-		OnStop: func(_ context.Context) error {
-			return Close()
-		},
-	})
+	container.OverrideSupply[*Level](&level)
+	ensureHook()
 }
 
-// Flush writes any buffered log data to the underlying file. Use this before
-// querying recent log entries to ensure they are visible on disk. Safe to call
+// Flush writes any buffered log data to the underlying file. Safe to call
 // concurrently; returns nil when no writer is active.
 func Flush() error {
 	global.mu.Lock()
-	defer global.mu.Unlock()
-	if global.writer != nil {
-		return global.writer.Flush()
+	writer := global.writer
+	global.mu.Unlock()
+	if writer != nil {
+		return writer.Flush()
 	}
 	return nil
 }
@@ -134,45 +93,40 @@ func Flush() error {
 // cleanup in the boot sequence.
 func Close() error {
 	global.mu.Lock()
-	defer global.mu.Unlock()
-	if global.writer != nil {
-		return global.writer.Close()
+	writer := global.writer
+	global.writer = nil
+	global.mu.Unlock()
+	if writer != nil {
+		return writer.Close()
 	}
 	return nil
-}
-
-// OnRotate registers a callback that fires asynchronously when the daily log
-// file rotates to a new date. The callback receives the previous date and the
-// new date (format "2006_01_02"). Use this for operational automation such as
-// compressing old log files or uploading them to external storage.
-//
-// Callbacks are non-blocking — they run in a separate goroutine and must not
-// assume the logging pipeline is paused. Must be called after [Load].
-func OnRotate(fn RotateFunc) {
-	global.mu.Lock()
-	defer global.mu.Unlock()
-	if global.writer != nil {
-		global.writer.mu.Lock()
-		global.writer.onRotate = append(global.writer.onRotate, fn)
-		global.writer.mu.Unlock()
-	}
-}
-
-// Reset closes the file writer and sets the slog default to a discard
-// handler. Intended for tests to get clean state between test cases.
-func Reset() {
-	global.mu.Lock()
-	if global.writer != nil {
-		_ = global.writer.Close()
-		global.writer = nil
-	}
-	global.mu.Unlock()
-	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 // ---------------------------------------------------------------------------
 // Internal
 // ---------------------------------------------------------------------------
+
+func swapWriter(next *dailyFileWriter) *dailyFileWriter {
+	global.mu.Lock()
+	prev := global.writer
+	global.writer = next
+	global.mu.Unlock()
+	return prev
+}
+
+func ensureHook() {
+	for _, h := range container.Global().Hooks() {
+		if h.Name == "log" {
+			return
+		}
+	}
+	container.AppendHook(container.Hook{
+		Name: "log",
+		OnStop: func(_ context.Context) error {
+			return Close()
+		},
+	})
+}
 
 // parseLevel sets lv from a string like "DEBUG", "INFO", "WARN", "ERROR".
 func parseLevel(lv *slog.LevelVar, s string) error {

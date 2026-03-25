@@ -273,11 +273,6 @@ func Close() error {
 	return errors.Join(writeErr, readErr)
 }
 
-// Reset closes the database and clears the global state. Intended for tests.
-func Reset() {
-	_ = Close()
-}
-
 // GetPragma reads the current value of a PRAGMA from the database. Uses the
 // read pool. The returned value is the native type from SQLite (int64 for
 // integers, string for text).

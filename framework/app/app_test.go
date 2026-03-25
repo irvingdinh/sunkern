@@ -10,7 +10,6 @@ import (
 	"testing"
 
 	"sunkern.local/framework/container"
-	sunkernlog "sunkern.local/framework/log"
 )
 
 // ---------------------------------------------------------------------------
@@ -123,7 +122,6 @@ func newTestApp(t *testing.T) *App {
 	t.Setenv("DATA_DIR", t.TempDir())
 	t.Setenv("HTTP_ADDR", ":0") // random port to avoid conflicts between tests
 	container.Reset()
-	sunkernlog.Reset()
 	a := New()
 	a.signalCtxFunc = func() (context.Context, context.CancelFunc) {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -950,7 +948,7 @@ type testModuleWithTagsAndDeps struct {
 }
 
 func (m *testModuleWithTagsAndDeps) Tags() []string      { return m.tags }
-func (m *testModuleWithTagsAndDeps) DependsOn() []string  { return m.deps }
+func (m *testModuleWithTagsAndDeps) DependsOn() []string { return m.deps }
 
 func TestDuplicateModuleNames(t *testing.T) {
 	a := newTestApp(t)

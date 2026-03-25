@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"sunkern.local/framework/config"
+	"sunkern.local/framework/container"
 	sunkernlog "sunkern.local/framework/log"
 )
 
@@ -587,7 +589,11 @@ func TestCachedBodyWithoutMiddleware(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestMiddlewareChain(t *testing.T) {
-	sunkernlog.Reset() // discard handler for test
+	t.Setenv("DATA_DIR", t.TempDir())
+	container.Reset()
+	config.Load()
+	sunkernlog.Load()
+	defer sunkernlog.Close()
 
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Verify request ID is in context (set by RequestID middleware).

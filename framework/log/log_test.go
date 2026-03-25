@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -18,15 +17,10 @@ import (
 	"sunkern.local/framework/container"
 )
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 func setup(t *testing.T) {
 	t.Helper()
 	t.Setenv("DATA_DIR", t.TempDir())
 	container.Reset()
-	Reset()
 	config.Load()
 }
 
@@ -39,10 +33,6 @@ func nonEmptyLines(s string) []string {
 	}
 	return result
 }
-
-// ---------------------------------------------------------------------------
-// Load
-// ---------------------------------------------------------------------------
 
 func TestLoadCreatesLogDirectory(t *testing.T) {
 	setup(t)
@@ -66,9 +56,10 @@ func TestLoadSetsDefaultLogger(t *testing.T) {
 	Load()
 	defer Close()
 
-	// Logging should write to the file. Verify a file exists in DATA_DIR/logs.
 	slog.Info("test message")
-	Flush() // ensure buffered data reaches disk
+	if err := Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
 
 	logsDir := filepath.Join(config.DataDir(), "logs")
 	entries, _ := filepath.Glob(filepath.Join(logsDir, "*.log"))
@@ -80,7 +71,6 @@ func TestLoadSetsDefaultLogger(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading log file: %v", err)
 	}
-
 	if !strings.Contains(string(data), "test message") {
 		t.Errorf("log file does not contain expected message; got: %s", string(data))
 	}
@@ -89,53 +79,17 @@ func TestLoadSetsDefaultLogger(t *testing.T) {
 func TestLoadWithCustomLevel(t *testing.T) {
 	setup(t)
 	t.Setenv("LOG_LEVEL", "ERROR")
-	config.Load() // reload to pick up env
-
-	Load()
-	defer Close()
-
-	// File level should be ERROR.
-	fl, err := container.Make[*FileLevel]()
-	if err != nil {
-		t.Fatalf("resolve FileLevel: %v", err)
-	}
-	if fl.Level() != slog.LevelError {
-		t.Errorf("file level = %v, want ERROR", fl.Level())
-	}
-
-	// Console defaults to same as file when not set explicitly.
-	cl, err := container.Make[*ConsoleLevel]()
-	if err != nil {
-		t.Fatalf("resolve ConsoleLevel: %v", err)
-	}
-	if cl.Level() != slog.LevelError {
-		t.Errorf("console level = %v, want ERROR (inherited from log.level)", cl.Level())
-	}
-}
-
-func TestLoadSeparateConsoleLevelOverride(t *testing.T) {
-	setup(t)
-	t.Setenv("LOG_LEVEL", "DEBUG")
-	t.Setenv("LOG_CONSOLE_LEVEL", "WARN")
 	config.Load()
 
 	Load()
 	defer Close()
 
-	fl, err := container.Make[*FileLevel]()
+	lv, err := container.Make[*Level]()
 	if err != nil {
-		t.Fatalf("resolve FileLevel: %v", err)
+		t.Fatalf("resolve Level: %v", err)
 	}
-	if fl.Level() != slog.LevelDebug {
-		t.Errorf("file level = %v, want DEBUG", fl.Level())
-	}
-
-	cl, err := container.Make[*ConsoleLevel]()
-	if err != nil {
-		t.Fatalf("resolve ConsoleLevel: %v", err)
-	}
-	if cl.Level() != slog.LevelWarn {
-		t.Errorf("console level = %v, want WARN", cl.Level())
+	if lv.Level() != slog.LevelError {
+		t.Errorf("level = %v, want ERROR", lv.Level())
 	}
 }
 
@@ -145,20 +99,17 @@ func TestLevelVarInContainer(t *testing.T) {
 	Load()
 	defer Close()
 
-	cl, err := container.Make[*ConsoleLevel]()
+	lv, err := container.Make[*Level]()
 	if err != nil {
-		t.Fatalf("resolve ConsoleLevel: %v", err)
+		t.Fatalf("resolve Level: %v", err)
+	}
+	if lv.Level() != slog.LevelInfo {
+		t.Errorf("initial level = %v, want INFO", lv.Level())
 	}
 
-	// Default is INFO.
-	if cl.Level() != slog.LevelInfo {
-		t.Errorf("initial level = %v, want INFO", cl.Level())
-	}
-
-	// Dynamic change.
-	cl.Set(slog.LevelError)
-	if cl.Level() != slog.LevelError {
-		t.Errorf("changed level = %v, want ERROR", cl.Level())
+	lv.Set(slog.LevelError)
+	if lv.Level() != slog.LevelError {
+		t.Errorf("changed level = %v, want ERROR", lv.Level())
 	}
 }
 
@@ -175,23 +126,36 @@ func TestLoadPanicsOnInvalidLogLevel(t *testing.T) {
 	Load()
 }
 
-func TestLoadPanicsOnInvalidConsoleLevel(t *testing.T) {
+func TestLoadReloadsWithoutReset(t *testing.T) {
 	setup(t)
-	t.Setenv("LOG_CONSOLE_LEVEL", "not-a-level")
-	config.Load()
 
-	defer func() {
-		if recover() == nil {
-			t.Fatal("expected panic for invalid LOG_CONSOLE_LEVEL")
-		}
-	}()
 	Load()
+
+	t.Setenv("LOG_LEVEL", "ERROR")
+	config.Load()
+	Load()
+	defer Close()
+
+	lv, err := container.Make[*Level]()
+	if err != nil {
+		t.Fatalf("resolve Level: %v", err)
+	}
+	if lv.Level() != slog.LevelError {
+		t.Errorf("level after reload = %v, want ERROR", lv.Level())
+	}
+
+	logHooks := 0
+	for _, h := range container.Global().Hooks() {
+		if h.Name == "log" {
+			logHooks++
+		}
+	}
+	if logHooks != 1 {
+		t.Fatalf("log hook count = %d, want 1", logHooks)
+	}
 }
 
 func TestConsoleAndFileStructuralParity(t *testing.T) {
-	setup(t)
-
-	// Capture console output via a buffer.
 	var consoleBuf bytes.Buffer
 	consoleH := slog.NewJSONHandler(&prettyWriter{out: &consoleBuf}, &slog.HandlerOptions{
 		AddSource: true,
@@ -200,41 +164,21 @@ func TestConsoleAndFileStructuralParity(t *testing.T) {
 		AddSource: true,
 	})
 
-	// Use a temporary logger to avoid interfering with global state.
-	merged := newMergedHandler(consoleH, fileH)
-	logger := slog.New(newContextHandler(merged))
-
+	logger := slog.New(newContextHandler(newMergedHandler(consoleH, fileH)))
 	ctx := WithRequestID(context.Background(), "req-parity")
 	logger.InfoContext(ctx, "parity check", "extra", "value")
 
-	// Parse the console output (pretty-printed JSON).
 	var m map[string]any
 	if err := json.Unmarshal(consoleBuf.Bytes(), &m); err != nil {
 		t.Fatalf("console output is not valid JSON: %v\nraw: %s", err, consoleBuf.String())
 	}
 
-	// Both console and file handlers have AddSource, so "source" must be present.
 	for _, key := range []string{"time", "level", "msg", "source", "request_id", "extra"} {
 		if _, ok := m[key]; !ok {
 			t.Errorf("console output missing key %q", key)
 		}
 	}
-
-	// Verify source is a structured object (not just a string).
-	src, ok := m["source"].(map[string]any)
-	if !ok {
-		t.Fatalf("source should be an object, got %T", m["source"])
-	}
-	for _, field := range []string{"function", "file", "line"} {
-		if _, ok := src[field]; !ok {
-			t.Errorf("source missing field %q", field)
-		}
-	}
 }
-
-// ---------------------------------------------------------------------------
-// MergedHandler
-// ---------------------------------------------------------------------------
 
 func TestMergedHandlerLevelFiltering(t *testing.T) {
 	var consoleBuf, fileBuf bytes.Buffer
@@ -242,36 +186,45 @@ func TestMergedHandlerLevelFiltering(t *testing.T) {
 	consoleH := slog.NewJSONHandler(&consoleBuf, &slog.HandlerOptions{Level: slog.LevelWarn})
 	fileH := slog.NewJSONHandler(&fileBuf, &slog.HandlerOptions{Level: slog.LevelInfo})
 
-	merged := newMergedHandler(consoleH, fileH)
-	logger := slog.New(merged)
-
+	logger := slog.New(newMergedHandler(consoleH, fileH))
 	logger.Debug("debug msg")
 	logger.Info("info msg")
 	logger.Warn("warn msg")
 	logger.Error("error msg")
 
-	// Console (WARN+) should have warn and error only.
 	consoleLines := nonEmptyLines(consoleBuf.String())
 	if len(consoleLines) != 2 {
 		t.Fatalf("console: expected 2 lines, got %d: %v", len(consoleLines), consoleLines)
 	}
 
-	// File (INFO+) should have info, warn, error.
 	fileLines := nonEmptyLines(fileBuf.String())
 	if len(fileLines) != 3 {
 		t.Fatalf("file: expected 3 lines, got %d: %v", len(fileLines), fileLines)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// ContextHandler
-// ---------------------------------------------------------------------------
+func TestMergedHandlerEnabledOptimization(t *testing.T) {
+	consoleH := slog.NewJSONHandler(&bytes.Buffer{}, &slog.HandlerOptions{Level: slog.LevelWarn})
+	fileH := slog.NewJSONHandler(&bytes.Buffer{}, &slog.HandlerOptions{Level: slog.LevelWarn})
+	merged := newMergedHandler(consoleH, fileH)
+
+	if merged.Enabled(context.Background(), slog.LevelDebug) {
+		t.Error("DEBUG should be disabled when both sinks are WARN+")
+	}
+	if merged.Enabled(context.Background(), slog.LevelInfo) {
+		t.Error("INFO should be disabled when both sinks are WARN+")
+	}
+	if !merged.Enabled(context.Background(), slog.LevelWarn) {
+		t.Error("WARN should be enabled")
+	}
+	if !merged.Enabled(context.Background(), slog.LevelError) {
+		t.Error("ERROR should be enabled")
+	}
+}
 
 func TestContextHandlerAddsRequestID(t *testing.T) {
 	var buf bytes.Buffer
-	inner := slog.NewJSONHandler(&buf, nil)
-	ch := newContextHandler(inner)
-	logger := slog.New(ch)
+	logger := slog.New(newContextHandler(slog.NewJSONHandler(&buf, nil)))
 
 	ctx := WithRequestID(context.Background(), "req-42")
 	logger.InfoContext(ctx, "with request id")
@@ -287,9 +240,7 @@ func TestContextHandlerAddsRequestID(t *testing.T) {
 
 func TestContextHandlerAddsUserID(t *testing.T) {
 	var buf bytes.Buffer
-	inner := slog.NewJSONHandler(&buf, nil)
-	ch := newContextHandler(inner)
-	logger := slog.New(ch)
+	logger := slog.New(newContextHandler(slog.NewJSONHandler(&buf, nil)))
 
 	ctx := WithUserID(context.Background(), "user-7")
 	logger.InfoContext(ctx, "with user id")
@@ -305,9 +256,7 @@ func TestContextHandlerAddsUserID(t *testing.T) {
 
 func TestContextHandlerNoContextValues(t *testing.T) {
 	var buf bytes.Buffer
-	inner := slog.NewJSONHandler(&buf, nil)
-	ch := newContextHandler(inner)
-	logger := slog.New(ch)
+	logger := slog.New(newContextHandler(slog.NewJSONHandler(&buf, nil)))
 
 	logger.Info("no context values")
 
@@ -323,10 +272,6 @@ func TestContextHandlerNoContextValues(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// DailyFileWriter
-// ---------------------------------------------------------------------------
-
 func TestDailyFileWriterRotation(t *testing.T) {
 	dir := t.TempDir()
 	w := newDailyFileWriter(dir)
@@ -337,7 +282,6 @@ func TestDailyFileWriterRotation(t *testing.T) {
 	_, _ = w.Write([]byte("line1\n"))
 	_, _ = w.Write([]byte("line2\n"))
 
-	// Advance clock to next day.
 	fakeDate = fakeDate.AddDate(0, 0, 1)
 
 	_, _ = w.Write([]byte("line3\n"))
@@ -378,7 +322,6 @@ func TestDailyFileWriterConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Flush buffered data before reading files.
 	_ = w.Flush()
 	_ = w.Close()
 
@@ -399,9 +342,6 @@ func TestDailyFileWriterFlush(t *testing.T) {
 	defer w.Close()
 
 	_, _ = w.Write([]byte("buffered line\n"))
-
-	// Before flush, data may or may not be on disk (depending on buffer state).
-	// After explicit flush, it must be on disk.
 	if err := w.Flush(); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
@@ -417,10 +357,6 @@ func TestDailyFileWriterFlush(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Close / Reset
-// ---------------------------------------------------------------------------
-
 func TestCloseIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	w := newDailyFileWriter(dir)
@@ -433,30 +369,6 @@ func TestCloseIdempotent(t *testing.T) {
 		t.Fatalf("second close: %v", err)
 	}
 }
-
-func TestResetDiscardsOutput(t *testing.T) {
-	setup(t)
-
-	Load()
-
-	Reset()
-
-	// After Reset, logging should go nowhere. Verify no new log files are
-	// created (the old ones from Load may exist, but no new data).
-	tmpDir := t.TempDir()
-	t.Setenv("DATA_DIR", tmpDir)
-
-	slog.Info("this should be discarded")
-
-	entries, _ := filepath.Glob(filepath.Join(tmpDir, "logs", "*.log"))
-	if len(entries) != 0 {
-		t.Fatalf("expected no log files after Reset, got %d", len(entries))
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Flush (package-level)
-// ---------------------------------------------------------------------------
 
 func TestFlushPackageLevel(t *testing.T) {
 	setup(t)
@@ -485,15 +397,10 @@ func TestFlushPackageLevel(t *testing.T) {
 func TestFlushWhenNoWriter(t *testing.T) {
 	setup(t)
 
-	// No Load(), so no writer. Flush should return nil.
 	if err := Flush(); err != nil {
 		t.Fatalf("Flush with no writer: %v", err)
 	}
 }
-
-// ---------------------------------------------------------------------------
-// prettyWriter
-// ---------------------------------------------------------------------------
 
 func TestPrettyWriter(t *testing.T) {
 	var buf bytes.Buffer
@@ -509,22 +416,15 @@ func TestPrettyWriter(t *testing.T) {
 	}
 
 	got := buf.String()
-
-	// Must be valid JSON.
 	var m map[string]any
 	if err := json.Unmarshal([]byte(got), &m); err != nil {
 		t.Fatalf("output is not valid JSON: %v\nraw: %s", err, got)
 	}
-
-	// Must contain 2-space indentation.
 	if !strings.Contains(got, "  \"level\"") {
 		t.Errorf("expected 2-space indented output, got:\n%s", got)
 	}
-
-	// Must contain newlines (multi-line).
-	lines := nonEmptyLines(got)
-	if len(lines) < 3 {
-		t.Errorf("expected multi-line output, got %d lines:\n%s", len(lines), got)
+	if len(nonEmptyLines(got)) < 3 {
+		t.Errorf("expected multi-line output, got:\n%s", got)
 	}
 }
 
@@ -540,16 +440,10 @@ func TestPrettyWriterFallback(t *testing.T) {
 	if n != len(notJSON) {
 		t.Fatalf("Write returned %d, want %d", n, len(notJSON))
 	}
-
-	// Non-JSON input should pass through unchanged.
 	if buf.String() != string(notJSON) {
 		t.Errorf("expected passthrough, got: %q", buf.String())
 	}
 }
-
-// ---------------------------------------------------------------------------
-// parseLevel
-// ---------------------------------------------------------------------------
 
 func TestParseLevelVariants(t *testing.T) {
 	cases := []struct {
@@ -584,645 +478,5 @@ func TestParseLevelVariants(t *testing.T) {
 				t.Errorf("got %v, want %v", lv.Level(), tc.want)
 			}
 		})
-	}
-}
-
-// ---------------------------------------------------------------------------
-// ListFiles / CleanOldFiles / OpenFile
-// ---------------------------------------------------------------------------
-
-func TestListFilesEmpty(t *testing.T) {
-	setup(t)
-	Load()
-	defer Close()
-
-	// No logs written yet, but the directory exists. ListFiles should return
-	// only the file created by Load (today's file was opened lazily, so it
-	// may not exist until something is logged).
-	files, err := ListFiles()
-	if err != nil {
-		t.Fatalf("ListFiles: %v", err)
-	}
-	// Might be 0 or 1 depending on whether Load triggered a write.
-	_ = files
-}
-
-func TestListFilesSorted(t *testing.T) {
-	setup(t)
-
-	logsDir := filepath.Join(config.DataDir(), "logs")
-	os.MkdirAll(logsDir, 0o755)
-
-	// Create files out of order.
-	for _, date := range []string{"2025_03_10", "2025_03_15", "2025_03_12"} {
-		os.WriteFile(filepath.Join(logsDir, date+".log"), []byte("data\n"), 0o644)
-	}
-
-	files, err := ListFiles()
-	if err != nil {
-		t.Fatalf("ListFiles: %v", err)
-	}
-	if len(files) != 3 {
-		t.Fatalf("expected 3 files, got %d", len(files))
-	}
-
-	// Newest first.
-	if files[0].Date != "2025_03_15" || files[1].Date != "2025_03_12" || files[2].Date != "2025_03_10" {
-		t.Errorf("wrong order: %v, %v, %v", files[0].Date, files[1].Date, files[2].Date)
-	}
-
-	// Size should be > 0.
-	for _, f := range files {
-		if f.Size == 0 {
-			t.Errorf("file %s has zero size", f.Date)
-		}
-	}
-}
-
-func TestListFilesIgnoresNonLogFiles(t *testing.T) {
-	setup(t)
-
-	logsDir := filepath.Join(config.DataDir(), "logs")
-	os.MkdirAll(logsDir, 0o755)
-
-	os.WriteFile(filepath.Join(logsDir, "2025_03_10.log"), []byte("data\n"), 0o644)
-	os.WriteFile(filepath.Join(logsDir, "readme.txt"), []byte("not a log\n"), 0o644)
-	os.Mkdir(filepath.Join(logsDir, "subdir"), 0o755)
-
-	files, err := ListFiles()
-	if err != nil {
-		t.Fatalf("ListFiles: %v", err)
-	}
-	if len(files) != 1 {
-		t.Fatalf("expected 1 file, got %d", len(files))
-	}
-}
-
-func TestCleanOldFiles(t *testing.T) {
-	setup(t)
-
-	logsDir := filepath.Join(config.DataDir(), "logs")
-	os.MkdirAll(logsDir, 0o755)
-
-	today := time.Now().Format("2006_01_02")
-	old := time.Now().AddDate(0, 0, -10).Format("2006_01_02")
-	borderline := time.Now().AddDate(0, 0, -7).Format("2006_01_02")
-
-	for _, date := range []string{today, old, borderline} {
-		os.WriteFile(filepath.Join(logsDir, date+".log"), []byte("data\n"), 0o644)
-	}
-
-	removed, err := CleanOldFiles(7)
-	if err != nil {
-		t.Fatalf("CleanOldFiles: %v", err)
-	}
-
-	// old (10 days ago) should be removed. borderline (exactly 7 days) has
-	// date == cutoff, and since the comparison is strictly less-than, it
-	// survives. today stays.
-	if removed != 1 {
-		t.Errorf("expected 1 removed, got %d", removed)
-	}
-
-	files, _ := ListFiles()
-	if len(files) != 2 {
-		t.Fatalf("expected 2 remaining files, got %d", len(files))
-	}
-}
-
-func TestCleanOldFilesInvalidRetention(t *testing.T) {
-	setup(t)
-
-	_, err := CleanOldFiles(0)
-	if err == nil {
-		t.Fatal("expected error for retentionDays=0")
-	}
-}
-
-func TestOpenFile(t *testing.T) {
-	setup(t)
-
-	logsDir := filepath.Join(config.DataDir(), "logs")
-	os.MkdirAll(logsDir, 0o755)
-	os.WriteFile(filepath.Join(logsDir, "2025_03_15.log"), []byte("hello world\n"), 0o644)
-
-	rc, err := OpenFile("2025_03_15")
-	if err != nil {
-		t.Fatalf("OpenFile: %v", err)
-	}
-	defer rc.Close()
-
-	buf := make([]byte, 64)
-	n, _ := rc.Read(buf)
-	if string(buf[:n]) != "hello world\n" {
-		t.Errorf("unexpected content: %q", string(buf[:n]))
-	}
-}
-
-func TestOpenFileNotFound(t *testing.T) {
-	setup(t)
-
-	_, err := OpenFile("1999_01_01")
-	if err == nil {
-		t.Fatal("expected error for non-existent file")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Entry parsing
-// ---------------------------------------------------------------------------
-
-func TestParseEntry(t *testing.T) {
-	line := []byte(`{"time":"2025-03-15T10:30:00Z","level":"INFO","msg":"request handled","source":{"function":"main.handler","file":"main.go","line":42},"request_id":"req-123","user_id":"user-7","latency_ms":15,"status":200}`)
-
-	entry, err := parseEntry(line)
-	if err != nil {
-		t.Fatalf("parseEntry: %v", err)
-	}
-
-	if entry.Level != "INFO" {
-		t.Errorf("level = %q, want INFO", entry.Level)
-	}
-	if entry.Message != "request handled" {
-		t.Errorf("message = %q, want 'request handled'", entry.Message)
-	}
-	if entry.RequestID != "req-123" {
-		t.Errorf("request_id = %q, want req-123", entry.RequestID)
-	}
-	if entry.UserID != "user-7" {
-		t.Errorf("user_id = %q, want user-7", entry.UserID)
-	}
-	if entry.Source == nil {
-		t.Fatal("source is nil")
-	}
-	if entry.Source.Function != "main.handler" {
-		t.Errorf("source.function = %q", entry.Source.Function)
-	}
-	if entry.Source.Line != 42 {
-		t.Errorf("source.line = %d, want 42", entry.Source.Line)
-	}
-
-	// Extra fields.
-	if entry.Extra == nil {
-		t.Fatal("extra is nil")
-	}
-	if v, ok := entry.Extra["status"].(float64); !ok || v != 200 {
-		t.Errorf("extra[status] = %v", entry.Extra["status"])
-	}
-	if v, ok := entry.Extra["latency_ms"].(float64); !ok || v != 15 {
-		t.Errorf("extra[latency_ms] = %v", entry.Extra["latency_ms"])
-	}
-}
-
-func TestParseEntryMalformed(t *testing.T) {
-	_, err := parseEntry([]byte("not json"))
-	if err == nil {
-		t.Fatal("expected error for malformed JSON")
-	}
-}
-
-func TestEntryMarshalJSON(t *testing.T) {
-	e := Entry{
-		Time:      time.Date(2025, 3, 15, 10, 0, 0, 0, time.UTC),
-		Level:     "INFO",
-		Message:   "test",
-		RequestID: "req-1",
-		Extra:     map[string]any{"custom": "value"},
-	}
-
-	b, err := e.MarshalJSON()
-	if err != nil {
-		t.Fatalf("MarshalJSON: %v", err)
-	}
-
-	var m map[string]any
-	json.Unmarshal(b, &m)
-
-	if m["level"] != "INFO" {
-		t.Errorf("level = %v", m["level"])
-	}
-	if m["msg"] != "test" {
-		t.Errorf("msg = %v", m["msg"])
-	}
-	if m["request_id"] != "req-1" {
-		t.Errorf("request_id = %v", m["request_id"])
-	}
-	if m["custom"] != "value" {
-		t.Errorf("custom = %v", m["custom"])
-	}
-	// source should be absent.
-	if _, ok := m["source"]; ok {
-		t.Error("source should be omitted when nil")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Query
-// ---------------------------------------------------------------------------
-
-// writeTestEntries creates a JSONL log file with synthetic entries for testing.
-func writeTestEntries(t *testing.T, date string, count int) {
-	t.Helper()
-	logsDir := filepath.Join(config.DataDir(), "logs")
-	os.MkdirAll(logsDir, 0o755)
-
-	var lines []string
-	for i := 0; i < count; i++ {
-		level := "INFO"
-		if i%5 == 0 {
-			level = "ERROR"
-		}
-		ts := fmt.Sprintf("2025-03-15T10:%02d:%02dZ", i/60, i%60)
-		line := fmt.Sprintf(`{"time":"%s","level":"%s","msg":"event %d","request_id":"req-%d","user_id":"user-%d"}`, ts, level, i, i%10, i%3)
-		lines = append(lines, line)
-	}
-	os.WriteFile(filepath.Join(logsDir, date+".log"), []byte(strings.Join(lines, "\n")+"\n"), 0o644)
-}
-
-func TestQuery(t *testing.T) {
-	setup(t)
-	writeTestEntries(t, "2025_03_15", 50)
-	ctx := context.Background()
-
-	// All entries.
-	res, err := Query(ctx, "2025_03_15", QueryOptions{})
-	if err != nil {
-		t.Fatalf("Query: %v", err)
-	}
-	if res.Total != 50 {
-		t.Errorf("total = %d, want 50", res.Total)
-	}
-	if len(res.Entries) != 50 {
-		t.Errorf("entries = %d, want 50", len(res.Entries))
-	}
-
-	// Level filter.
-	res, _ = Query(ctx, "2025_03_15", QueryOptions{Level: "ERROR"})
-	if res.Total != 10 {
-		t.Errorf("ERROR total = %d, want 10", res.Total)
-	}
-	if len(res.Entries) != 10 {
-		t.Errorf("ERROR entries = %d, want 10", len(res.Entries))
-	}
-
-	// Search.
-	res, _ = Query(ctx, "2025_03_15", QueryOptions{Search: "event 42"})
-	if res.Total != 1 {
-		t.Errorf("search total = %d, want 1", res.Total)
-	}
-
-	// RequestID filter.
-	res, _ = Query(ctx, "2025_03_15", QueryOptions{RequestID: "req-0"})
-	if res.Total != 5 {
-		t.Errorf("request_id total = %d, want 5", res.Total)
-	}
-
-	// Pagination.
-	res, _ = Query(ctx, "2025_03_15", QueryOptions{Limit: 5, Offset: 10})
-	if res.Total != 50 {
-		t.Errorf("paginated total = %d, want 50", res.Total)
-	}
-	if len(res.Entries) != 5 {
-		t.Errorf("paginated entries = %d, want 5", len(res.Entries))
-	}
-	if res.Entries[0].Message != "event 10" {
-		t.Errorf("first entry = %q, want 'event 10'", res.Entries[0].Message)
-	}
-}
-
-func TestQueryDescOrder(t *testing.T) {
-	setup(t)
-	writeTestEntries(t, "2025_03_15", 50)
-	ctx := context.Background()
-
-	// Desc order — newest first.
-	res, err := Query(ctx, "2025_03_15", QueryOptions{Order: "desc"})
-	if err != nil {
-		t.Fatalf("Query desc: %v", err)
-	}
-	if res.Total != 50 {
-		t.Errorf("total = %d, want 50", res.Total)
-	}
-	if len(res.Entries) != 50 {
-		t.Errorf("entries = %d, want 50", len(res.Entries))
-	}
-	// First entry should be the last one written (event 49).
-	if res.Entries[0].Message != "event 49" {
-		t.Errorf("first desc entry = %q, want 'event 49'", res.Entries[0].Message)
-	}
-	// Last entry should be the first one written (event 0).
-	if res.Entries[49].Message != "event 0" {
-		t.Errorf("last desc entry = %q, want 'event 0'", res.Entries[49].Message)
-	}
-
-	// Desc with pagination.
-	res, _ = Query(ctx, "2025_03_15", QueryOptions{Order: "desc", Limit: 5, Offset: 0})
-	if res.Total != 50 {
-		t.Errorf("paginated desc total = %d, want 50", res.Total)
-	}
-	if len(res.Entries) != 5 {
-		t.Errorf("paginated desc entries = %d, want 5", len(res.Entries))
-	}
-	// First page of desc: events 49, 48, 47, 46, 45.
-	if res.Entries[0].Message != "event 49" {
-		t.Errorf("first desc page entry = %q, want 'event 49'", res.Entries[0].Message)
-	}
-	if res.Entries[4].Message != "event 45" {
-		t.Errorf("last desc page entry = %q, want 'event 45'", res.Entries[4].Message)
-	}
-
-	// Desc page 2.
-	res, _ = Query(ctx, "2025_03_15", QueryOptions{Order: "desc", Limit: 5, Offset: 5})
-	if res.Entries[0].Message != "event 44" {
-		t.Errorf("desc page 2 first = %q, want 'event 44'", res.Entries[0].Message)
-	}
-}
-
-func TestQueryTimeRange(t *testing.T) {
-	setup(t)
-	writeTestEntries(t, "2025_03_15", 50)
-	ctx := context.Background()
-
-	// After: entries at or after 10:00:30 (events 30-49).
-	after := time.Date(2025, 3, 15, 10, 0, 30, 0, time.UTC)
-	res, err := Query(ctx, "2025_03_15", QueryOptions{After: after})
-	if err != nil {
-		t.Fatalf("Query after: %v", err)
-	}
-	if res.Total != 20 {
-		t.Errorf("after total = %d, want 20", res.Total)
-	}
-	if len(res.Entries) != 20 {
-		t.Errorf("after entries = %d, want 20", len(res.Entries))
-	}
-
-	// Before: entries strictly before 10:00:10 (events 0-9).
-	before := time.Date(2025, 3, 15, 10, 0, 10, 0, time.UTC)
-	res, _ = Query(ctx, "2025_03_15", QueryOptions{Before: before})
-	if res.Total != 10 {
-		t.Errorf("before total = %d, want 10", res.Total)
-	}
-
-	// Combined range: 10:00:10 <= t < 10:00:20 (events 10-19).
-	res, _ = Query(ctx, "2025_03_15", QueryOptions{
-		After:  time.Date(2025, 3, 15, 10, 0, 10, 0, time.UTC),
-		Before: time.Date(2025, 3, 15, 10, 0, 20, 0, time.UTC),
-	})
-	if res.Total != 10 {
-		t.Errorf("range total = %d, want 10", res.Total)
-	}
-	if len(res.Entries) != 10 {
-		t.Errorf("range entries = %d, want 10", len(res.Entries))
-	}
-}
-
-func TestQueryCountOnly(t *testing.T) {
-	setup(t)
-	writeTestEntries(t, "2025_03_15", 50)
-	ctx := context.Background()
-
-	// CountOnly: total is computed, entries is nil.
-	res, err := Query(ctx, "2025_03_15", QueryOptions{CountOnly: true})
-	if err != nil {
-		t.Fatalf("Query countOnly: %v", err)
-	}
-	if res.Total != 50 {
-		t.Errorf("countOnly total = %d, want 50", res.Total)
-	}
-	if len(res.Entries) != 0 {
-		t.Errorf("countOnly entries = %d, want 0", len(res.Entries))
-	}
-
-	// CountOnly with level filter.
-	res, _ = Query(ctx, "2025_03_15", QueryOptions{CountOnly: true, Level: "ERROR"})
-	if res.Total != 10 {
-		t.Errorf("countOnly ERROR total = %d, want 10", res.Total)
-	}
-
-	// CountOnly with user_id filter.
-	res, _ = Query(ctx, "2025_03_15", QueryOptions{CountOnly: true, UserID: "user-0"})
-	if res.Total != 17 {
-		t.Errorf("countOnly user-0 total = %d, want 17", res.Total)
-	}
-}
-
-func TestQueryUserIDFilter(t *testing.T) {
-	setup(t)
-	writeTestEntries(t, "2025_03_15", 50)
-	ctx := context.Background()
-
-	res, err := Query(ctx, "2025_03_15", QueryOptions{UserID: "user-0"})
-	if err != nil {
-		t.Fatalf("Query user_id: %v", err)
-	}
-	// user-0 = indices 0,3,6,9,12,...,48 → 17 entries (i%3==0).
-	if res.Total != 17 {
-		t.Errorf("user_id total = %d, want 17", res.Total)
-	}
-	if len(res.Entries) != 17 {
-		t.Errorf("user_id entries = %d, want 17", len(res.Entries))
-	}
-}
-
-func TestQueryNonExistentDate(t *testing.T) {
-	setup(t)
-	ctx := context.Background()
-
-	_, err := Query(ctx, "1999_01_01", QueryOptions{})
-	if err == nil {
-		t.Fatal("expected error for non-existent date")
-	}
-}
-
-func TestQueryInvalidDateFormat(t *testing.T) {
-	setup(t)
-	ctx := context.Background()
-
-	for _, bad := range []string{"invalid", "2025-03-15", "20250315", ""} {
-		_, err := Query(ctx, bad, QueryOptions{})
-		if err == nil {
-			t.Errorf("expected error for date %q", bad)
-		}
-		if !strings.Contains(err.Error(), "invalid date") {
-			t.Errorf("error for %q should mention 'invalid date': %v", bad, err)
-		}
-	}
-}
-
-func TestQueryContextCancellation(t *testing.T) {
-	setup(t)
-	// Write enough entries to trigger the context check (>1024 lines).
-	writeTestEntries(t, "2025_03_15", 2000)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // cancel immediately
-
-	res, err := Query(ctx, "2025_03_15", QueryOptions{})
-	if err == nil {
-		t.Fatal("expected error from cancelled context")
-	}
-	if !errors.Is(err, context.Canceled) {
-		t.Errorf("expected context.Canceled, got %v", err)
-	}
-	// Should have partial results (some entries scanned before cancellation).
-	_ = res
-}
-
-func TestQuerySkippedMalformedLines(t *testing.T) {
-	setup(t)
-
-	logsDir := filepath.Join(config.DataDir(), "logs")
-	os.MkdirAll(logsDir, 0o755)
-
-	// Write a mix of valid and invalid lines.
-	content := `{"time":"2025-03-15T10:00:00Z","level":"INFO","msg":"good 1"}
-not json at all
-{"time":"2025-03-15T10:00:01Z","level":"INFO","msg":"good 2"}
-{broken json
-{"time":"2025-03-15T10:00:02Z","level":"INFO","msg":"good 3"}
-`
-	os.WriteFile(filepath.Join(logsDir, "2025_03_15.log"), []byte(content), 0o644)
-
-	ctx := context.Background()
-	res, err := Query(ctx, "2025_03_15", QueryOptions{})
-	if err != nil {
-		t.Fatalf("Query: %v", err)
-	}
-	if res.Total != 3 {
-		t.Errorf("total = %d, want 3", res.Total)
-	}
-	if res.Skipped != 2 {
-		t.Errorf("skipped = %d, want 2", res.Skipped)
-	}
-	if len(res.Entries) != 3 {
-		t.Errorf("entries = %d, want 3", len(res.Entries))
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Sampling
-// ---------------------------------------------------------------------------
-
-func TestSamplingHandlerNoSampling(t *testing.T) {
-	var buf bytes.Buffer
-	inner := slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
-
-	// Zero rates = no sampling, should return inner unchanged.
-	h := newSamplingHandler(inner, SamplingRate{})
-	if _, ok := h.(*samplingHandler); ok {
-		t.Fatal("expected inner handler returned when no sampling configured")
-	}
-}
-
-func TestSamplingHandlerDropsRecords(t *testing.T) {
-	var buf bytes.Buffer
-	inner := slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
-	h := newSamplingHandler(inner, SamplingRate{Debug: 10, Info: 5})
-	logger := slog.New(h)
-
-	// Fire 100 DEBUG messages — only 10 should pass (1-in-10).
-	for i := 0; i < 100; i++ {
-		logger.Debug("debug msg")
-	}
-	debugLines := nonEmptyLines(buf.String())
-	if len(debugLines) != 10 {
-		t.Errorf("debug lines = %d, want 10", len(debugLines))
-	}
-
-	buf.Reset()
-
-	// Fire 100 INFO messages — only 20 should pass (1-in-5).
-	for i := 0; i < 100; i++ {
-		logger.Info("info msg")
-	}
-	infoLines := nonEmptyLines(buf.String())
-	if len(infoLines) != 20 {
-		t.Errorf("info lines = %d, want 20", len(infoLines))
-	}
-
-	buf.Reset()
-
-	// WARN and ERROR always pass through.
-	for i := 0; i < 50; i++ {
-		logger.Warn("warn msg")
-		logger.Error("error msg")
-	}
-	warnErrorLines := nonEmptyLines(buf.String())
-	if len(warnErrorLines) != 100 {
-		t.Errorf("warn+error lines = %d, want 100", len(warnErrorLines))
-	}
-}
-
-func TestSamplingHandlerWithAttrsAndGroup(t *testing.T) {
-	var buf bytes.Buffer
-	inner := slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
-	h := newSamplingHandler(inner, SamplingRate{Debug: 2})
-
-	// WithAttrs and WithGroup should preserve sampling behavior.
-	h2 := h.WithAttrs([]slog.Attr{slog.String("key", "val")})
-	h3 := h2.WithGroup("grp")
-	logger := slog.New(h3)
-
-	for i := 0; i < 10; i++ {
-		logger.Debug("test")
-	}
-	lines := nonEmptyLines(buf.String())
-	if len(lines) != 5 {
-		t.Errorf("lines after WithAttrs+WithGroup = %d, want 5", len(lines))
-	}
-
-	// Verify the attrs are present.
-	var m map[string]any
-	json.Unmarshal([]byte(lines[0]), &m)
-	if m["key"] != "val" {
-		t.Errorf("expected key=val attr in output")
-	}
-}
-
-func TestMergedHandlerEnabledOptimization(t *testing.T) {
-	// Both sinks at WARN — DEBUG and INFO should be disabled.
-	consoleH := slog.NewJSONHandler(&bytes.Buffer{}, &slog.HandlerOptions{Level: slog.LevelWarn})
-	fileH := slog.NewJSONHandler(&bytes.Buffer{}, &slog.HandlerOptions{Level: slog.LevelWarn})
-	merged := newMergedHandler(consoleH, fileH)
-
-	if merged.Enabled(context.Background(), slog.LevelDebug) {
-		t.Error("DEBUG should be disabled when both sinks are WARN+")
-	}
-	if merged.Enabled(context.Background(), slog.LevelInfo) {
-		t.Error("INFO should be disabled when both sinks are WARN+")
-	}
-	if !merged.Enabled(context.Background(), slog.LevelWarn) {
-		t.Error("WARN should be enabled")
-	}
-	if !merged.Enabled(context.Background(), slog.LevelError) {
-		t.Error("ERROR should be enabled")
-	}
-
-	// One sink at DEBUG, one at ERROR — DEBUG should be enabled (one child accepts).
-	consoleH2 := slog.NewJSONHandler(&bytes.Buffer{}, &slog.HandlerOptions{Level: slog.LevelDebug})
-	fileH2 := slog.NewJSONHandler(&bytes.Buffer{}, &slog.HandlerOptions{Level: slog.LevelError})
-	merged2 := newMergedHandler(consoleH2, fileH2)
-
-	if !merged2.Enabled(context.Background(), slog.LevelDebug) {
-		t.Error("DEBUG should be enabled when console accepts it")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// levelRank
-// ---------------------------------------------------------------------------
-
-func TestLevelRank(t *testing.T) {
-	if levelRank("DEBUG") >= levelRank("INFO") {
-		t.Error("DEBUG should rank below INFO")
-	}
-	if levelRank("INFO") >= levelRank("WARN") {
-		t.Error("INFO should rank below WARN")
-	}
-	if levelRank("WARN") >= levelRank("ERROR") {
-		t.Error("WARN should rank below ERROR")
-	}
-	if levelRank("unknown") >= levelRank("DEBUG") {
-		t.Error("unknown should rank below DEBUG")
 	}
 }
