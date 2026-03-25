@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -43,16 +44,45 @@ type MigrationStatus struct {
 	Orphaned      bool       `json:"orphaned,omitempty"`
 }
 
-// Engine manages schema migrations against a SQLite database.
+// BeforeEachFunc is called before each migration executes. Return a non-nil
+// error to abort the migration and the entire operation.
+type BeforeEachFunc func(ctx context.Context, m Migration, direction Direction) error
+
+// AfterEachFunc is called after each migration executes, with the elapsed
+// time and any error. Informational only — return value is not checked.
+type AfterEachFunc func(ctx context.Context, m Migration, direction Direction, elapsed time.Duration, err error)
+
+// Engine manages schema migrations against a SQLite database. All mutation
+// methods (Up, UpTo, Down, DownTo, Redo, DryRun) are serialized by an
+// internal mutex to prevent concurrent migration operations.
 type Engine struct {
 	db         *sql.DB
 	migrations []Migration
+	mu         sync.Mutex
+	beforeEach []BeforeEachFunc
+	afterEach  []AfterEachFunc
 }
 
 // NewEngine creates a migration engine that operates on the given database
 // connection. The connection should be the write pool (single-writer).
 func NewEngine(db *sql.DB) *Engine {
 	return &Engine{db: db}
+}
+
+// OnBeforeEach registers a callback that fires before each migration
+// executes. Multiple callbacks fire in registration order. If any callback
+// returns a non-nil error, the migration is skipped and the operation fails.
+// Must be called before Up/Down/UpTo/DownTo/Redo.
+func (e *Engine) OnBeforeEach(fn BeforeEachFunc) {
+	e.beforeEach = append(e.beforeEach, fn)
+}
+
+// OnAfterEach registers a callback that fires after each migration
+// executes, with the elapsed time and any error. Multiple callbacks fire
+// in registration order. Informational only.
+// Must be called before Up/Down/UpTo/DownTo/Redo.
+func (e *Engine) OnAfterEach(fn AfterEachFunc) {
+	e.afterEach = append(e.afterEach, fn)
 }
 
 // Collect reads migration files from one or more fs.FS sources, parses them,
@@ -119,6 +149,9 @@ func (e *Engine) Collect(sources ...fs.FS) error {
 // of applied migrations. Already-applied migrations with changed checksums
 // are logged as warnings.
 func (e *Engine) Up(ctx context.Context) (int, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	if err := e.ensureTable(ctx); err != nil {
 		return 0, err
 	}
@@ -146,16 +179,24 @@ func (e *Engine) Up(ctx context.Context) (int, error) {
 			continue
 		}
 
+		if err := e.fireBeforeEach(ctx, m, DirectionUp); err != nil {
+			return count, fmt.Errorf("before hook for %05d_%s: %w", m.Version, m.Name, err)
+		}
+
 		start := time.Now()
-		if err := e.applyUp(ctx, m); err != nil {
-			return count, fmt.Errorf("migration %05d_%s up: %w", m.Version, m.Name, err)
+		applyErr := e.applyUp(ctx, m)
+		elapsed := time.Since(start)
+		e.fireAfterEach(ctx, m, DirectionUp, elapsed, applyErr)
+
+		if applyErr != nil {
+			return count, fmt.Errorf("migration %05d_%s up: %w", m.Version, m.Name, applyErr)
 		}
 		count++
 		slog.Info("migration applied",
 			"version", m.Version,
 			"name", m.Name,
 			"direction", "up",
-			"duration", time.Since(start),
+			"duration", elapsed,
 		)
 	}
 
@@ -166,6 +207,9 @@ func (e *Engine) Up(ctx context.Context) (int, error) {
 // Returns the count of applied migrations. Already-applied migrations with
 // changed checksums are logged as warnings.
 func (e *Engine) UpTo(ctx context.Context, version int) (int, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	if err := e.ensureTable(ctx); err != nil {
 		return 0, err
 	}
@@ -195,16 +239,24 @@ func (e *Engine) UpTo(ctx context.Context, version int) (int, error) {
 			continue
 		}
 
+		if err := e.fireBeforeEach(ctx, m, DirectionUp); err != nil {
+			return count, fmt.Errorf("before hook for %05d_%s: %w", m.Version, m.Name, err)
+		}
+
 		start := time.Now()
-		if err := e.applyUp(ctx, m); err != nil {
-			return count, fmt.Errorf("migration %05d_%s up: %w", m.Version, m.Name, err)
+		applyErr := e.applyUp(ctx, m)
+		elapsed := time.Since(start)
+		e.fireAfterEach(ctx, m, DirectionUp, elapsed, applyErr)
+
+		if applyErr != nil {
+			return count, fmt.Errorf("migration %05d_%s up: %w", m.Version, m.Name, applyErr)
 		}
 		count++
 		slog.Info("migration applied",
 			"version", m.Version,
 			"name", m.Name,
 			"direction", "up",
-			"duration", time.Since(start),
+			"duration", elapsed,
 		)
 	}
 
@@ -214,6 +266,9 @@ func (e *Engine) UpTo(ctx context.Context, version int) (int, error) {
 // Down rolls back the last count applied migrations in reverse version
 // order. Returns the count of rolled-back migrations.
 func (e *Engine) Down(ctx context.Context, count int) (int, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	if err := e.ensureTable(ctx); err != nil {
 		return 0, err
 	}
@@ -242,16 +297,24 @@ func (e *Engine) Down(ctx context.Context, count int) (int, error) {
 			return rolled, fmt.Errorf("migration %05d_%s: no Down statements for rollback", m.Version, m.Name)
 		}
 
+		if err := e.fireBeforeEach(ctx, m, DirectionDown); err != nil {
+			return rolled, fmt.Errorf("before hook for %05d_%s: %w", m.Version, m.Name, err)
+		}
+
 		start := time.Now()
-		if err := e.applyDown(ctx, m); err != nil {
-			return rolled, fmt.Errorf("migration %05d_%s down: %w", m.Version, m.Name, err)
+		applyErr := e.applyDown(ctx, m)
+		elapsed := time.Since(start)
+		e.fireAfterEach(ctx, m, DirectionDown, elapsed, applyErr)
+
+		if applyErr != nil {
+			return rolled, fmt.Errorf("migration %05d_%s down: %w", m.Version, m.Name, applyErr)
 		}
 		rolled++
 		slog.Info("migration rolled back",
 			"version", m.Version,
 			"name", m.Name,
 			"direction", "down",
-			"duration", time.Since(start),
+			"duration", elapsed,
 		)
 	}
 
@@ -262,6 +325,9 @@ func (e *Engine) Down(ctx context.Context, count int) (int, error) {
 // specified version. The target version remains applied. Use version 0
 // to roll back all migrations.
 func (e *Engine) DownTo(ctx context.Context, version int) (int, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	if err := e.ensureTable(ctx); err != nil {
 		return 0, err
 	}
@@ -289,16 +355,24 @@ func (e *Engine) DownTo(ctx context.Context, version int) (int, error) {
 			return rolled, fmt.Errorf("migration %05d_%s: no Down statements for rollback", m.Version, m.Name)
 		}
 
+		if err := e.fireBeforeEach(ctx, m, DirectionDown); err != nil {
+			return rolled, fmt.Errorf("before hook for %05d_%s: %w", m.Version, m.Name, err)
+		}
+
 		start := time.Now()
-		if err := e.applyDown(ctx, m); err != nil {
-			return rolled, fmt.Errorf("migration %05d_%s down: %w", m.Version, m.Name, err)
+		applyErr := e.applyDown(ctx, m)
+		elapsed := time.Since(start)
+		e.fireAfterEach(ctx, m, DirectionDown, elapsed, applyErr)
+
+		if applyErr != nil {
+			return rolled, fmt.Errorf("migration %05d_%s down: %w", m.Version, m.Name, applyErr)
 		}
 		rolled++
 		slog.Info("migration rolled back",
 			"version", m.Version,
 			"name", m.Name,
 			"direction", "down",
-			"duration", time.Since(start),
+			"duration", elapsed,
 		)
 	}
 
@@ -308,6 +382,9 @@ func (e *Engine) DownTo(ctx context.Context, version int) (int, error) {
 // Redo rolls back the last applied migration and re-applies it. Useful
 // during development when iterating on a migration file.
 func (e *Engine) Redo(ctx context.Context) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	if err := e.ensureTable(ctx); err != nil {
 		return err
 	}
@@ -334,24 +411,42 @@ func (e *Engine) Redo(ctx context.Context) error {
 		return fmt.Errorf("migration %05d_%s: no Down statements for redo", target.Version, target.Name)
 	}
 
+	// Down phase.
+	if err := e.fireBeforeEach(ctx, *target, DirectionDown); err != nil {
+		return fmt.Errorf("before hook for %05d_%s down: %w", target.Version, target.Name, err)
+	}
+
 	start := time.Now()
-	if err := e.applyDown(ctx, *target); err != nil {
-		return fmt.Errorf("migration %05d_%s redo down: %w", target.Version, target.Name, err)
+	downErr := e.applyDown(ctx, *target)
+	elapsed := time.Since(start)
+	e.fireAfterEach(ctx, *target, DirectionDown, elapsed, downErr)
+
+	if downErr != nil {
+		return fmt.Errorf("migration %05d_%s redo down: %w", target.Version, target.Name, downErr)
 	}
 	slog.Info("migration rolled back (redo)",
 		"version", target.Version,
 		"name", target.Name,
-		"duration", time.Since(start),
+		"duration", elapsed,
 	)
 
+	// Up phase.
+	if err := e.fireBeforeEach(ctx, *target, DirectionUp); err != nil {
+		return fmt.Errorf("before hook for %05d_%s up: %w", target.Version, target.Name, err)
+	}
+
 	start = time.Now()
-	if err := e.applyUp(ctx, *target); err != nil {
-		return fmt.Errorf("migration %05d_%s redo up: %w", target.Version, target.Name, err)
+	upErr := e.applyUp(ctx, *target)
+	elapsed = time.Since(start)
+	e.fireAfterEach(ctx, *target, DirectionUp, elapsed, upErr)
+
+	if upErr != nil {
+		return fmt.Errorf("migration %05d_%s redo up: %w", target.Version, target.Name, upErr)
 	}
 	slog.Info("migration re-applied (redo)",
 		"version", target.Version,
 		"name", target.Name,
-		"duration", time.Since(start),
+		"duration", elapsed,
 	)
 
 	return nil
@@ -570,6 +665,95 @@ func (e *Engine) Validate(ctx context.Context) (ValidationResult, error) {
 	return result, nil
 }
 
+// DryRunResult reports what migrations would be applied without actually
+// applying them. Each planned migration includes its SQL statements and
+// a validation result from executing in a rolled-back transaction.
+type DryRunResult struct {
+	Migrations []PlannedMigration `json:"migrations"`
+}
+
+// PlannedMigration is a pending migration in a dry-run plan.
+type PlannedMigration struct {
+	Version    int      `json:"version"`
+	Name       string   `json:"name"`
+	Statements []string `json:"statements"`
+	Valid      bool     `json:"valid"`
+	Error      string   `json:"error,omitempty"`
+}
+
+// DryRun validates pending migrations by executing them inside a transaction
+// that is always rolled back. Returns what would be applied, with SQL
+// statements and validation results. On the first invalid migration,
+// subsequent migrations are reported as skipped.
+func (e *Engine) DryRun(ctx context.Context) (*DryRunResult, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if err := e.ensureTable(ctx); err != nil {
+		return nil, err
+	}
+
+	records, err := e.appliedRecords(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var pending []Migration
+	for _, m := range e.migrations {
+		if _, ok := records[m.Version]; !ok {
+			pending = append(pending, m)
+		}
+	}
+
+	result := &DryRunResult{
+		Migrations: make([]PlannedMigration, 0, len(pending)),
+	}
+	if len(pending) == 0 {
+		return result, nil
+	}
+
+	// Execute inside a transaction that always rolls back. This validates
+	// SQL syntax, schema compatibility, and constraints without persisting.
+	tx, err := e.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin dry-run transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	failed := false
+	for _, m := range pending {
+		pm := PlannedMigration{
+			Version:    m.Version,
+			Name:       m.Name,
+			Statements: m.Up,
+		}
+
+		if failed {
+			pm.Error = "skipped: depends on failed migration"
+			result.Migrations = append(result.Migrations, pm)
+			continue
+		}
+
+		var execErr error
+		for i, stmt := range m.Up {
+			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+				execErr = fmt.Errorf("statement %d/%d: %w", i+1, len(m.Up), err)
+				break
+			}
+		}
+
+		if execErr != nil {
+			pm.Error = execErr.Error()
+			failed = true
+		} else {
+			pm.Valid = true
+		}
+		result.Migrations = append(result.Migrations, pm)
+	}
+
+	return result, nil
+}
+
 // Migrations returns the collected migrations for inspection.
 func (e *Engine) Migrations() []Migration {
 	return e.migrations
@@ -600,6 +784,21 @@ func Checksum(m Migration) string {
 // ---------------------------------------------------------------------------
 // Internal
 // ---------------------------------------------------------------------------
+
+func (e *Engine) fireBeforeEach(ctx context.Context, m Migration, d Direction) error {
+	for _, fn := range e.beforeEach {
+		if err := fn(ctx, m, d); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (e *Engine) fireAfterEach(ctx context.Context, m Migration, d Direction, elapsed time.Duration, err error) {
+	for _, fn := range e.afterEach {
+		fn(ctx, m, d, elapsed, err)
+	}
+}
 
 func (e *Engine) ensureTable(ctx context.Context) error {
 	_, err := e.db.ExecContext(ctx, `

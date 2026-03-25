@@ -8,7 +8,7 @@
 
 ## Current State
 
-**Last session**: 2026-03-25 — Session 40 (framework/log revisited — consistent per-request sampling, OnRotate callback, query early termination)
+**Last session**: 2026-03-25 — Session 41 (framework/sqlite/migrate revisited — migration locking, hooks, dry-run)
 **Working tree**: clean
 **Branch**: with-experiment
 
@@ -25,7 +25,7 @@
 | `framework/db` | **Maturing** | Session 36 | Revisited: RunTxVal[T] generic transaction with return value (same rollback/panic semantics as RunTx), Exists() optimized with SELECT EXISTS(SELECT 1 ... LIMIT 1) instead of COUNT(*) (stops at first match), FindByID[T] convenience with optional scopes (replaces 4-line Select+Where+Limit+QueryOne), DeleteByID hard-delete (parallels SoftDeleteByID), service/users controller updated to use FindByID. Previous (Session 27): INSERT...SELECT, DoUpdateAll, ConflictBuilder.Where, ConflictWhere, Excluded(), Returning(...Expr), ReturningStar(). Previous (Session 24): CTEs, With() on all builders. Previous (Session 23): set operations, FILTER, Query interface. Previous (Session 22): window functions, GROUP_CONCAT. Previous (Session 21): JOIN ergonomics. Previous (Session 12): RETURNING, subqueries, CASE. Previous (Session 5): nullable types, cursor pagination |
 | `framework/sqlite` | **Maturing** | Session 34 | Revisited: db.trace config key (DB_TRACE env, default false) — opt-in SQL tracing to slog.Debug with expanded SQL and execution time (microseconds). Trace flag visible in startup log. Previous (Session 32): Connector per-connection PRAGMAs, sql.OpenDB, GetPragma/SetPragma/Pragmas, TableStats, Stats.CurrentPragmas. Previous (Session 18): maintenance goroutine, Health(ctx). Previous (Session 11): Stats, Checkpoint, Optimize, IntegrityCheck, Backup. |
 | `framework/sqlite/driver` | **Maturing** | Session 34 | Revisited: sqlite3_trace_v2 (TraceStmt/TraceProfile with expanded SQL and Duration), sqlite3_busy_handler (callback-based retry with DefaultBusyHandler exponential backoff), sqlite3_wal_hook (WAL commit notification with page count), CGo callback trampolines via hook.c + cgo.Handle for safe Go↔C bridging, Connector.SetTrace/SetBusyHandler/SetWALHook, conn.handle lifecycle (cgo.Handle freed on Close). Framework db.trace config key (DB_TRACE env) installs slog.Debug trace on both pools. Load tested: 2% write overhead, 13% read overhead with trace (debug-only). Previous (Session 32): Connector per-connection PRAGMAs, DBSTAT_VTAB. Previous (Session 20): structured Error type, context cancellation, MemoryUsed/MemoryHighwater. |
-| `framework/sqlite/migrate` | **Maturing** | Session 33 | Revisited: Validate() method (orphan detection + dirty checksum report), HasPending() lightweight check, Status() includes orphaned DB records (Orphaned field on MigrationStatus), Up()/UpTo() log dirty checksum warnings for already-applied migrations, appliedRecords() internal refactor (richer DB data shared across all methods), ValidationResult/OrphanedMigration/DirtyMigration types with JSON tags, app.go validates at startup and logs orphan+dirty warnings. Load tested: Status 28K req/s, Validate 29K req/s, HasPending 30K req/s, Version 34K req/s — all sub-5ms p99, 25 MB RSS. Previous (Session 19): SHA-256 checksums, UpTo/DownTo/Version/Redo, MigrationStatus enriched. Previous (Session 11): migration timing, Pending(), error context. |
+| `framework/sqlite/migrate` | **Maturing** | Session 41 | Revisited: sync.Mutex locking on all mutation methods (Up/UpTo/Down/DownTo/Redo/DryRun — prevents concurrent migration races), BeforeEachFunc/AfterEachFunc hooks (OnBeforeEach can abort, OnAfterEach informational — fired for all operations including Redo's down+up phases), Direction.String() method, DryRun() validates pending migrations in rolled-back transaction (PlannedMigration with Valid/Error, skips dependents on first failure). Load tested: Status 37K req/s p99 1.3ms, Version 44K req/s p99 1.0ms, Validate 39K req/s p99 1.2ms, hooks (in-memory) 70K req/s p99 0.9ms, 25 MB RSS. Concurrent test: 10 goroutines all succeed (0 errors). Previous (Session 33): Validate, HasPending, Status orphaned records, appliedRecords refactor. Previous (Session 19): SHA-256 checksums, UpTo/DownTo/Version/Redo. Previous (Session 11): migration timing, Pending(), error context. |
 
 ## Friction Log
 
@@ -452,6 +452,16 @@ Session 40 (log revisit, event logger with consistent sampling + rotation + quer
 - [race] No data races detected with -race flag on concurrent create + sampling + query + list
 - [consistent sampling] Verified: DEBUG 12/50 at rate=5 (24%), INFO 16/50 at rate=3 (32%), 100% all-or-nothing per request_id
 
+Session 41 (migrate revisit, migration admin tool with 3 migrations — articles, comments, tags):
+- [migrate/GET status] 37,000 req/s, p99 1.3ms — Status() with 3 applied migrations
+- [migrate/GET version] 44,000 req/s, p99 1.0ms — Version() single MAX query
+- [migrate/GET validate] 39,000 req/s, p99 1.2ms — Validate() with 3 clean migrations
+- [migrate/GET hooks] 70,272 req/s, p99 0.9ms — in-memory hook event list (no DB)
+- [migrate/POST concurrent] 10/10 goroutines succeeded, 0 errors — mutex serialization verified
+- [migrate/DryRun] validates 3 pending migrations in rolled-back transaction, returns SQL + validity
+- [memory] 25 MB RSS under sustained load
+- [hooks] 6 events on startup (before+after × 3 migrations), down hooks fire correctly
+
 ## Design Decisions
 
 <!-- Key decisions and rationale so future sessions don't reverse them. Format:
@@ -742,19 +752,25 @@ Session 40 (log revisit, event logger with consistent sampling + rotation + quer
 - [log] Query early termination tracks a `pastWindow` boolean. Once an entry's time >= Before, all subsequent entries are skipped without JSON parsing. This relies on JSONL files being chronologically ordered (guaranteed by dailyFileWriter's sequential writes). Only applies to ascending order — descending order must collect all entries anyway for correct pagination. The optimization is especially significant on large files: 16.7x faster on a 14MB file. (Session 40)
 - [log] fnv1a iterates bytes (not runes) of the request_id string — safe because request_ids are ASCII (nanoid, UUID). The function avoids hash/fnv package to eliminate heap allocation (hash.Hash32 is an interface, which escapes to heap). Same FNV-1a constants as the stdlib implementation. (Session 40)
 
+- [migrate] sync.Mutex on Engine protects all mutation methods (Up/UpTo/Down/DownTo/Redo/DryRun). In-process lock is correct for Sunkern's single-binary model — no need for DB-level advisory locks. Read-only methods (Status/Validate/Pending/HasPending/Version) don't acquire the lock; SQLite WAL mode handles concurrent reads safely. (Session 41)
+- [migrate] Hook registration (OnBeforeEach/OnAfterEach) must happen before Up/Down/etc. — no runtime registration. BeforeEachFunc can return error to abort; AfterEachFunc is fire-and-forget. Hooks fire in registration order, not concurrently. Designed for admin observability and custom logging, not for complex orchestration. (Session 41)
+- [migrate] DryRun uses BEGIN + execute all pending Up statements + ROLLBACK. This validates everything — syntax, schema compatibility, FK constraints, index conflicts — not just SQL parsing. On first failure, subsequent migrations are marked "skipped: depends on failed migration" since their validation is meaningless without prior migrations. (Session 41)
+- [migrate] Direction type already existed in parse.go; added String() method ("up"/"down") for use in hook callbacks and logging. Hooks receive the concrete Direction value, not a string — caller uses d.String() when needed. (Session 41)
+- [migrate] DryRun acquires the engine mutex because it uses the write pool (BeginTx) and concurrent Up() during DryRun would conflict. The write pool has MaxOpenConns=1, so serialization via mutex is the correct approach. (Session 41)
+
 ## Next Priorities
 
 <!-- What the last session thinks should come next, in order -->
 
-1. **Revisit `framework/sqlite/migrate`** — last touched Session 33 (7 sessions ago, oldest). Future: dry-run mode (validate SQL syntax without applying), migration locking (prevent concurrent Up() calls), migration hooks (pre/post callbacks)
-2. **Revisit `framework/sqlite/driver`** — last touched Session 34. Future: blob I/O (sqlite3_blob_open/read/write/close for incremental large object access), sqlite3_update_hook (row-level change notifications), WAL hook integration with maintenance goroutine (proactive checkpoint triggering instead of polling)
-3. **Revisit `framework/http`** — last touched Session 35. SSE broker/hub pattern (manages multiple connections, fan-out from event source, stats), response inspection helpers (exported ResponseRecorder or status getter)
-4. **Revisit `framework/http/middleware`** — last touched Session 35. Future: CSRF protection (double-submit cookie), conditional middleware by method (SkipMethods), request body caching for retry/inspection
-5. **Revisit `framework/db`** — last touched Session 36. Future: batch update helpers (CASE-based multi-row updates), query logging/tracing hook (can now leverage driver trace), prepared statement caching, consider UpdateByID convenience
-6. **Revisit `framework/container`** — last touched Session 37. Future: exported container-level generic functions (ProvideToContainer, MustMakeFromContainer) for isolated container testing, provider timeout (context-based deadline for lazy init), service health integration (register health checks from providers automatically)
-7. **Revisit `framework/app`** — last touched Session 38. Future: module boot ordering via DependsOn (topological sort — currently validation only), ModuleGroup children introspection (nested ModuleInfo), module enable/disable at runtime via config change callback
-8. **Revisit `framework/config`** — last touched Session 39. Future: config watcher (detect env var changes at runtime), config schema generation (JSON Schema from registered keys+rules+descriptions for external tooling), DescribeMany() bulk variant
-9. **Revisit `framework/log`** — last touched Session 40. Future: mmap-based query for very large files (deferred), multi-date query (span across day boundaries), log entry struct tags for faster JSON extraction (avoid map[string]any), Query streaming via callback/channel for memory-bounded large result sets
+1. **Revisit `framework/sqlite/driver`** — last touched Session 34 (7 sessions ago, oldest). Future: blob I/O (sqlite3_blob_open/read/write/close for incremental large object access), sqlite3_update_hook (row-level change notifications), WAL hook integration with maintenance goroutine (proactive checkpoint triggering instead of polling)
+2. **Revisit `framework/http`** — last touched Session 35. SSE broker/hub pattern (manages multiple connections, fan-out from event source, stats), response inspection helpers (exported ResponseRecorder or status getter)
+3. **Revisit `framework/http/middleware`** — last touched Session 35. Future: CSRF protection (double-submit cookie), conditional middleware by method (SkipMethods), request body caching for retry/inspection
+4. **Revisit `framework/db`** — last touched Session 36. Future: batch update helpers (CASE-based multi-row updates), query logging/tracing hook (can now leverage driver trace), prepared statement caching, consider UpdateByID convenience
+5. **Revisit `framework/container`** — last touched Session 37. Future: exported container-level generic functions (ProvideToContainer, MustMakeFromContainer) for isolated container testing, provider timeout (context-based deadline for lazy init), service health integration (register health checks from providers automatically)
+6. **Revisit `framework/app`** — last touched Session 38. Future: module boot ordering via DependsOn (topological sort — currently validation only), ModuleGroup children introspection (nested ModuleInfo), module enable/disable at runtime via config change callback
+7. **Revisit `framework/config`** — last touched Session 39. Future: config watcher (detect env var changes at runtime), config schema generation (JSON Schema from registered keys+rules+descriptions for external tooling), DescribeMany() bulk variant
+8. **Revisit `framework/log`** — last touched Session 40. Future: mmap-based query for very large files (deferred), multi-date query (span across day boundaries), log entry struct tags for faster JSON extraction (avoid map[string]any), Query streaming via callback/channel for memory-bounded large result sets
+9. **Revisit `framework/sqlite/migrate`** — last touched Session 41. Future: dual-pool support (read pool for Status/Validate/Pending queries, write pool for mutations), migration groups/batches (tag migrations, apply by group), migrate down to named migration (instead of version number)
 10. Update sunkern-go-best-practices skill (BLOCKED: need .claude/skills/ write permission)
 
 ## In-Progress Work

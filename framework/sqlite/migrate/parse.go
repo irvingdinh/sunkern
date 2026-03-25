@@ -23,6 +23,14 @@ const (
 	DirectionDown
 )
 
+// String returns "up" or "down".
+func (d Direction) String() string {
+	if d == DirectionDown {
+		return "down"
+	}
+	return "up"
+}
+
 // Parse reads a migration file and splits it into Up and Down statement lists.
 // The file must contain a "-- +sunkern Up" annotation. The "-- +sunkern Down"
 // annotation is optional.
