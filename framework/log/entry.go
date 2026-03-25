@@ -217,6 +217,14 @@ func Query(ctx context.Context, date string, opts QueryOptions) (QueryResult, er
 		lines   int
 	)
 
+	// hasBefore tracks whether a Before time filter is active. When
+	// scanning in ascending order, JSONL entries are chronological — once
+	// we see an entry at or after Before, all subsequent entries will also
+	// be past the window. We can stop parsing (expensive) and just count
+	// remaining lines for the total.
+	hasBefore := !desc && !opts.Before.IsZero()
+	pastWindow := false
+
 	for scanner.Scan() {
 		// Check context every 1024 lines to balance responsiveness
 		// against the overhead of the channel check.
@@ -232,9 +240,24 @@ func Query(ctx context.Context, date string, opts QueryOptions) (QueryResult, er
 			continue
 		}
 
+		// Early termination: once we're past the Before window in
+		// ascending order, skip JSON parsing entirely. JSONL files are
+		// written chronologically so no future entry can match.
+		if pastWindow {
+			continue
+		}
+
 		entry, err := parseEntry(line)
 		if err != nil {
 			skipped++
+			continue
+		}
+
+		// Detect when we've crossed the Before boundary. The current
+		// entry already fails the time filter, so we skip it and mark
+		// all subsequent entries as past-window.
+		if hasBefore && !entry.Time.Before(opts.Before) {
+			pastWindow = true
 			continue
 		}
 

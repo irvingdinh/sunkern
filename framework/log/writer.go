@@ -32,6 +32,13 @@ func (w *prettyWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// RotateFunc is the callback signature for daily log file rotation events.
+// prevDate is the date of the file being closed (empty on first write),
+// newDate is the date of the new file being opened.
+// Callbacks run asynchronously in a separate goroutine so they must not
+// block the logging pipeline.
+type RotateFunc func(prevDate, newDate string)
+
 // dailyFileWriter is the file sink behind the JSON file handler: a
 // thread-safe io.WriteCloser that appends bytes to one JSONL file per calendar
 // day (YYYY_MM_DD.log) under a fixed directory. Writes are buffered (64 KB)
@@ -41,13 +48,14 @@ func (w *prettyWriter) Write(p []byte) (int, error) {
 // Rotation happens on the first write after the date changes; the mutex
 // serializes writes and protects the current file handle, buffer, and date.
 type dailyFileWriter struct {
-	mu    sync.Mutex
-	dir   string
-	date  string
-	file  *os.File
-	buf   *bufio.Writer
-	nowFn func() time.Time // injectable for testing
-	done  chan struct{}
+	mu        sync.Mutex
+	dir       string
+	date      string
+	file      *os.File
+	buf       *bufio.Writer
+	nowFn     func() time.Time // injectable for testing
+	done      chan struct{}
+	onRotate  []RotateFunc
 }
 
 func newDailyFileWriter(dir string) *dailyFileWriter {
@@ -97,8 +105,10 @@ func (w *dailyFileWriter) Write(p []byte) (int, error) {
 }
 
 // rotate flushes the current buffer, closes the previous file (if any), and
-// opens a new file for the given date.
+// opens a new file for the given date. Rotation callbacks are fired
+// asynchronously after a successful rotation.
 func (w *dailyFileWriter) rotate(date string) error {
+	prevDate := w.date
 	if w.buf != nil {
 		_ = w.buf.Flush()
 	}
@@ -113,6 +123,18 @@ func (w *dailyFileWriter) rotate(date string) error {
 	w.file = f
 	w.buf = bufio.NewWriterSize(f, 64*1024) // 64 KB write buffer
 	w.date = date
+
+	// Fire rotation callbacks asynchronously to avoid blocking the log
+	// pipeline. Snapshot the slice under the lock (already held by caller).
+	if len(w.onRotate) > 0 {
+		fns := make([]RotateFunc, len(w.onRotate))
+		copy(fns, w.onRotate)
+		go func() {
+			for _, fn := range fns {
+				fn(prevDate, date)
+			}
+		}()
+	}
 	return nil
 }
 

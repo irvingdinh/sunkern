@@ -146,6 +146,23 @@ func Close() error {
 	return nil
 }
 
+// OnRotate registers a callback that fires asynchronously when the daily log
+// file rotates to a new date. The callback receives the previous date and the
+// new date (format "2006_01_02"). Use this for operational automation such as
+// compressing old log files or uploading them to external storage.
+//
+// Callbacks are non-blocking — they run in a separate goroutine and must not
+// assume the logging pipeline is paused. Must be called after [Load].
+func OnRotate(fn RotateFunc) {
+	global.mu.Lock()
+	defer global.mu.Unlock()
+	if global.writer != nil {
+		global.writer.mu.Lock()
+		global.writer.onRotate = append(global.writer.onRotate, fn)
+		global.writer.mu.Unlock()
+	}
+}
+
 // Reset closes the file writer and sets the slog default to a discard
 // handler. Intended for tests to get clean state between test cases.
 func Reset() {
