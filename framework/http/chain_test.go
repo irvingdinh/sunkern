@@ -148,6 +148,63 @@ func TestSkipIfFalse(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// SkipMethods
+// ---------------------------------------------------------------------------
+
+func TestSkipMethodsMatched(t *testing.T) {
+	mw := headerMiddleware("X-CSRF", "checked")
+	skipped := SkipMethods(mw, "GET", "HEAD", "OPTIONS")
+
+	handler := skipped(httpstd.HandlerFunc(noop))
+
+	for _, method := range []string{"GET", "HEAD", "OPTIONS"} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(method, "/api/data", nil))
+
+		if v := rec.Header().Get("X-CSRF"); v != "" {
+			t.Errorf("method %s: X-CSRF = %q, want empty (middleware should be skipped)", method, v)
+		}
+	}
+}
+
+func TestSkipMethodsNotMatched(t *testing.T) {
+	mw := headerMiddleware("X-CSRF", "checked")
+	skipped := SkipMethods(mw, "GET", "HEAD", "OPTIONS")
+
+	handler := skipped(httpstd.HandlerFunc(noop))
+
+	for _, method := range []string{"POST", "PUT", "PATCH", "DELETE"} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(method, "/api/data", nil))
+
+		if v := rec.Header().Get("X-CSRF"); v != "checked" {
+			t.Errorf("method %s: X-CSRF = %q, want %q", method, v, "checked")
+		}
+	}
+}
+
+func TestSkipMethodsEmpty(t *testing.T) {
+	called := false
+	mw := func(next httpstd.Handler) httpstd.Handler {
+		return httpstd.HandlerFunc(func(w httpstd.ResponseWriter, r *httpstd.Request) {
+			called = true
+			next.ServeHTTP(w, r)
+		})
+	}
+
+	skipped := SkipMethods(Middleware(mw))
+
+	handler := skipped(httpstd.HandlerFunc(noop))
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest("POST", "/anything", nil))
+
+	if !called {
+		t.Error("middleware should have been called (no methods to skip)")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // SkipPaths
 // ---------------------------------------------------------------------------
 

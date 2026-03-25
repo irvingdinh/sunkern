@@ -53,6 +53,27 @@ func SkipIf(mw Middleware, skip func(r *httpstd.Request) bool) Middleware {
 	}
 }
 
+// SkipMethods wraps a middleware so that it is bypassed for requests whose
+// HTTP method matches any of the given methods. This is a convenience
+// wrapper around [SkipIf] for the common case of exempting safe methods
+// from CSRF checks or skipping auth on OPTIONS preflight.
+//
+//	csrf := middleware.CSRF(secret)
+//	csrf = sunkernhttp.SkipMethods(csrf, "GET", "HEAD", "OPTIONS")
+func SkipMethods(mw Middleware, methods ...string) Middleware {
+	if len(methods) == 0 {
+		return mw
+	}
+	set := make(map[string]struct{}, len(methods))
+	for _, m := range methods {
+		set[m] = struct{}{}
+	}
+	return SkipIf(mw, func(r *httpstd.Request) bool {
+		_, ok := set[r.Method]
+		return ok
+	})
+}
+
 // SkipPaths wraps a middleware so that it is bypassed for requests whose
 // URL path exactly matches any of the given paths. This is a convenience
 // wrapper around [SkipIf] for the common case of excluding health checks,
