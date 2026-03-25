@@ -1,343 +1,342 @@
 # Configuration
 
-## Introduction
+All configuration for a Sunkern application flows through the `framework/config` package. It provides a three-layer resolution system — environment variables, a JSON configuration file, and registered defaults — so that every config value has a clear, predictable source of truth.
 
-The `framework/config` package provides process-wide configuration for a
-Sunkern application.
-
-It is responsible for:
-
-- loading configuration from `DATA_DIR/config.json`
-- reading environment variable overrides
-- registering framework and module defaults
-- coercing raw values into typed Go values
-- validating config during boot
-- exposing the declared config surface for CLI or diagnostics
-
-Unlike larger frameworks that split configuration across many files, Sunkern
-keeps configuration intentionally simple: one runtime config file, one
-environment override layer, and explicit defaults registered by the framework
-and modules.
-
-## Configuration Sources
-
-Each configuration key resolves in the following order:
-
-1. Environment variables
-2. `{DATA_DIR}/config.json`
-3. Registered defaults
-
-The package uses dot notation for keys:
-
-- `app.env`
-- `http.addr`
-- `db.busy_timeout`
-- `jwt.secret`
-
-Environment variables are derived by uppercasing the key and replacing dots
-with underscores:
-
-- `app.env` becomes `APP_ENV`
-- `http.addr` becomes `HTTP_ADDR`
-- `jwt.secret` becomes `JWT_SECRET`
-
-You may convert a key to its environment variable name with
-`EnvName`.
-
-## Loading Configuration
-
-Configuration is initialized by calling `Load()`.
-
-During `Load()`:
-
-1. `DATA_DIR` is resolved from the environment, falling back to
-   `~/.standalone`
-2. the data directory is created if it does not already exist
-3. `{DATA_DIR}/config.json` is read if present
-4. nested JSON is flattened into dot-notation keys
-5. `data_dir` is registered as a default key
-
-Example:
+The package uses flat dot-notation keys (e.g., `db.host`, `http.port`) that map directly to `UPPER_SNAKE_CASE` environment variables. This makes it trivial for container platforms like Fly.io, Railway, and Cloud Run to override any setting without touching files.
 
 ```go
-config.Load()
+import "sunkern.local/framework/config"
 
-dataDir := config.DataDir()
+func main() {
+    config.Load()
+    port := config.Get[int]("http.port")
+}
 ```
 
-If `config.json` is missing, the package continues normally. If the file exists
-but contains invalid JSON, `Load()` panics immediately.
+## Configuration Files
 
-## Environment Configuration
+Configuration is read from a single JSON file at `{DATA_DIR}/config.json`. The file is optional — if it does not exist, the package silently continues with environment variables and defaults.
 
-Environment variables are the highest-priority configuration layer. They are
-typically used for deployment-specific values, secrets, and one-off overrides.
-
-For example, this key:
+Nested JSON structures are automatically flattened into dot-notation keys during `Load()`:
 
 ```json
 {
   "http": {
-    "addr": ":19110"
+    "port": 19110,
+    "read_timeout": "15s"
+  },
+  "db": {
+    "busy_timeout": 5000,
+    "synchronous": "NORMAL"
   }
 }
 ```
 
-may be overridden by setting:
+After loading, these become flat keys:
 
-```bash
-HTTP_ADDR=:8080
-```
+| Key | Value |
+|-----|-------|
+| `http.port` | `19110` |
+| `http.read_timeout` | `"15s"` |
+| `db.busy_timeout` | `5000` |
+| `db.synchronous` | `"NORMAL"` |
 
-If both `config.json` and the environment define a key, the environment value
-wins.
+> **Note:** The config file must contain valid JSON. If the file exists but is malformed, `Load()` panics immediately.
 
-## Defining Configuration Values
+## Environment Variables
 
-Framework packages and feature modules define their configuration surface by
-registering defaults during boot.
+Every dot-notation key maps to an `UPPER_SNAKE_CASE` environment variable. The conversion is simple: uppercase everything and replace dots with underscores.
 
-Use `SetDefault` for a single key:
+| Config Key | Environment Variable |
+|------------|---------------------|
+| `http.port` | `HTTP_PORT` |
+| `db.host` | `DB_HOST` |
+| `jwt.secret` | `JWT_SECRET` |
+| `email.from_address` | `EMAIL_FROM_ADDRESS` |
+| `log.level` | `LOG_LEVEL` |
+| `data_dir` | `DATA_DIR` |
 
-```go
-config.SetDefault("http.addr", ":19110")
-```
-
-Use `SetDefaults` for a group of flat keys:
-
-```go
-config.SetDefaults(config.Values{
-	"http.read_timeout":  "15s",
-	"http.write_timeout": "15s",
-	"http.idle_timeout":  "60s",
-})
-```
-
-`config.Values` is an alias for `map[string]any`. It exists purely to keep
-call sites and examples compact.
-
-Defaults serve two purposes:
-
-- they provide fallback values when no higher-priority source exists
-- they declare the application's known configuration surface
-
-That second point matters for introspection helpers such as `All()`, `Keys()`,
-and `Sub()`.
-
-## Accessing Configuration Values
-
-Use `Get[T]` when a value must exist and must be valid:
+Use `config.EnvName(key)` to get the environment variable name programmatically:
 
 ```go
-addr := config.Get[string]("http.addr")
+envVar := config.EnvName("jwt.secret") // "JWT_SECRET"
 ```
 
-`Get[T]` panics if:
+Sunkern uses **flat, unprefixed** environment variable names (e.g., `PORT`, not `SUNKERN_PORT`). These are standalone apps — one per container — so namespace collisions are not a concern.
 
-- the key does not exist in any layer
-- the raw value cannot be coerced to `T`
+## Resolution Order
 
-Use `GetOr[T]` when you want a fallback:
+When you request a config value, the package checks three layers in order. The first match wins:
 
-```go
-readTimeout := config.GetOr[time.Duration]("http.read_timeout", 15*time.Second)
+```
+1. Environment variable   ← highest priority
+2. config.json value
+3. Registered default     ← lowest priority
 ```
 
-Use `Has` to check for existence without coercion:
+This design lets you ship sensible defaults in code, override them with a config file for specific deployments, and override everything with environment variables for container platforms.
 
 ```go
-if config.Has("jwt.secret") {
-	// ...
+// Module registers a default during boot:
+config.SetDefault("http.port", 19110)
+
+// config.json may contain: {"http": {"port": 8080}}
+
+// Environment may have: HTTP_PORT=3000
+
+// Result of config.Get[int]("http.port"):
+//   HTTP_PORT set     → 3000      (env wins)
+//   No env var        → 8080      (config.json wins)
+//   No env, no file   → 19110     (default wins)
+```
+
+> **Note:** Environment variables always arrive as strings. The package coerces them to the requested type automatically — see [Type Coercion](#type-coercion).
+
+## Retrieving Configuration Values
+
+### Required Values
+
+Use `Get[T](key)` for configuration that must exist. It panics with a descriptive message (including the environment variable name) if the key is missing from all three layers or if the value cannot be coerced to type `T`.
+
+```go
+port := config.Get[int]("http.port")
+secret := config.Get[string]("jwt.secret")
+```
+
+Use this for boot-time configuration that the application cannot run without.
+
+### Optional Values
+
+Use `GetOr[T](key, fallback)` for configuration with safe defaults. It returns the fallback value if the key is missing or coercion fails. It never panics.
+
+```go
+timeout := config.GetOr("http.read_timeout", 15*time.Second)
+debug := config.GetOr("app.debug", false)
+workers := config.GetOr("queue.workers", 4)
+```
+
+### Existence Checks
+
+Use `Has(key)` to check whether a key can be resolved from any layer without attempting type coercion. Zero values (`""`, `0`, `false`) count as existing.
+
+```go
+if config.Has("resend.api_token") {
+    // Email sending is available
 }
 ```
 
-Use `Ensure` to fail fast when required values are missing:
+### Data Directory
+
+`DataDir()` is a convenience shorthand for `Get[string]("data_dir")`. It returns the absolute path to the application's data directory.
 
 ```go
-config.Ensure("jwt.secret", "resend.api_token")
+logsDir := filepath.Join(config.DataDir(), "logs")
+dbPath := filepath.Join(config.DataDir(), "database.sqlite")
 ```
 
-## Supported Types
+The data directory is resolved during `Load()`:
+1. If the `DATA_DIR` environment variable is set, use it
+2. Otherwise, default to `~/.standalone`
+3. The directory is created automatically (with `0o755` permissions) if it does not exist
 
-The package supports typed reads for:
+> **Warning:** When running multiple Sunkern instances on the same machine (or in tests), always set `DATA_DIR` to an isolated directory. The default `~/.standalone` is shared and will cause data collisions.
 
-- `string`
-- `bool`
-- `int`, `int32`, `int64`
-- `uint`, `uint8`, `uint16`, `uint32`, `uint64`
-- `float64`
-- `time.Time`
-- `time.Duration`
-- `[]int`
-- `[]string`
-- `map[string]any`
-- `map[string]string`
-- `map[string][]string`
+## Setting Defaults
 
-If a raw config value cannot be converted to the requested target type, `Get`
-panics and `GetOr` returns its fallback value.
+Register default values during the module registration phase — before `Validate()` runs.
 
-## Integer Values
-
-Integer coercion is intentionally strict.
-
-Accepted values:
-
-- integer strings such as `"19110"`
-- JSON whole numbers such as `19110`
-
-Rejected values:
-
-- fractional strings such as `"19110.5"`
-- fractional JSON numbers such as `19110.5`
-
-The package does not silently truncate configuration values. If a value is
-meant to be an integer, it must be provided as an integer.
-
-## Duration Values
-
-`time.Duration` values must be expressed as duration strings when they come
-from environment variables or `config.json`.
-
-Accepted values:
-
-- `"15s"`
-- `"5m"`
-- `"1h30m"`
-
-Rejected values:
-
-- `"30"`
-- `30`
-- `30.5`
-
-Typed Go defaults of type `time.Duration` are still supported:
+### Single Key
 
 ```go
-config.SetDefault("job.interval", 30*time.Second)
+config.SetDefault("http.port", 19110)
 ```
 
-This keeps runtime configuration explicit and readable while still allowing
-framework code to register strongly typed defaults.
+### Multiple Keys
+
+Use `SetDefaults` with `config.Values` (an alias for `map[string]any`) to register related keys together:
+
+```go
+func (m *Module) Register() {
+    config.SetDefaults(config.Values{
+        "http.port":         19110,
+        "http.read_timeout": "15s",
+        "http.idle_timeout": "60s",
+    })
+}
+```
+
+When the same key is registered multiple times, the last call wins. This is how a service module can override a framework-level default.
+
+> **Warning:** Calling `SetDefault` or `SetDefaults` after the config is frozen (after `Validate()`) causes a panic.
 
 ## Validation
 
-Configuration rules are registered with `AddRule` and checked by `Validate()`.
+### Adding Rules
 
-Built-in rules include:
-
-- `Required`
-- `NotEmpty`
-- `Positive`
-- `NonNegative`
-- `OneOf(...)`
-- `Min(...)`
-- `Max(...)`
-- `Range(...)`
-- `MinLen(...)`
-- `MaxLen(...)`
-
-Example:
+Use `AddRule(key, ...Rule)` to register validation functions during the registration phase. Multiple `AddRule` calls for the same key accumulate — all rules must pass.
 
 ```go
-config.AddRule("log.level", config.OneOf("DEBUG", "INFO", "WARN", "ERROR"))
-config.AddRule("jwt.secret", config.Required, config.MinLen(32))
+func (m *Module) Register() {
+    config.SetDefault("http.port", 19110)
+    config.AddRule("http.port", config.Range(1, 65535))
+
+    config.AddRule("jwt.secret", config.NotEmpty, config.MinLen(32))
+    config.AddRule("log.level", config.OneOf("DEBUG", "INFO", "WARN", "ERROR"))
+}
 ```
 
-If validation fails, `Validate()` panics with a summary of every failure.
+### Running Validation
 
-## Configuration Lifecycle
+The framework calls `Validate()` after all modules have registered their defaults and rules, but before any module's `Boot()` phase. It runs every registered rule and panics with a summary of all violations:
 
-The expected lifecycle is:
-
-1. call `Load()`
-2. register defaults with `SetDefault` or `SetDefaults`
-3. register validation rules with `AddRule`
-4. call `Validate()`
-5. read values with `Get` and `GetOr`
-
-After validation succeeds, the package is frozen. Any later call to
-`SetDefault`, `SetDefaults`, or `AddRule` panics.
-
-This keeps the config surface stable after boot and prevents modules from
-quietly changing configuration shape during runtime.
-
-## Accessing Declared Configuration
-
-The package includes a small introspection layer for CLI commands and
-diagnostics.
-
-`All()` returns the effective value of every known key.
-
-`Keys()` returns the sorted list of known keys.
-
-`Sub(prefix)` returns the effective values for a namespace with the prefix removed.
-
-For example, if the application knows these keys:
-
-- `db.host`
-- `db.port`
-- `db.trace`
-
-then:
-
-```go
-db := config.Sub("db")
+```
+config validation failed:
+  - HTTP_PORT: must be in [1, 65535], got 0
+  - JWT_SECRET: must not be empty
 ```
 
-returns a map with:
+After `Validate()` completes (even with no violations), the config is frozen.
 
-- `host`
-- `port`
-- `trace`
+### Built-in Rules
 
-`Sub("db.")` is also accepted.
+| Rule | Description |
+|------|-------------|
+| `Required` | Key must exist in at least one layer. Zero values (`""`, `0`, `false`) are valid. |
+| `NotEmpty` | Key must exist AND its string value must be non-empty. |
+| `Positive` | Integer value must be strictly greater than zero. |
+| `NonNegative` | Integer value must be zero or greater. |
+| `OneOf(values...)` | String value must be one of the listed values (case-sensitive). |
+| `Min(n)` | Integer value must be >= n. |
+| `Max(n)` | Integer value must be <= n. |
+| `Range(min, max)` | Integer value must be in [min, max] inclusive. |
+| `MinLen(n)` | String value must have at least n characters. |
+| `MaxLen(n)` | String value must have at most n characters. |
 
-## Known Keys
+All built-in rules (except `Required` and `NotEmpty`) pass silently if the key does not exist. This lets you validate a value only when it is provided.
 
-`All()`, `Keys()`, and `Sub()` only operate on known keys.
+### Custom Rules
 
-A key becomes known when it appears in either:
-
-- registered defaults
-- `config.json`
-
-This means env-only undeclared keys are still readable through `Get()` and
-`Has()`, but they are not listed by `All()`, `Keys()`, or `Sub()`.
-
-This behavior is intentional. The declared configuration surface should come
-from the application itself, not from whatever extra environment variables may
-exist in the host process.
-
-## Practical Example
+A `Rule` is a function with the signature `func(key string, value any, exists bool) error`. Return `nil` to pass, an error to fail:
 
 ```go
-config.Load()
-
-config.SetDefaults(config.Values{
-	"http.addr":         ":19110",
-	"http.read_timeout": "15s",
+config.AddRule("app.mode", func(key string, value any, exists bool) error {
+    if !exists {
+        return nil // optional key
+    }
+    s, ok := value.(string)
+    if !ok {
+        return fmt.Errorf("must be a string")
+    }
+    if s != "development" && s != "production" {
+        return fmt.Errorf("must be 'development' or 'production', got '%s'", s)
+    }
+    return nil
 })
-
-config.AddRule("http.addr", config.NotEmpty)
-
-config.Validate()
-
-addr := config.Get[string]("http.addr")
-timeout := config.GetOr[time.Duration]("http.read_timeout", 15*time.Second)
 ```
 
-In this example:
+### Ensuring Required Keys
 
-- `HTTP_ADDR` overrides `config.json`
-- `config.json` overrides the registered defaults
-- invalid values fail during `Get` or `Validate`
+`Ensure(keys...)` is an imperative existence check. It panics immediately with a summary listing all missing keys by their environment variable names:
 
-## Notes
+```go
+config.Ensure("jwt.secret", "resend.api_token")
+// Panics: "missing required config: JWT_SECRET, RESEND_API_TOKEN"
+```
 
-- `DATA_DIR` should be set explicitly when running Sunkern apps locally or in
-  tests
-- `config.json` uses nested JSON, but the package resolves it as flat
-  dot-notation keys
-- environment values arrive as strings and are coerced on read
-- `GetOr` falls back on both missing values and coercion failures
+Unlike `Required` (which is declarative and runs during `Validate`), `Ensure` runs at the call site. Use it when you need to assert key existence at a specific point in your boot sequence.
+
+## Type Coercion
+
+The package automatically coerces values to the requested type when you call `Get[T]` or `GetOr[T]`. This is especially useful for environment variables, which always arrive as strings.
+
+| Target Type | Coerces From | Notes |
+|-------------|-------------|-------|
+| `string` | any | Always succeeds via `fmt.Sprintf` |
+| `bool` | string, int, float64 | Strings: `true`/`1`/`t`/`yes`/`on`, `false`/`0`/`f`/`no`/`off` (case-insensitive) |
+| `int` | float64, int64, string, bool | Floats with fractional part are rejected |
+| `int32`, `int64` | Same as `int` | Overflow is checked and rejected |
+| `uint`, `uint8`–`uint64` | int, float64, string, bool | Negative values are rejected |
+| `float64` | int, int64, string, bool | |
+| `time.Time` | string | Tries in order: RFC3339, RFC3339Nano, `2006-01-02`, `2006-01-02 15:04:05` |
+| `time.Duration` | string | Go duration format: `"15s"`, `"1m30s"`, `"168h"` |
+| `[]int` | []any, comma-separated string | Each element coerced individually |
+| `[]string` | []any, comma-separated string | Each element stringified |
+| `map[string]any` | Direct type match only | No automatic conversion |
+| `map[string]string` | map[string]any | Values stringified |
+| `map[string][]string` | map[string]any | Single values wrapped in slice |
+
+> **Note:** Comma-separated strings (e.g., `ALLOWED_ORIGINS=http://localhost:3000,http://localhost:5173`) are split into slices automatically when you request `[]string` or `[]int`.
+
+## Freeze
+
+After `Validate()` completes, the config is frozen. This prevents accidental registration of new defaults or rules during the runtime phase.
+
+```go
+config.IsFrozen() // true after Validate()
+config.SetDefault("new.key", "value") // PANIC: config is frozen
+config.AddRule("new.key", config.Required) // PANIC: config is frozen
+```
+
+You can call `Freeze()` manually for earlier lockdown, but this is rarely needed — `Validate()` handles it automatically.
+
+Query functions (`Get`, `GetOr`, `Has`, `All`, `Keys`, `Sub`) are unaffected by freeze and work normally throughout the application lifecycle.
+
+## Introspection
+
+Three functions expose the known configuration for diagnostics and CLI tooling.
+
+### All
+
+`All()` returns a snapshot of all known keys with their resolved values (applying the full resolution order):
+
+```go
+snapshot := config.All()
+// {"http.port": 19110, "db.host": "localhost", ...}
+```
+
+### Keys
+
+`Keys()` returns a sorted list of all known key names:
+
+```go
+keys := config.Keys()
+// ["db.host", "db.port", "http.port", ...]
+```
+
+### Sub
+
+`Sub(prefix)` returns all keys under a prefix with the prefix stripped and resolution applied:
+
+```go
+dbConfig := config.Sub("db")
+// {"host": "localhost", "port": 5432, "busy_timeout": 5000}
+```
+
+Both `Sub("db")` and `Sub("db.")` work — trailing dots are handled automatically.
+
+> **Note:** All three functions only include keys that were registered via `SetDefault` or present in `config.json`. Keys that exist only as environment variables are not visible in introspection results.
+
+## Lifecycle Summary
+
+```
+1. config.Load()
+   ├── Resolves DATA_DIR (env var or ~/.standalone)
+   ├── Creates data directory if missing
+   ├── Reads and flattens config.json (if exists)
+   └── Sets "data_dir" as a default key
+
+2. Module Registration Phase
+   ├── Modules call SetDefault / SetDefaults
+   └── Modules call AddRule
+
+3. config.Validate()
+   ├── Runs all registered rules
+   ├── Panics with summary if any rule fails
+   └── Freezes config (no more SetDefault / AddRule)
+
+4. Runtime
+   ├── Get[T] / GetOr[T] / Has / DataDir — read config values
+   └── All / Keys / Sub — introspection
+```
+
+Calling `Load()` again resets all state (clears defaults, file values, and rules). This is useful in tests to start with a clean slate.

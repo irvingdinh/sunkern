@@ -1,175 +1,257 @@
 # Logging
 
-## Introduction
+The `framework/log` package provides structured logging for Sunkern applications. It is built on Go's standard `log/slog` library and writes to two sinks simultaneously — console (stdout) and daily-rotated log files — so every log event is both visible in real-time and preserved on disk.
 
-The `framework/log` package provides process-wide structured logging for a Sunkern application.
+The package is intentionally **write-only**. It handles log output, context injection, and file lifecycle. Log querying, analysis, and management belong to external tools reading the JSONL files or consuming stdout.
 
-It is responsible for:
+```go
+import (
+    "log/slog"
 
-- creating the global `slog` logger used by the framework and service
-- writing every log entry to both console and file outputs
-- injecting `request_id` and `user_id` from `context.Context`
-- rotating file output daily under `{DATA_DIR}/logs`
-- resolving one shared log level from config at boot
+    "sunkern.local/framework/config"
+    "sunkern.local/framework/log"
+)
 
-The package is intentionally narrow. It is a write-only logging package. It
-does not own log querying, log browsing, log retention commands, sampling, or
-admin-style APIs.
-
-## Logging Outputs
-
-Sunkern writes each log entry to two sinks:
-
-1. Console output
-2. File output
-
-Console format depends on `log.format`. By default it writes compact
-single-line JSON suitable for log aggregators. Set `LOG_FORMAT=json-pretty`
-for 2-space indented JSON during local development.
-
-File output is always compact JSONL regardless of `log.format`.
-
-Both outputs contain the same structured fields. Only formatting differs.
-
-## File Location
-
-Log files live under:
-
-```text
-{DATA_DIR}/logs/YYYY_MM_DD.log
+func main() {
+    config.Load()
+    log.Load()
+    slog.Info("application started")
+}
 ```
 
-For example:
-
-```text
-/.standalone/logs/2026_03_25.log
-```
-
-The file rotates lazily on the first write after midnight.
-
-## Loading The Logger
-
-Logging is initialized by calling `Load()`.
-
-`Load()`:
-
-1. registers the `log.level` default if it is not already declared
-2. resolves the shared log level from config
-3. creates the console and file handlers
-4. replaces the package-local writer state
-5. sets the global `slog` default logger
-6. ensures a shutdown hook exists to close the writer
-
-Application code normally does not call `Load()` directly. The framework boot
-sequence does that for you.
-
-Tests may call `Load()` again after `config.Load()` to rebuild logging state,
-matching the mental model used by `framework/config`.
+After `log.Load()`, the standard `slog` package is ready to use. No custom logger instance is needed — the package configures the global `slog` default.
 
 ## Configuration
 
-| Key          | Env Var      | Default  | Description                                          |
-| ------------ | ------------ | -------- | ---------------------------------------------------- |
-| `log.level`  | `LOG_LEVEL`  | `"INFO"` | Shared minimum level for both console and file sinks |
-| `log.format` | `LOG_FORMAT` | `"json"` | Console output format: `json` (compact) or `json-pretty` (indented) |
+The logging package reads two config keys, both with sensible defaults:
 
-There is no separate console-only or file-only level. File output is always
-compact JSONL regardless of `log.format`.
+| Key | Env Var | Default | Description |
+|-----|---------|---------|-------------|
+| `log.level` | `LOG_LEVEL` | `"INFO"` | Minimum log level for both sinks |
+| `log.format` | `LOG_FORMAT` | `"json"` | Console output format |
 
-## Log Levels
+Override via environment variables for quick adjustments:
 
-Use levels consistently:
-
-- `DEBUG` for detailed trace and diagnosis
-- `INFO` for normal operations and business events
-- `WARN` for degraded but recoverable behavior
-- `ERROR` for failed work that needs attention
-
-Invalid log levels cause `Load()` to panic during boot.
-
-## Writing Logs
-
-The package does not wrap `slog`. Log through the Go standard library
-directly.
-
-Basic example:
-
-```go
-slog.Info("user created", "user_id", user.ID, "email", user.Email)
-slog.Error("payment failed", "error", err, "amount", amount)
+```bash
+LOG_LEVEL=DEBUG LOG_FORMAT=json-pretty go run .
 ```
 
-Prefer static messages with structured attributes.
+> **Note:** The `log.format` setting controls console output only. File output is always compact JSONL regardless of this setting.
 
-Do this:
+## Writing Log Messages
 
-```go
-slog.Info("order created", "user_id", userID, "order_id", orderID)
-```
+### Log Levels
 
-Not this:
+The package supports four log levels, controlled by a single `log.level` that applies to both console and file output:
 
-```go
-slog.Info(fmt.Sprintf("user %s created order %s", userID, orderID))
-```
-
-## Context-Aware Logging
-
-The logger automatically injects request-scoped metadata from the context.
-
-Supported context fields:
-
-- `request_id`
-- `user_id`
-
-Store them with:
+| Level | When to Use | Examples |
+|-------|-------------|---------|
+| `DEBUG` | Trace-level detail for diagnosing issues | Request payloads, SQL queries, internal state |
+| `INFO` | Normal operational events | Server started, request handled, user created |
+| `WARN` | Degraded but recoverable conditions | Retries, fallbacks, approaching rate limits |
+| `ERROR` | Failures that need human attention | Unrecoverable errors, broken invariants |
 
 ```go
-ctx = log.WithRequestID(ctx, requestID)
-ctx = log.WithUserID(ctx, userID)
+slog.Debug("executing query", "sql", q.String())
+slog.Info("server listening", "port", 19110)
+slog.Warn("rate limit approaching", "remaining", 5)
+slog.Error("database connection failed", "error", err)
 ```
 
-Then log with the context-aware `slog` methods:
+Reserve `ERROR` for genuine failures. Business-logic rejections like "user not found" are normal — use `INFO` or `WARN`, not `ERROR`.
+
+### Structured Attributes
+
+Always use key-value pairs for log data. Messages should be static strings that describe the event — put variable data in attributes, not in the message.
 
 ```go
-slog.InfoContext(ctx, "creating order", "product_id", productID)
-slog.ErrorContext(ctx, "order creation failed", "error", err)
+// Correct: static message, structured attributes
+slog.InfoContext(ctx, "user created", "user_id", u.ID, "email", u.Email)
+
+// Incorrect: variable data in the message
+slog.Info(fmt.Sprintf("user %s created with email %s", u.ID, u.Email))
 ```
 
-If you log without context, those fields are simply omitted.
+This produces clean, parseable JSON:
 
-## Shutdown And Flushing
+```json
+{"time":"...","level":"INFO","msg":"user created","user_id":"abc123","email":"user@example.com"}
+```
 
-The framework registers a shutdown hook that calls `Close()` during graceful
-shutdown.
+### Context-Aware Logging
 
-`Close()`:
-
-- flushes any buffered file output
-- closes the active file handle
-- clears the package-local writer state
-
-`Flush()` is also available when you need buffered file output on disk before
-shutdown, especially in tests.
-
-## Testing
-
-Tests should follow the same lifecycle model as the application:
+In all request-scoped code — handlers, middleware, services called from handlers — use the context-aware variants: `InfoContext`, `WarnContext`, `ErrorContext`, `DebugContext`. This ensures `request_id` and `user_id` are automatically included in every log entry.
 
 ```go
-t.Setenv("DATA_DIR", t.TempDir())
-container.Reset()
-config.Load()
-log.Load()
-defer log.Close()
+func (c *usersController) create(w http.ResponseWriter, r *http.Request) {
+    // request_id and user_id are auto-injected from r.Context()
+    slog.InfoContext(r.Context(), "user created", "email", u.Email)
+}
 ```
 
-This keeps logging aligned with the current config and avoids hidden test-only
-reset pathways.
+Bare `slog.Info` / `slog.Error` (without context) should only be used during application boot, where no request context exists:
 
-## Notes
+```go
+func main() {
+    config.Load()
+    log.Load()
+    slog.Info("application started", "port", config.Get[int]("http.port"))
+}
+```
 
-- always use an isolated `DATA_DIR` when running locally or in tests
-- the package is write-only by design
-- if you later need log browsing or retention tooling, build it outside
-  `framework/log`
+## Context Values
+
+The package provides two context injection functions. Values stored in context are automatically added to every log record produced from that context — you never need to pass them manually as key-value pairs.
+
+### Request ID
+
+Use `log.WithRequestID(ctx, id)` in request middleware to store the request ID. The context handler auto-injects it as a `request_id` field.
+
+```go
+func requestIDMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        id := generateRequestID()
+        ctx := log.WithRequestID(r.Context(), id)
+        next.ServeHTTP(w, r.WithContext(ctx))
+    })
+}
+```
+
+To extract the request ID from context (e.g., for including in HTTP response headers):
+
+```go
+reqID := log.RequestIDFromCtx(r.Context())
+w.Header().Set("X-Request-Id", reqID)
+```
+
+### User ID
+
+Use `log.WithUserID(ctx, id)` in auth middleware after verifying the user's identity. It works identically to request ID — auto-injected as a `user_id` field.
+
+```go
+func authMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        claims, err := verifyToken(r)
+        if err != nil {
+            http.Error(w, "unauthorized", http.StatusUnauthorized)
+            return
+        }
+        ctx := log.WithUserID(r.Context(), claims.UserID)
+        next.ServeHTTP(w, r.WithContext(ctx))
+    })
+}
+```
+
+With both middleware in place, every log entry from a request handler automatically includes both fields:
+
+```json
+{
+  "time": "2026-03-25T14:30:45.123Z",
+  "level": "INFO",
+  "msg": "order placed",
+  "source": {"function": "...", "file": "orders.controller.go", "line": 42},
+  "request_id": "req-abc123",
+  "user_id": "usr-789",
+  "order_id": "ord-456",
+  "total": 99.99
+}
+```
+
+## Architecture
+
+### Handler Chain
+
+The logger is assembled from three handler components:
+
+```
+slog.Default()
+  └── contextHandler       ← extracts request_id, user_id from context
+        └── mergedHandler   ← fans out to both sinks
+              ├── console JSONHandler  (stdout)
+              └── file JSONHandler     ({DATA_DIR}/logs/YYYY_MM_DD.log)
+```
+
+Both handlers have `AddSource: true` enabled, so every log entry includes the source file and line number.
+
+### Console Output
+
+Console output goes to stdout. The format is controlled by the `log.format` config key:
+
+**`"json"` (default)** — compact single-line JSON, optimized for log aggregation systems:
+
+```json
+{"time":"2026-03-25T14:30:45.123Z","level":"INFO","source":{"function":"...","file":"users.controller.go","line":42},"msg":"user created","request_id":"req-abc123","user_id":"usr-789"}
+```
+
+**`"json-pretty"`** — 2-space indented JSON, optimized for human reading during development:
+
+```json
+{
+  "time": "2026-03-25T14:30:45.123Z",
+  "level": "INFO",
+  "source": {
+    "function": "...",
+    "file": "users.controller.go",
+    "line": 42
+  },
+  "msg": "user created",
+  "request_id": "req-abc123",
+  "user_id": "usr-789"
+}
+```
+
+### File Output
+
+Log files are written to `{DATA_DIR}/logs/` with daily rotation:
+
+```
+{DATA_DIR}/logs/
+  2026_03_23.log
+  2026_03_24.log
+  2026_03_25.log    ← current day
+```
+
+Each file contains compact JSONL (one JSON object per line), regardless of the `log.format` setting. The file writer uses a 64 KB buffer with a 200 ms background flush interval, balancing write throughput with data freshness.
+
+Rotation happens lazily — a new file is created on the first write after midnight.
+
+## Lifecycle
+
+### Initialization
+
+`log.Load()` must be called after `config.Load()`. It:
+
+1. Reads `log.level` and `log.format` from config (with defaults)
+2. Creates the `{DATA_DIR}/logs/` directory if it does not exist
+3. Instantiates the console handler (format-aware) and file handler (always compact JSONL)
+4. Wraps both with the context handler for auto-injection
+5. Sets the result as the `slog` default logger
+6. Registers a container shutdown hook to flush and close the file writer
+
+If `log.level` or `log.format` contain invalid values, `Load()` panics.
+
+### Flush and Close
+
+`log.Flush()` forces any buffered log data to be written to disk immediately. Use it before critical operations where you need to ensure logs are persisted:
+
+```go
+log.Flush()
+```
+
+`log.Close()` flushes buffered data and closes the file writer. It is automatically called during graceful shutdown via the container hook. Both functions are safe to call concurrently and multiple times (idempotent).
+
+### Reloading
+
+`log.Load()` can be called again to replace the logger with a new configuration. The previous file writer is automatically closed. This is useful in tests:
+
+```go
+func TestSomething(t *testing.T) {
+    t.Setenv("DATA_DIR", t.TempDir())
+    config.Load()
+    log.Load()
+    defer log.Close()
+    // Test code with isolated logging
+}
+```
+
+> **Warning:** Always set `DATA_DIR` to a temp directory in tests. Without it, test logs pollute the default `~/.standalone/logs/` directory.
